@@ -52,6 +52,9 @@ class ModelEntry(BaseModel):
     n_ctx: int = 65536
     extra_args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    # Alternate model IDs that route to this model's engine
+    # (e.g. "claude-sonnet-4-5" so Anthropic API clients work unchanged)
+    aliases: list[str] = Field(default_factory=list)
 
 
 class GatewayConfig(BaseModel):

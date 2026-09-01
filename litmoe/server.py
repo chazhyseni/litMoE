@@ -151,19 +151,19 @@ class Gateway:
     def _setup_routes(self) -> None:
         @self.app.get("/v1/models")
         async def list_models():
-            return {
-                "object": "list",
-                "data": [
-                    {"id": m.id, "object": "model", "owned_by": "litmoe",
-                     "engine": m.engine}
-                    for m in self.config.models
-                ],
-            }
+            data = []
+            for m in self.config.models:
+                data.append({"id": m.id, "object": "model", "owned_by": "litmoe",
+                             "engine": m.engine})
+                for alias in m.aliases:
+                    data.append({"id": alias, "object": "model", "owned_by": "litmoe",
+                                 "engine": m.engine, "alias_of": m.id})
+            return {"object": "list", "data": data}
 
         @self.app.get("/v1/models/{model_id}")
         async def get_model(model_id: str):
             for m in self.config.models:
-                if m.id == model_id:
+                if m.id == model_id or model_id in m.aliases:
                     return {"id": m.id, "object": "model",
                             "owned_by": "litmoe", "engine": m.engine}
             raise HTTPException(404, f"Model \'{model_id}\' not found")
@@ -173,13 +173,14 @@ class Gateway:
             return {
                 "status": "ok",
                 "engines": {
-                    model_id: {
+                    model.id: {
                         "running": eng.process is not None and eng.process.poll() is None,
                         "port": eng.default_port(),
                         "base_url": eng.base_url,
                         "log": str(eng._log_path) if eng._log_path else None,
+                        "aliases": model.aliases,
                     }
-                    for model_id, eng in self.engines.items()
+                    for model, eng in self._unique_engines()
                 },
             }
 
@@ -249,6 +250,13 @@ class Gateway:
         if stream:
             # For streaming, create the client outside async with so it
             # stays open for the duration of the StreamingResponse iterator
+            if anthropic:
+                # Translate OpenAI SSE chunks → Anthropic Messages SSE events
+                return StreamingResponse(
+                    _stream_anthropic_response(target_url, send_body, timeout,
+                                               fwd_headers, model_id),
+                    media_type="text/event-stream",
+                )
             return StreamingResponse(
                 _stream_response(target_url, send_body, timeout, fwd_headers),
                 media_type="text/event-stream",
@@ -256,6 +264,8 @@ class Gateway:
         else:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(target_url, content=send_body, headers=fwd_headers)
+                if anthropic and r.status_code == 200:
+                    return JSONResponse(content=_openai_to_anthropic(r.json(), model_id))
                 return JSONResponse(content=r.json(), status_code=r.status_code)
 
     def load_engines(self, log_dir: str | None = None) -> None:
@@ -317,16 +327,23 @@ class Gateway:
             engine._assigned_port = assigned_port
             engine.start(log_dir=ld)
             self.engines[model.id] = engine
+            for alias in model.aliases:
+                self.engines[alias] = engine
+
+    def _unique_engines(self) -> list[tuple[ModelEntry, Engine]]:
+        """(model, engine) pairs with aliases deduplicated."""
+        return [(m, self.engines[m.id]) for m in self.config.models
+                if m.id in self.engines]
 
     async def wait_all_ready(self, timeout: float = 600.0) -> bool:
         """Wait for all engines to be ready."""
-        tasks = [eng.wait_ready(timeout=timeout) for eng in self.engines.values()]
+        tasks = [eng.wait_ready(timeout=timeout) for _, eng in self._unique_engines()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return all(r is True for r in results)
 
     def shutdown(self) -> None:
         """Stop all engines."""
-        for engine in self.engines.values():
+        for _, engine in self._unique_engines():
             engine.stop()
 
 
@@ -364,9 +381,10 @@ async def _stream_response(url: str, body: bytes, timeout: httpx.Timeout, header
 
 
 def _anthropic_to_openai(payload: dict) -> dict:
-    """Translate Anthropic Messages API to OpenAI Chat Completions.
+    """Translate Anthropic Messages API request → OpenAI Chat Completions.
 
-    Best-effort translation. Supports the common subset.
+    Covers the Claude Code subset: system prompts, text/image blocks,
+    tool_use / tool_result blocks, tools + tool_choice, streaming usage.
     """
     messages = []
     system = payload.get("system")
@@ -375,7 +393,7 @@ def _anthropic_to_openai(payload: dict) -> dict:
             messages.append({"role": "system", "content": system})
         elif isinstance(system, list):
             for block in system:
-                if block.get("type") == "text":
+                if isinstance(block, dict) and block.get("type") == "text":
                     messages.append({"role": "system", "content": block.get("text", "")})
 
     for msg in payload.get("messages", []):
@@ -383,22 +401,65 @@ def _anthropic_to_openai(payload: dict) -> dict:
         content = msg.get("content")
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
-        elif isinstance(content, list):
+            continue
+        if not isinstance(content, list):
+            continue
+        if role == "assistant":
+            text_parts, tool_calls = [], []
+            for block in content:
+                # thinking / redacted_thinking blocks are intentionally
+                # dropped — engines regenerate reasoning each turn
+                btype = block.get("type")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {"name": block.get("name", ""),
+                                     "arguments": json.dumps(block.get("input", {}))},
+                    })
+            out_msg: dict[str, Any] = {"role": "assistant",
+                                       "content": "\n".join(text_parts) or None}
+            if tool_calls:
+                out_msg["tool_calls"] = tool_calls
+            messages.append(out_msg)
+        else:  # user — may carry tool_result blocks, which OpenAI models
+            # as separate tool-role messages
             text_parts = []
             for block in content:
-                if block.get("type") == "text":
+                btype = block.get("type")
+                if btype == "text":
                     text_parts.append(block.get("text", ""))
-                elif block.get("type") == "image":
-                    src_type = block.get('source', {}).get('type', 'unknown')
+                elif btype == "image":
+                    src_type = block.get("source", {}).get("type", "unknown")
                     text_parts.append(f"[image: {src_type}]")
-            messages.append({"role": role, "content": "\n".join(text_parts)})
+                elif btype == "tool_result":
+                    if text_parts:
+                        messages.append({"role": "user", "content": "\n".join(text_parts)})
+                        text_parts = []
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        result_content = "\n".join(
+                            b.get("text", "") for b in result_content
+                            if isinstance(b, dict) and b.get("type") == "text")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", ""),
+                        "content": result_content,
+                    })
+            if text_parts:
+                messages.append({"role": "user", "content": "\n".join(text_parts)})
 
-    out = {
+    out: dict[str, Any] = {
         "model": payload.get("model"),
         "messages": messages,
         "max_tokens": payload.get("max_tokens", 8192),
         "stream": payload.get("stream", False),  # pass through stream flag
     }
+    if out["stream"]:
+        # Ask the engine for a final usage chunk so we can report real counts
+        out["stream_options"] = {"include_usage": True}
     if "temperature" in payload:
         out["temperature"] = payload["temperature"]
     if "top_p" in payload:
@@ -406,7 +467,223 @@ def _anthropic_to_openai(payload: dict) -> dict:
     if "stop_sequences" in payload:
         out["stop"] = payload["stop_sequences"]
 
+    tools = payload.get("tools")
+    if tools:
+        out["tools"] = [
+            {"type": "function",
+             "function": {"name": t.get("name", ""),
+                          "description": t.get("description", ""),
+                          "parameters": t.get("input_schema", {})}}
+            for t in tools
+        ]
+    tool_choice = payload.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type")
+        if tc_type == "auto":
+            out["tool_choice"] = "auto"
+        elif tc_type == "any":
+            out["tool_choice"] = "required"
+        elif tc_type == "tool":
+            out["tool_choice"] = {"type": "function",
+                                  "function": {"name": tool_choice.get("name", "")}}
+        elif tc_type == "none":
+            out.pop("tools", None)
+
     return out
+
+
+# OpenAI finish_reason → Anthropic stop_reason
+_STOP_REASON_MAP = {"stop": "end_turn", "length": "max_tokens",
+                    "tool_calls": "tool_use", "content_filter": "refusal"}
+
+
+def _openai_to_anthropic(resp: dict, model: str) -> dict:
+    """Translate a non-streaming OpenAI Chat Completions response → Anthropic Messages."""
+    choice = (resp.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content_blocks: list[dict] = []
+    # Reasoning models (llama-server --jinja) split thinking into
+    # reasoning_content — surface it as an Anthropic thinking block.
+    # The signature is a placeholder: thinking blocks are stripped on the
+    # way back upstream, so it is never verified.
+    reasoning = msg.get("reasoning_content")
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning,
+                               "signature": "litmoe"})
+    text = msg.get("content")
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            tool_input = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            tool_input = {"_raw": fn.get("arguments", "")}
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id") or f"toolu_litmoe_{len(content_blocks)}",
+            "name": fn.get("name", ""),
+            "input": tool_input,
+        })
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+    finish = choice.get("finish_reason")
+    usage = resp.get("usage") or {}
+    return {
+        "id": resp.get("id") or f"msg_litmoe_{int(time.time() * 1000)}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": _STOP_REASON_MAP.get(finish, "end_turn") if finish else None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                  "output_tokens": usage.get("completion_tokens", 0)},
+    }
+
+
+async def _stream_anthropic_response(url: str, body: bytes, timeout: httpx.Timeout,
+                                     headers: dict, model: str):
+    """Stream upstream OpenAI SSE chunks as Anthropic Messages SSE events.
+
+    Translates each OpenAI chunk (delta.content / delta.tool_calls) into the
+    message_start → content_block_* → message_delta → message_stop lifecycle
+    that Anthropic API clients (e.g. Claude Code) expect.
+    """
+    client = httpx.AsyncClient(timeout=timeout)
+
+    def ev(event: str, data: dict) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+    try:
+        msg_id = f"msg_litmoe_{int(time.time() * 1000)}"
+        yield ev("message_start", {
+            "type": "message_start",
+            "message": {"id": msg_id, "type": "message", "role": "assistant",
+                        "model": model, "content": [], "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}},
+        })
+        block_open = False
+        block_index = -1
+        block_type = ""           # "text" | "tool_use"
+        tool_blocks: dict[int, int] = {}  # OpenAI tool_calls index → Anthropic block index
+        input_tokens = 0
+        output_tokens = 0
+        stop_reason = "end_turn"
+        buf = b""
+        async with client.stream("POST", url, content=body, headers=headers) as r:
+            if r.status_code >= 400:
+                err = (await r.aread()).decode(errors="replace")[:500]
+                yield ev("error", {"type": "error",
+                                   "error": {"type": "api_error", "message": err}})
+                return
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    usage = payload.get("usage") or {}
+                    if usage:
+                        input_tokens = usage.get("prompt_tokens", input_tokens)
+                        output_tokens = usage.get("completion_tokens", output_tokens)
+                    choice = (payload.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    thinking = delta.get("reasoning_content")
+                    if thinking:
+                        if not block_open or block_type != "thinking":
+                            if block_open:
+                                yield ev("content_block_stop",
+                                         {"type": "content_block_stop", "index": block_index})
+                            block_index += 1
+                            block_type = "thinking"
+                            block_open = True
+                            yield ev("content_block_start",
+                                     {"type": "content_block_start", "index": block_index,
+                                      "content_block": {"type": "thinking", "thinking": "",
+                                                        "signature": ""}})
+                        yield ev("content_block_delta",
+                                 {"type": "content_block_delta", "index": block_index,
+                                  "delta": {"type": "thinking_delta", "thinking": thinking}})
+                    text = delta.get("content")
+                    if text:
+                        if not block_open or block_type != "text":
+                            if block_open:
+                                if block_type == "thinking":
+                                    yield ev("content_block_delta",
+                                             {"type": "content_block_delta", "index": block_index,
+                                              "delta": {"type": "signature_delta",
+                                                        "signature": "litmoe"}})
+                                yield ev("content_block_stop",
+                                         {"type": "content_block_stop", "index": block_index})
+                            block_index += 1
+                            block_type = "text"
+                            block_open = True
+                            yield ev("content_block_start",
+                                     {"type": "content_block_start", "index": block_index,
+                                      "content_block": {"type": "text", "text": ""}})
+                        output_tokens += 1  # refined by final usage chunk if present
+                        yield ev("content_block_delta",
+                                 {"type": "content_block_delta", "index": block_index,
+                                  "delta": {"type": "text_delta", "text": text}})
+                    # llama.cpp streams tool calls sequentially per index
+                    for tc in delta.get("tool_calls") or []:
+                        oai_idx = tc.get("index", 0)
+                        fn = tc.get("function") or {}
+                        if oai_idx not in tool_blocks:
+                            if block_open:
+                                if block_type == "thinking":
+                                    yield ev("content_block_delta",
+                                             {"type": "content_block_delta", "index": block_index,
+                                              "delta": {"type": "signature_delta",
+                                                        "signature": "litmoe"}})
+                                yield ev("content_block_stop",
+                                         {"type": "content_block_stop", "index": block_index})
+                            block_index += 1
+                            tool_blocks[oai_idx] = block_index
+                            block_type = "tool_use"
+                            block_open = True
+                            yield ev("content_block_start",
+                                     {"type": "content_block_start", "index": block_index,
+                                      "content_block": {
+                                          "type": "tool_use",
+                                          "id": tc.get("id") or f"toolu_litmoe_{oai_idx}",
+                                          "name": fn.get("name") or "", "input": {}}})
+                        args = fn.get("arguments")
+                        if args:
+                            yield ev("content_block_delta",
+                                     {"type": "content_block_delta", "index": tool_blocks[oai_idx],
+                                      "delta": {"type": "input_json_delta",
+                                                "partial_json": args}})
+                    finish = choice.get("finish_reason")
+                    if finish:
+                        stop_reason = _STOP_REASON_MAP.get(finish, "end_turn")
+        if block_open:
+            if block_type == "thinking":
+                yield ev("content_block_delta",
+                         {"type": "content_block_delta", "index": block_index,
+                          "delta": {"type": "signature_delta", "signature": "litmoe"}})
+            yield ev("content_block_stop", {"type": "content_block_stop", "index": block_index})
+        yield ev("message_delta",
+                 {"type": "message_delta",
+                  "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                  "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}})
+        yield ev("message_stop", {"type": "message_stop"})
+    except httpx.RequestError as e:
+        logger.error("Stream error: %s", e)
+        yield ev("error", {"type": "error",
+                           "error": {"type": "api_error", "message": str(e)}})
+    finally:
+        await client.aclose()
 
 
 def run(config: GatewayConfig, log_dir: str | None = None, config_path: str | None = None) -> None:

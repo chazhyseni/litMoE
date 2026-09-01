@@ -2,7 +2,7 @@
 #
 # After: docker compose up -d --build
 # Visit http://<your-ip>:8080 for Open WebUI
-# API at http://<your-ip>:8000/v1
+# API at http://127.0.0.1:8000/v1 (loopback only)
 #
 # Prerequisites:
 #   1. Copy models.yaml.example to models.yaml and edit model paths
@@ -19,6 +19,10 @@ services:
     restart: unless-stopped
     expose:
       - "8000"
+    ports:
+      # Loopback only — gateway has no auth (api_key: null); not for LAN exposure.
+      # Lets host clients (e.g. Claude Code via ANTHROPIC_BASE_URL) reach /v1.
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./models.yaml:/config/models.yaml:ro
       - ./logs:/app/logs

@@ -1,5 +1,5 @@
 # litmoe models.yaml for Docker deployment
-# Gateway listens on port 8000 internally (exposed to Docker network only).
+# Gateway listens on port 8000 (Docker network + host loopback 127.0.0.1:8000).
 # Open WebUI on port 8080 externally, connects to gateway at litmoe-gateway:8000.
 
 host: 0.0.0.0
@@ -13,7 +13,21 @@ models:
     engine: llamacpp
     model_path: /models/qwen3.8-9b-distill/Q4_K_M/Qwen3.8-9B-Q4_K_M.gguf
     n_gpu_layers: 0
-    n_ctx: 16384
+    # 128K native — Claude Code system prompt + tools alone exceed 16K
+    n_ctx: 131072
+    # --jinja enables the model's chat template with tool calling
+    extra_args: ["--jinja"]
+    # Route Anthropic API clients (Claude Code) to this model unchanged
+    aliases:
+      - claude-sonnet-4-5
+      - claude-sonnet-4-5-20250929
+      - claude-opus-4-1
+      - claude-opus-4-1-20250805
+      - claude-haiku-4-5
+      - claude-haiku-4-5-20251001
+      - claude-3-7-sonnet-latest
+      - claude-3-5-sonnet-latest
+      - claude-3-5-haiku-latest
 
   # Kimi-Linear-48B (48B MoE, 3B active, 30 GB Q4_K_M)
   # Loads but 0.58 t/s on CPU — impractical for chat
