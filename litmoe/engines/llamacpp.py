@@ -1,10 +1,10 @@
 """llama.cpp engine adapter.
 
-Native support for Kimi-K3, Qwen3.5 MoE, and many other architectures via GGUF.
-Backends: CUDA, HIP (AMD), Metal (Apple), Vulkan, SYCL, OpenCL, CANN (Ascend).
-Quantization: 1.5/2/3/4/5/6/8-bit. SIMD: AVX, AVX2, AVX-512, AMX.
+Native support for Kimi-K3, Qwen3.x MoE, DeepSeek, GLM, MiniMax, Gemma and many
+other architectures via GGUF. Backends: CUDA, HIP (AMD), Metal (Apple), Vulkan,
+SYCL, OpenCL, CANN (Ascend). Quantization: 1.5/2/3/4/5/6/8-bit.
 
-Reference: https://github.com/ggml-org/llama.cpp
+Reference: https://github.com/ggml-org/llama.cpp (tools/server/README.md)
 """
 from __future__ import annotations
 
@@ -13,22 +13,23 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from litmoe.config import ModelEntry, expand_path, is_hf_repo_spec
 from litmoe.engines.base import Engine
-from litmoe.config import ModelEntry
 from litmoe.platform_utils import (
-    is_macos, get_library_path_env,
-    find_llama_server_binary, fix_macos_dylib_paths,
+    get_library_path_env,
+    get_physical_cores,
+    is_macos,
 )
+
+_THREAD_FLAGS = {"-t", "--threads"}
+
+
+def _has_flag(args: list[str], flags: set[str]) -> bool:
+    return any(a in flags or any(a.startswith(f + "=") for f in flags) for a in args)
 
 
 class LlamaCppEngine(Engine):
     """Adapter for llama.cpp server (llama-server)."""
-
-    def default_port(self) -> int:
-        # Assign unique ports per model deterministically.
-        # Use a simple ordinal: first model gets 8081, second 8082, etc.
-        # The gateway sets _port_index before calling start().
-        return getattr(self, "_assigned_port", 8081)
 
     def health_url(self) -> str:
         return f"http://127.0.0.1:{self.default_port()}/health"
@@ -43,90 +44,68 @@ class LlamaCppEngine(Engine):
         set by start() are passed directly to the process (not through
         a bash wrapper that may overwrite or lose them).
         """
-        # Expand ~ and $VARS in LITMOE_PREFIX
         raw_prefix = os.environ.get("LITMOE_PREFIX", str(Path.home() / ".local"))
         prefix = Path(os.path.expanduser(os.path.expandvars(raw_prefix)))
 
-        # First: look for the direct binary in known install locations
-        # Prebuilt binaries are in subdirectories like prebuilt/llama-b10516/
-        # Source builds are in local/
+        # Source builds live in local/, prebuilt releases in prebuilt/llama-bNNNNN/.
         for lib_subdir in ["lib/llama.cpp/local", "lib/llama.cpp/prebuilt"]:
             lib_dir = prefix / lib_subdir
             direct = lib_dir / "llama-server"
-            if direct.exists():
+            if direct.is_file():
                 return (str(direct), lib_dir)
-            # Search recursively for nested archives (e.g. prebuilt/llama-b10516/)
             if lib_dir.exists():
-                for p in lib_dir.rglob("llama-server"):
+                for p in sorted(lib_dir.rglob("llama-server"), reverse=True):
                     if p.is_file():
                         return (str(p), p.parent)
 
-        # Second: check PATH (may find a wrapper script)
         found = shutil.which("llama-server") or shutil.which("llama-server.exe")
         if found:
-            p = Path(found)
-            for lib_subdir in ["lib/llama.cpp/local", "lib/llama.cpp/prebuilt"]:
-                lib_dir = prefix / lib_subdir
-                if lib_dir.exists():
-                    return (found, lib_dir)
-            # Check if shared libs are alongside the binary
-            so_files = list(p.parent.glob("lib*.so*"))
-            dylib_files = list(p.parent.glob("lib*.dylib*"))
-            if so_files or dylib_files:
-                return (found, p.parent)
-            return (found, None)
+            p = Path(found).resolve()
+            so_files = list(p.parent.glob("lib*.so*")) + list(p.parent.glob("lib*.dylib*"))
+            return (found, p.parent if so_files else None)
 
-        # Not found anywhere
         raise FileNotFoundError(
-            "llama-server not found. Build from https://github.com/ggml-org/llama.cpp "
-            "or install with: litmoe install --engine llamacpp"
+            "llama-server not found. Install with: litmoe install --engine llamacpp "
+            "(or build from https://github.com/ggml-org/llama.cpp and put llama-server on PATH)"
         )
 
     def build_command(self) -> list[str]:
         """Build llama-server command."""
         binary, lib_dir = self._resolve_binary()
         cmd = [binary]
+        m = self.model
 
-        # Model: GGUF path takes priority, then HF repo, then local path
-        # Expand ~ and $VARS in file paths — Python doesn't do this automatically
-        # like the shell does, which causes FileNotFoundError on macOS.
-        from litmoe.config import expand_path
-
-        if self.model.gguf_path:
-            cmd.extend(["-m", str(expand_path(self.model.gguf_path))])
-        elif self.model.model_path and self.model.model_path.startswith(("http://", "https://")):
-            # HF repo URL: use -hf flag
-            cmd.extend(["-hf", self.model.model_path])
-        elif self.model.model_path:
-            # Local directory or file: expand ~ and $VARS
-            cmd.extend(["-m", str(expand_path(self.model.model_path))])
+        # Model source: local GGUF path, HF repo spec (owner/repo[:quant]) or URL.
+        if m.gguf_path:
+            cmd.extend(["-m", str(expand_path(m.gguf_path))])
+        elif m.model_path and m.model_path.startswith(("http://", "https://")):
+            cmd.extend(["-hf", m.model_path])
+        elif m.model_path and is_hf_repo_spec(m.model_path):
+            # llama-server downloads to its own cache (~/.cache/llama.cpp) and
+            # picks up the matching mmproj automatically for multimodal models.
+            cmd.extend(["-hf", m.model_path])
+        elif m.model_path:
+            cmd.extend(["-m", str(expand_path(m.model_path))])
         else:
-            raise ValueError(f"{self.model.id}: model_path or gguf_path required for llama.cpp")
+            raise ValueError(f"{m.id}: model_path or gguf_path required for llama.cpp")
 
-        # GPU offload
-        if self.model.n_gpu_layers == 0:
-            cmd.extend(["-ngl", "0"])
-        else:
-            cmd.extend(["-ngl", str(self.model.n_gpu_layers)])
+        # GPU offload (-1 = all layers that fit; 0 = CPU only). llama-server
+        # accepts a number for every release; 'auto'/'all' only on newer builds.
+        cmd.extend(["-ngl", str(m.n_gpu_layers)])
 
-        # Context size
-        if self.model.n_ctx:
-            cmd.extend(["-c", str(self.model.n_ctx)])
+        # Context size (0 = use the model's trained context)
+        if m.n_ctx is not None:
+            cmd.extend(["-c", str(m.n_ctx)])
 
-        # Threads — cap at 8 for efficiency; more threads have diminishing
-        # returns for LLM inference and waste CPU on scheduling overhead
-        n_threads = min(os.cpu_count() or 8, 8)
-        cmd.extend(["-t", str(n_threads)])
+        # Threads: one per physical core unless the user set -t in extra_args.
+        # SMT threads slow memory-bound decode; a low fixed cap starves big CPUs.
+        if not _has_flag(m.extra_args, _THREAD_FLAGS):
+            cmd.extend(["-t", str(get_physical_cores())])
 
-        # Host/port
         cmd.extend(["--host", "127.0.0.1", "--port", str(self.default_port())])
+        cmd.extend(m.extra_args)
 
-        # Extra args
-        cmd.extend(self.model.extra_args)
-
-        # Store lib_dir for start() to set env vars
         self._lib_dir = lib_dir
-
         return cmd
 
     def start(self, log_dir: Path | None = None) -> None:
@@ -142,36 +121,28 @@ class LlamaCppEngine(Engine):
         env = os.environ.copy()
         env.update(self.model.env)
 
-        # Prepare log file (used by all branches below)
-        ld = Path(log_dir) if log_dir else Path("logs")
-        ld.mkdir(parents=True, exist_ok=True)
-        log_file = ld / f"{self.model.id}.log"
-        self._log_path = log_file
-
         lib_dir = getattr(self, "_lib_dir", None)
         if lib_dir and is_macos():
-            # macOS: com.apple.provenance blocks Python subprocess from
-            # launching the binary. Strip it by copying binary over itself.
-            # Then launch via /bin/bash as a belt-and-suspenders approach.
             actual_binary = lib_dir / "llama-server"
             if actual_binary.exists():
-                # Strip com.apple.provenance by copying binary over itself.
-                # This MUST succeed — if it fails, the binary can't be launched.
+                # Strip com.apple.provenance by copying the binary over itself.
                 tmp = actual_binary.parent / ".llama-server.tmp"
                 shutil.copy2(str(actual_binary), str(tmp))
                 shutil.move(str(tmp), str(actual_binary))
                 os.chmod(str(actual_binary), 0o755)
-                # Also strip provenance from all dylibs
                 for dylib in actual_binary.parent.glob("*.dylib*"):
                     if dylib.is_file():
                         dtmp = dylib.parent / f".{dylib.name}.tmp"
                         shutil.copy2(str(dylib), str(dtmp))
                         shutil.move(str(dtmp), str(dylib))
 
-            wrapper = Path(os.environ.get("LITMOE_PREFIX", Path.home() / ".local")) / "bin" / "llama-server"
+            prefix = Path(os.path.expanduser(os.environ.get("LITMOE_PREFIX", str(Path.home() / ".local"))))
+            wrapper = prefix / "bin" / "llama-server"
             wrapper.parent.mkdir(parents=True, exist_ok=True)
-            is_prebuilt = "prebuilt" in str(lib_dir)
-            if is_prebuilt:
+            # Never write through a symlink: that would overwrite the binary it points to.
+            if wrapper.is_symlink() or wrapper.exists():
+                wrapper.unlink()
+            if "prebuilt" in str(lib_dir):
                 wrapper.write_text(f"#!/bin/bash\nexec {actual_binary} \"$@\"\n")
             else:
                 wrapper.write_text(
@@ -182,9 +153,8 @@ class LlamaCppEngine(Engine):
                 )
             wrapper.chmod(0o755)
 
-            # Launch via bash
             shell_cmd = f'"{wrapper}" ' + ' '.join(f'"{a}"' for a in cmd[1:])
-            with open(log_file, "w") as logf:
+            with self._open_log(log_dir, cmd) as logf:
                 self.process = subprocess.Popen(
                     ['/bin/bash', '-c', shell_cmd],
                     stdout=logf,
@@ -192,20 +162,10 @@ class LlamaCppEngine(Engine):
                     env=env,
                     start_new_session=True,
                 )
-        elif lib_dir:
-            # Linux: direct launch with LD_LIBRARY_PATH
-            env.update(get_library_path_env(lib_dir))
-            with open(log_file, "w") as logf:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    env=env,
-                    start_new_session=True,
-                )
         else:
-            # No lib_dir needed (prebuilt binary with system libs)
-            with open(log_file, "w") as logf:
+            if lib_dir:
+                env.update(get_library_path_env(lib_dir))
+            with self._open_log(log_dir, cmd) as logf:
                 self.process = subprocess.Popen(
                     cmd,
                     stdout=logf,
@@ -213,21 +173,15 @@ class LlamaCppEngine(Engine):
                     env=env,
                     start_new_session=True,
                 )
+        self._record_pid()
 
         self.base_url = f"http://127.0.0.1:{self.default_port()}"
-        print(f"  {self.model.id}: started PID {self.process.pid}, logs: {log_file}")
+        print(f"  {self.model.id}: started PID {self.process.pid}, logs: {self._log_path}")
 
 
 def is_installed() -> bool:
-    """Check if llama-server is installed.
-
-    Checks PATH first, then common install locations (~/.local, etc.).
-    """
-    # Check PATH
+    """Check if llama-server is installed (PATH or the litmoe install prefix)."""
     if shutil.which("llama-server") or shutil.which("llama-server.exe"):
         return True
-
-    # Check install prefix locations
     from litmoe.platform_utils import find_llama_server_binary
-    binary = find_llama_server_binary()
-    return binary is not None
+    return find_llama_server_binary() is not None

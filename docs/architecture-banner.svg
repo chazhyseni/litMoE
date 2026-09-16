@@ -10,7 +10,7 @@
   <rect width="1200" height="400" fill="#0d1117"/>
 
   <text x="600" y="40" text-anchor="middle" class="title">litmoe: engine dispatcher for local LLM inference</text>
-  <text x="600" y="65" text-anchor="middle" class="sub">OpenAI-compatible gateway · no inference code · ~780 lines Python</text>
+  <text x="600" y="65" text-anchor="middle" class="sub">OpenAI + Anthropic gateway · no inference code · ~3,450 lines Python</text>
 
   <!-- Clients -->
   <rect x="20" y="100" width="1160" height="50" rx="8" fill="#0d2818" stroke="#2ea043"/>
@@ -22,12 +22,12 @@
   <text x="40" y="195" class="section">litmoe Gateway</text>
   <text x="40" y="215" class="mono">FastAPI · /v1/chat/completions · /v1/messages</text>
   <text x="40" y="232" class="mono">routes by model name from models.yaml</text>
-  <text x="40" y="252" class="body">~215 lines · latency added: 1-5 ms</text>
+  <text x="40" y="252" class="body">~780 lines · latency added: 1-5 ms</text>
 
   <!-- Engine 1: ktransformers -->
   <rect x="600" y="170" width="270" height="100" rx="8" fill="#1a0d1d" stroke="#a371f7"/>
   <text x="620" y="195" class="section">ktransformers</text>
-  <text x="620" y="215" class="mono">kt run · :10002</text>
+  <text x="620" y="215" class="mono">sglang.launch_server · :8082</text>
   <text x="620" y="232" class="body">CUDA · AMX · AVX-512 · AVX2</text>
   <text x="620" y="252" class="body">heterogeneous CPU+GPU MoE</text>
 

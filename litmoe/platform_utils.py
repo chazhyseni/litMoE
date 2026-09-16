@@ -60,6 +60,116 @@ def get_total_memory_bytes() -> int | None:
     return None
 
 
+def get_physical_cores() -> int:
+    """Number of physical CPU cores (not SMT threads), best effort.
+
+    llama.cpp and kt-kernel both perform best with one thread per physical
+    core; SMT oversubscription slows memory-bound decode.
+
+    Linux: unique (physical id, core id) pairs from /proc/cpuinfo, bounded by
+    the process CPU affinity. macOS: sysctl hw.physicalcpu. Fallback: half of
+    os.cpu_count() (assume 2-way SMT), minimum 1.
+    """
+    logical = os.cpu_count() or 1
+    try:
+        affinity = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        affinity = logical
+
+    if is_macos():
+        try:
+            r = subprocess.run(["sysctl", "-n", "hw.physicalcpu"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                return max(1, int(r.stdout.strip()))
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return max(1, logical // 2)
+
+    try:
+        cores: set[tuple[str, str]] = set()
+        phys = core = None
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("physical id"):
+                    phys = line.split(":", 1)[1].strip()
+                elif line.startswith("core id"):
+                    core = line.split(":", 1)[1].strip()
+                elif line.strip() == "":
+                    if phys is not None and core is not None:
+                        cores.add((phys, core))
+                    phys = core = None
+        if phys is not None and core is not None:
+            cores.add((phys, core))
+        if cores:
+            # If the process is pinned to fewer CPUs than physical cores
+            # (cgroup / taskset), do not exceed the affinity mask.
+            return max(1, min(len(cores), affinity))
+    except (FileNotFoundError, ValueError):
+        pass
+    return max(1, min(logical // 2 or 1, affinity))
+
+
+def get_numa_nodes() -> int:
+    """Number of NUMA nodes (1 if unknown). Used for kt-kernel thread pools."""
+    if is_linux():
+        try:
+            nodes = [p for p in Path("/sys/devices/system/node").glob("node[0-9]*") if p.is_dir()]
+            if nodes:
+                return len(nodes)
+        except OSError:
+            pass
+    return 1
+
+
+def cpu_flags() -> set[str]:
+    """CPU feature flags (Linux /proc/cpuinfo; macOS sysctl). Empty set if unknown."""
+    if is_linux():
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("flags"):
+                        return set(line.split(":", 1)[1].split())
+        except (FileNotFoundError, IndexError):
+            pass
+        return set()
+    if is_macos():
+        try:
+            r = subprocess.run(["sysctl", "-n", "machdep.cpu.features", "machdep.cpu.leaf7_features"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                return {t.lower() for t in r.stdout.split()}
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return set()
+
+
+def has_avx512() -> bool:
+    """True if the CPU exposes AVX-512F (required by kt-kernel FP8/BF16/RAWINT4 backends)."""
+    return "avx512f" in cpu_flags()
+
+
+def has_amx() -> bool:
+    """True if the CPU exposes Intel AMX tiles (kt-kernel AMXINT4/AMXINT8 backends)."""
+    return "amx_tile" in cpu_flags()
+
+
+def nvidia_gpus() -> list[str]:
+    """Names of NVIDIA GPUs visible to nvidia-smi, or [] if none/unavailable."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
 def get_library_path_env(lib_dir: Path) -> dict[str, str]:
     """Build environment variables for shared library discovery.
 

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# claude-local — run Claude Code against a litmoe gateway WITHOUT touching your
+# normal Claude Code setup.
+#
+# Everything is scoped to this one process:
+#   * ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN are set only in the environment
+#     of the `claude` process launched here — never exported to your shell, never
+#     written to ~/.claude/settings.json. A plain `claude` in another terminal
+#     (or after this one exits) still uses your Anthropic subscription/API key.
+#   * CLAUDE_CONFIG_DIR points at a separate directory, so sessions, cached
+#     credentials, and settings written while talking to the local model never
+#     mix with the ones for real Anthropic models.
+#   * Model alias env vars (ANTHROPIC_DEFAULT_*_MODEL) make `sonnet` / `opus` /
+#     `haiku` resolve to your local model, so background/subagent calls stay local
+#     too instead of failing or hitting Anthropic.
+#   * Non-essential background traffic (auto-update, telemetry) is disabled for
+#     this process only.
+#   * Claude Code logs a one-line "[claude-code:unrecognized_model]" notice for
+#     non-Anthropic model ids; it is harmless and only appears on stderr.
+#
+# Usage:
+#   claude-local [--gateway URL] [--model ID] [--key KEY] [claude args...]
+#
+#   claude-local                                  # interactive, first model in gateway
+#   claude-local --model qwen3.6-35b-a3b -p "..." # print mode against a specific model
+#   LITMOE_GATEWAY=http://192.168.1.10:8080 claude-local
+#
+# Reverting to normal Claude: just run `claude`. Nothing to undo.
+set -euo pipefail
+
+GATEWAY="${LITMOE_GATEWAY:-http://127.0.0.1:8080}"
+MODEL="${LITMOE_MODEL:-}"
+KEY="${LITMOE_API_KEY:-litmoe}"          # any non-empty string when api_key: null
+CONFIG_DIR="${LITMOE_CLAUDE_CONFIG_DIR:-$HOME/.litmoe/claude-config}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gateway) GATEWAY="$2"; shift 2 ;;
+    --model)   MODEL="$2";   shift 2 ;;
+    --key)     KEY="$2";     shift 2 ;;
+    --config-dir) CONFIG_DIR="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "claude-local: 'claude' not found on PATH (npm install -g @anthropic-ai/claude-code)" >&2
+  exit 127
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "claude-local: curl is required" >&2; exit 127
+fi
+
+# Gateway must be up; otherwise Claude Code would show confusing connection errors.
+if ! curl -sf --max-time 3 "$GATEWAY/health" >/dev/null 2>&1; then
+  echo "claude-local: litmoe gateway not reachable at $GATEWAY (start it with: litmoe serve)" >&2
+  exit 1
+fi
+
+# Default model = first model the gateway lists (aliases come after their model).
+if [[ -z "$MODEL" ]]; then
+  MODEL="$(curl -sf --max-time 5 "$GATEWAY/v1/models" \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin)["data"]; m=[x["id"] for x in d if not x.get("alias_of")]; print(m[0] if m else "")' 2>/dev/null || true)"
+  if [[ -z "$MODEL" ]]; then
+    echo "claude-local: gateway has no models loaded (check models.yaml and litmoe status)" >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$CONFIG_DIR"
+
+# `env -i`-style isolation is too aggressive (breaks PATH, locale, terminal);
+# instead we pass a clean *Anthropic* namespace: unset anything that could make
+# Claude Code pick a different endpoint/credential, then set exactly what the
+# gateway needs. All of it lives only in the child process.
+exec env \
+  -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL \
+  -u CLAUDE_CODE_USE_BEDROCK -u CLAUDE_CODE_USE_VERTEX -u CLAUDE_CODE_USE_FOUNDRY \
+  ANTHROPIC_BASE_URL="$GATEWAY" \
+  ANTHROPIC_AUTH_TOKEN="$KEY" \
+  ANTHROPIC_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL" \
+  CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
+  CLAUDE_CONFIG_DIR="$CONFIG_DIR" \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  claude --model "$MODEL" "$@"

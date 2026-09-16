@@ -9,7 +9,10 @@ import asyncio
 import json
 import logging
 import os
+import re
+import signal
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -17,125 +20,131 @@ import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from litmoe.config import GatewayConfig, ModelEntry
+from litmoe.config import GatewayConfig, ModelEntry, expand_path, is_hf_repo_spec
 from litmoe.engines import make_engine, Engine
-from litmoe.platform_utils import get_total_memory_bytes, is_macos
-from litmoe.config import expand_path
+from litmoe.engines.base import DEFAULT_ENGINE_PORT
+from litmoe.models import lookup as catalog_lookup, quant_size_gb, fit_context
+from litmoe.platform_utils import get_total_memory_bytes
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Model-native context sizes and KV cache rates
+# Memory-aware context sizing
 # ---------------------------------------------------------------------------
 
-NATIVE_CTX = {
-    "deepseek-v4-flash": 131072,   # 128K MLA
-    "kimi-linear-48b": 1048576,     # 1M KDA+MLA
-    "kimi-k3": 262144,              # 256K MLA
-    "qwen3.8": 262144,              # 256K (1M with YaRN) — KNOWN_MODELS key
-    "qwen3.8-2.4t": 262144,         # alias for backward compat
-    "qwen3.8-9b-distill": 131072,   # 128K (1M with YaRN)
-    "minimax-m3": 1048576,          # 1M
-    "gemma-4-12b": 131072,          # 128K
-    "gemma-4-31b": 131072,          # 128K
-    "llama-4-scout": 10485760,     # 10M
-}
-
-# KV cache rate per token (bytes/token) — rough per-model estimates
-# Format: "model_id": (kv_at_native_ctx_gb, native_ctx)
-KV_RATES = {
-    "deepseek-v4-flash": 23.1e9 / 131072,
-    "kimi-linear-48b": 15.0e9 / 1048576,
-    "kimi-k3": 49.9e9 / 262144,
-    "qwen3.8": 1580e9 / 262144,
-    "qwen3.8-2.4t": 1580e9 / 262144,         # alias
-    "qwen3.8-9b-distill": 17.2e9 / 131072,
-    "minimax-m3": 386.5e9 / 1048576,
-    "gemma-4-12b": 85.9e9 / 131072,
-    "gemma-4-31b": 86.0e9 / 131072,
-    "llama-4-scout": 206.2e9 / 10485760,
-}
-
-# Model sizes in GB (for memory fit calculation)
-MODEL_SIZES_GB = {
-    "kimi-k3": {"UD-IQ1_S": 594, "UD-IQ1_M": 649, "UD-Q2_K_XL": 861, "UD-Q4_K_XL": 1509},
-    "qwen3.8": {"UD-IQ1_S": 508, "UD-IQ1_M": 564, "UD-Q1_0": 397, "UD-IQ2_XXS": 657},
-    "qwen3.8-2.4t": {"UD-IQ1_S": 508, "UD-IQ1_M": 564, "UD-Q1_0": 397, "UD-IQ2_XXS": 657},
-    "minimax-m3": {"UD-IQ1_M": 128, "UD-IQ2_M": 134, "UD-Q2_K_XL": 143, "UD-Q4_K_M": 264},
-    "deepseek-v4-flash": {"UD-IQ1_S": 83, "UD-IQ1_M": 87, "UD-Q2_K_XL": 97, "UD-Q4_K_XL": 155},
-    "gemma-4-31b": {"UD-IQ2_XXS": 9, "UD-IQ2_M": 11, "Q4_K_M": 18, "Q8_0": 33},
-    "gemma-4-12b": {"UD-IQ2_M": 4, "Q4_K_M": 7, "Q8_0": 13},
-    "llama-4-scout": {"Q3_K_M": 52, "Q4_K_M": 65, "Q6_K": 88, "Q8_0": 115},
-    "kimi-linear-48b": {"Q2_K": 18, "Q3_K_M": 24, "Q4_K_M": 30, "Q5_K_M": 35, "Q6_K": 40, "Q8_0": 52},
-    "qwen3.8-9b-distill": {"Q4_K_M": 6, "Q5_K_M": 7, "Q6_K": 8, "Q8_0": 10},
-}
+# n_ctx values below this are treated as stale defaults and raised to the
+# model's native context if the KV cache fits in RAM.
+MIN_SANE_CTX = 16384
+# Fallbacks for models that are not in the catalog.
+_FALLBACK_NATIVE_CTX = 131072
+_FALLBACK_KV_BYTES_PER_TOKEN = 65_536  # ~8.6 GB at 128K
 
 
-def compute_memory_aware_ctx(model_id: str, n_ctx: int) -> int:
-    """Compute the optimal context size for a model given available memory.
+def _shard_pattern(path: Path) -> str | None:
+    """'name-00001-of-00004.gguf' -> glob 'name-*-of-00004.gguf', else None."""
+    m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", path.name)
+    if not m:
+        return None
+    return f"{m.group(1)}-*-of-{m.group(3)}.gguf"
 
-    If the model's native context + KV cache + model weights exceeds available
-    RAM, reduce the context to fit. Otherwise, keep the native context.
 
-    Works on both Linux (sysconf) and macOS (sysctl hw.memsize).
+def weights_size_gb(model: ModelEntry) -> float | None:
+    """Size of the model weights actually configured, in decimal GB.
+
+    Local GGUF file: its size plus sibling shards. Local directory: all
+    .gguf/.safetensors inside. HF repo spec: the catalog size of the requested
+    quant (or the model's default quant). None if unknown.
     """
+    src = model.gguf_path or model.model_path
+    if not src:
+        return None
+    if src.startswith(("http://", "https://")):
+        return None
+    if is_hf_repo_spec(src):
+        repo, _, quant = src.partition(":")
+        for mid, info in _catalog_items():
+            if info["hf_repo"].lower() == repo.lower():
+                return quant_size_gb(mid, quant or None)
+        return None
+    p = expand_path(src)
+    try:
+        if p.is_file():
+            pat = _shard_pattern(p)
+            files = list(p.parent.glob(pat)) if pat else [p]
+            return sum(f.stat().st_size for f in files) / 1e9
+        if p.is_dir():
+            files = [f for f in p.iterdir() if f.suffix in (".gguf", ".safetensors")]
+            return sum(f.stat().st_size for f in files) / 1e9 if files else None
+    except OSError:
+        return None
+    return None
+
+
+def _catalog_items():
+    from litmoe.models import KNOWN_MODELS
+    return KNOWN_MODELS.items()
+
+
+def compute_memory_aware_ctx(model: ModelEntry, n_ctx: int) -> int:
+    """Context size for a model given total RAM.
+
+    Target = n_ctx if it is already sane (>= MIN_SANE_CTX), else the model's
+    native context. If weights + KV cache at the target exceed ~90% of RAM,
+    shrink the context (multiple of 4096, minimum 8192).
+    """
+    info = catalog_lookup(model.id) or {}
+    native_ctx = info.get("native_ctx", _FALLBACK_NATIVE_CTX)
+    kv_rate = info.get("kv_bytes_per_token", _FALLBACK_KV_BYTES_PER_TOKEN)
+    target_ctx = n_ctx if n_ctx >= MIN_SANE_CTX else native_ctx
+
     total_mem = get_total_memory_bytes()
     if total_mem is None:
-        # Can't detect memory — keep what we have
-        return n_ctx
-
-    total_mem_gb = total_mem / 1e9
-
-    # Get native context for this model
-    native_ctx = NATIVE_CTX.get(model_id, 131072)
-
-    # If n_ctx is already reasonable (>= 16384), check if it fits
-    if n_ctx >= 16384:
-        target_ctx = n_ctx
-    else:
-        target_ctx = native_ctx
-
-    # Get KV cache rate (bytes per token)
-    kv_rate = KV_RATES.get(model_id, 17.2e9 / 131072)  # default: ~17 GB at 128K
-
-    # Estimate model size from MODEL_SIZES_GB
-    # Use the average of available quants as a reasonable estimate
-    model_size_gb = 0
-    if model_id in MODEL_SIZES_GB:
-        quants = MODEL_SIZES_GB[model_id]
-        model_size_gb = sum(quants.values()) / len(quants)
-
-    # KV cache size at target context
-    kv_gb = (kv_rate * target_ctx) / 1e9
-
-    # Budget: 90% of total RAM minus 3 GB overhead
-    avail_gb = total_mem_gb * 0.9 - 3
-    needed_gb = model_size_gb + kv_gb
-
-    if needed_gb <= avail_gb:
         return target_ctx
 
-    # Need to reduce context
-    max_kv_gb = avail_gb - model_size_gb - 1  # 1 GB headroom
-    if max_kv_gb <= 0:
-        logger.warning(
-            "Model %s (%.0f GB) may not fit in %.0f GB RAM",
-            model_id, model_size_gb, total_mem_gb,
-        )
-        return max(target_ctx, 8192)  # keep minimum viable
+    model_size_gb = weights_size_gb(model)
+    if model_size_gb is None:
+        model_size_gb = quant_size_gb(model.id, None) or 0.0
 
-    # Calculate max context that fits
-    max_ctx = int((max_kv_gb * 1e9) / kv_rate)
-    # Round down to nearest 4096
-    max_ctx = (max_ctx // 4096) * 4096
-    max_ctx = max(max_ctx, 8192)  # minimum 8K
+    ctx, note = fit_context(kv_rate, model_size_gb, total_mem / 1e9, target_ctx)
+    if note:
+        logger.warning("Model %s: %s", model.id, note)
+    return ctx
 
-    logger.info(
-        "Model %s: reduced context from %d to %d to fit %.0f GB model + KV in %.0f GB RAM",
-        model_id, target_ctx, max_ctx, model_size_gb, total_mem_gb,
-    )
-    return max_ctx
+
+def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """True if nothing is listening on host:port (bind probe)."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def allocate_engine_ports(n: int, gateway_port: int, start: int = DEFAULT_ENGINE_PORT,
+                          probe: bool = True) -> list[int]:
+    """n distinct engine ports counting up from `start`.
+
+    Never the gateway port, and (when probe=True) never a port something else
+    already listens on — an Ollama on 11434 is out of range anyway, but a
+    LM Studio / manual llama-server on 8081 used to make the first engine die
+    with "couldn't bind HTTP server socket". Skipping keeps both alive.
+    """
+    ports: list[int] = []
+    p = start
+    while len(ports) < n:
+        if p != gateway_port and (not probe or _port_is_free(p)):
+            ports.append(p)
+        elif probe and p != gateway_port:
+            logger.warning("Port %d is already in use by another process — skipping it", p)
+        p += 1
+        if p > 65535:
+            raise RuntimeError("no free engine ports")
+    return ports
 
 
 class Gateway:
@@ -197,21 +206,50 @@ class Gateway:
             """Anthropic Messages API → forward to OpenAI Chat Completions."""
             return await self._proxy(request, "messages", anthropic=True)
 
+        @self.app.post("/v1/messages/count_tokens")
+        async def count_tokens(request: Request):
+            """Anthropic token-count endpoint (Claude Code calls it before requests).
+
+            Engines expose no cross-model tokenizer, so this returns an estimate
+            (~4 characters per token over the serialized prompt).
+            """
+            self._check_api_key(request)
+            body = await request.body()
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                raise HTTPException(400, "invalid JSON body")
+            text = json.dumps(payload.get("system", "")) + json.dumps(payload.get("messages", []))
+            text += json.dumps(payload.get("tools", []))
+            return {"input_tokens": max(1, len(text) // 4)}
+
+    def _check_api_key(self, request: Request) -> None:
+        if not self.config.api_key:
+            return
+        auth = request.headers.get("authorization", "")
+        provided = auth[7:] if auth[:7].lower() == "bearer " else ""
+        if not provided:
+            provided = request.headers.get("x-api-key", "")
+        if provided != self.config.api_key:
+            raise HTTPException(401, "invalid API key")
+
+    def _resolve(self, model_id: str) -> tuple[ModelEntry, Engine]:
+        """(canonical model entry, engine) for a model id or alias."""
+        engine = self.engines.get(model_id)
+        if not engine:
+            served = sorted({e.model.id for e in self.engines.values()})
+            aliases = sorted(k for k, e in self.engines.items() if k != e.model.id)
+            hint = f"models served: {', '.join(served) or 'none'}"
+            if aliases:
+                hint += f"; aliases: {', '.join(aliases)}"
+            raise HTTPException(404, f"model not loaded: {model_id} ({hint})")
+        if not engine.base_url:
+            raise HTTPException(503, f"engine for {model_id} not ready")
+        return engine.model, engine
+
     async def _proxy(self, request: Request, endpoint: str, anthropic: bool = False):
         """Forward request to the right engine."""
-        # API key validation
-        if self.config.api_key:
-            auth = request.headers.get("authorization", "")
-            provided = ""
-            if auth.startswith("Bearer "):
-                provided = auth[7:]
-            elif auth.startswith("bearer "):
-                provided = auth[7:]
-            # Also check x-api-key header (Anthropic style)
-            if not provided:
-                provided = request.headers.get("x-api-key", "")
-            if provided != self.config.api_key:
-                raise HTTPException(401, "invalid API key")
+        self._check_api_key(request)
 
         body = await request.body()
         try:
@@ -219,28 +257,22 @@ class Gateway:
         except json.JSONDecodeError:
             raise HTTPException(400, "invalid JSON body")
 
-        # Determine model
         model_id = payload.get("model")
         if not model_id:
-            raise HTTPException(400, "missing \'model\' field")
+            raise HTTPException(400, "missing 'model' field")
+        model, engine = self._resolve(model_id)
 
-        engine = self.engines.get(model_id)
-        if not engine:
-            raise HTTPException(404, f"model not loaded: {model_id}")
-
-        if not engine.base_url:
-            raise HTTPException(503, f"engine for {model_id} not ready")
-
-        # Translate Anthropic Messages → OpenAI Chat Completions
         if anthropic:
             payload = _anthropic_to_openai(payload)
             target_url = f"{engine.base_url}/v1/chat/completions"
         else:
             target_url = f"{engine.base_url}/v1/{endpoint}"
 
-        # Use translated payload if anthropic, otherwise original body
-        send_body = json.dumps(payload).encode() if anthropic else body
-        stream = payload.get("stream", False)
+        # Aliases are a gateway concept: engines that validate the model field
+        # (sglang) must see the id they were started with.
+        payload["model"] = model.id
+        send_body = json.dumps(payload).encode()
+        stream = bool(payload.get("stream", False))
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
 
         # Strip Authorization header — the gateway handles auth, not the engine.
@@ -248,87 +280,99 @@ class Gateway:
         fwd_headers = {"content-type": "application/json"}
 
         if stream:
-            # For streaming, create the client outside async with so it
-            # stays open for the duration of the StreamingResponse iterator
             if anthropic:
-                # Translate OpenAI SSE chunks → Anthropic Messages SSE events
                 return StreamingResponse(
-                    _stream_anthropic_response(target_url, send_body, timeout,
-                                               fwd_headers, model_id),
+                    _stream_anthropic_response(target_url, send_body, timeout, fwd_headers, model_id),
                     media_type="text/event-stream",
                 )
             return StreamingResponse(
                 _stream_response(target_url, send_body, timeout, fwd_headers),
                 media_type="text/event-stream",
             )
-        else:
+
+        try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(target_url, content=send_body, headers=fwd_headers)
-                if anthropic and r.status_code == 200:
-                    return JSONResponse(content=_openai_to_anthropic(r.json(), model_id))
-                return JSONResponse(content=r.json(), status_code=r.status_code)
+        except httpx.RequestError as e:
+            raise HTTPException(502, f"engine for {model.id} unreachable: {e}")
+        try:
+            data = r.json()
+        except ValueError:
+            raise HTTPException(502, f"engine for {model.id} returned non-JSON "
+                                     f"(HTTP {r.status_code}): {r.text[:300]}")
+        if anthropic and r.status_code == 200:
+            return JSONResponse(content=_openai_to_anthropic(data, model_id))
+        if anthropic:
+            message = data.get("error", {}).get("message") if isinstance(data, dict) else None
+            return JSONResponse(status_code=r.status_code, content={
+                "type": "error",
+                "error": {"type": "api_error", "message": message or json.dumps(data)[:500]},
+            })
+        return JSONResponse(content=data, status_code=r.status_code)
 
     def load_engines(self, log_dir: str | None = None) -> None:
-        """Start all configured engines."""
-        from pathlib import Path
+        """Start all configured engines. A model that fails to start is skipped, not fatal."""
         ld = Path(log_dir) if log_dir else None
-        for idx, model in enumerate(self.config.models):
-            # Auto-fix stale/zero context sizes using memory-aware computation
-            needs_persist = False
-            if model.n_ctx and model.n_ctx < 16384:
-                new_ctx = compute_memory_aware_ctx(model.id, model.n_ctx)
+        ports = allocate_engine_ports(len(self.config.models), self.config.port)
+        for model, port in zip(self.config.models, ports):
+            self._fix_context(model)
 
-                logger.warning(
-                    "Model %s has n_ctx=%d (too small), setting to %d",
-                    model.id, model.n_ctx, new_ctx
-                )
-                model.n_ctx = new_ctx
-                needs_persist = True
-
-            elif not model.n_ctx or model.n_ctx == 0:
-                # No context set — compute memory-aware default
-                new_ctx = compute_memory_aware_ctx(model.id, 0)
-                model.n_ctx = new_ctx
-                logger.info("Model %s: set n_ctx=%d (memory-aware default)", model.id, new_ctx)
-                needs_persist = True
-
-            # Persist the fix to models.yaml so it doesn't repeat every run
-            if needs_persist:
-                try:
-                    import yaml as _yaml
-                    cfg_path = self.config_path
-                    if not cfg_path:
-                        cfg_path = os.environ.get("LITMOE_CONFIG", "")
-                    if not cfg_path:
-                        for candidate in ["models.yaml", "deploy/models.yaml", "config/models.yaml"]:
-                            if Path(candidate).exists():
-                                cfg_path = candidate
-                                break
-                    if cfg_path and Path(cfg_path).exists():
-                        with open(cfg_path) as f:
-                            raw = _yaml.safe_load(f)
-                        for m in raw.get("models", []):
-                            if m.get("id") == model.id:
-                                m["n_ctx"] = model.n_ctx
-                                break
-                        with open(cfg_path, "w") as f:
-                            _yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
-                        logger.info("Persisted n_ctx=%d for %s to %s", model.n_ctx, model.id, cfg_path)
-                except Exception:
-                    pass  # best effort — runtime fix is what matters
-
-            logger.info("Loading %s via %s...", model.id, model.engine)
-            engine = make_engine(model)
-            # Assign unique port: first model 8081, second 8082, etc.
-            # Skip the gateway's own port to avoid collision
-            assigned_port = 8081 + idx
-            if assigned_port == self.config.port:
-                assigned_port += 1
-            engine._assigned_port = assigned_port
-            engine.start(log_dir=ld)
+            logger.info("Loading %s via %s on port %d...", model.id, model.engine, port)
+            try:
+                engine = make_engine(model)
+                engine.set_port(port)
+                engine.start(log_dir=ld)
+            except Exception as e:  # FileNotFoundError, ValueError, OSError ...
+                logger.error("Model %s could not be started: %s", model.id, e)
+                continue
             self.engines[model.id] = engine
             for alias in model.aliases:
                 self.engines[alias] = engine
+
+    def _fix_context(self, model: ModelEntry) -> None:
+        """Raise stale/zero n_ctx to a memory-aware value and persist it to models.yaml.
+
+        Only for llama.cpp entries: sglang-kt sizes its own KV pool.
+        """
+        if model.engine != "llamacpp":
+            return
+        if model.n_ctx and model.n_ctx >= MIN_SANE_CTX:
+            return
+        new_ctx = compute_memory_aware_ctx(model, model.n_ctx or 0)
+        if new_ctx == model.n_ctx:
+            return
+        logger.warning("Model %s: n_ctx=%d is below %d, using %d (memory-aware native context)",
+                       model.id, model.n_ctx, MIN_SANE_CTX, new_ctx)
+        model.n_ctx = new_ctx
+        self._persist_ctx(model)
+
+    def _persist_ctx(self, model: ModelEntry) -> None:
+        """Write the corrected n_ctx back so the fix does not repeat every run.
+
+        Note: yaml.dump re-serializes the file, so comments in models.yaml are lost.
+        """
+        import yaml as _yaml
+        cfg_path = self.config_path or os.environ.get("LITMOE_CONFIG", "")
+        if not cfg_path:
+            for candidate in ["models.yaml", "deploy/models.yaml", "config/models.yaml"]:
+                if Path(candidate).exists():
+                    cfg_path = candidate
+                    break
+        if not cfg_path or not Path(cfg_path).exists():
+            logger.info("Not persisting n_ctx for %s: no config path known", model.id)
+            return
+        try:
+            with open(cfg_path) as f:
+                raw = _yaml.safe_load(f) or {}
+            for m in raw.get("models", []) or []:
+                if m.get("id") == model.id:
+                    m["n_ctx"] = model.n_ctx
+                    break
+            with open(cfg_path, "w") as f:
+                _yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+            logger.info("Persisted n_ctx=%d for %s to %s", model.n_ctx, model.id, cfg_path)
+        except (OSError, _yaml.YAMLError) as e:
+            logger.warning("Could not persist n_ctx for %s to %s: %s", model.id, cfg_path, e)
 
     def _unique_engines(self) -> list[tuple[ModelEntry, Engine]]:
         """(model, engine) pairs with aliases deduplicated."""
@@ -342,9 +386,12 @@ class Gateway:
         return all(r is True for r in results)
 
     def shutdown(self) -> None:
-        """Stop all engines."""
+        """Stop all engines (idempotent)."""
         for _, engine in self._unique_engines():
-            engine.stop()
+            try:
+                engine.stop()
+            except Exception as e:  # never let one engine block the others
+                logger.warning("stopping %s: %s", engine.model.id, e)
 
 
 async def _stream_response(url: str, body: bytes, timeout: httpx.Timeout, headers: dict | None = None):
@@ -484,8 +531,9 @@ def _anthropic_to_openai(payload: dict) -> dict:
         elif tc_type == "any":
             out["tool_choice"] = "required"
         elif tc_type == "tool":
-            out["tool_choice"] = {"type": "function",
-                                  "function": {"name": tool_choice.get("name", "")}}
+            # llama-server only accepts string tool_choice values; "required"
+            # forces a tool call, which is the closest to naming a specific tool.
+            out["tool_choice"] = "required"
         elif tc_type == "none":
             out.pop("tools", None)
 
@@ -690,25 +738,44 @@ def run(config: GatewayConfig, log_dir: str | None = None, config_path: str | No
     """Entry point: start gateway."""
     gateway = Gateway(config, config_path=config_path)
     gateway.load_engines(log_dir=log_dir)
+    if not gateway.engines:
+        logger.error("No engine could be started — check the errors above and `litmoe doctor`.")
 
-    # Wait for engines in background
+    # Models served straight from HuggingFace (-hf) download on first start;
+    # allow more time for that than for a local file.
+    ready_timeout = float(os.environ.get("LITMOE_READY_TIMEOUT", "0") or 0)
+    if not ready_timeout:
+        downloads = any(is_hf_repo_spec(m.model_path or "") or (m.model_path or "").startswith("http")
+                        for m in config.models)
+        ready_timeout = 3600.0 if downloads else 600.0
+
     async def startup():
-        ok = await gateway.wait_all_ready(timeout=600)
+        ok = await gateway.wait_all_ready(timeout=ready_timeout)
         if not ok:
             logger.warning("Not all engines became ready — gateway will start anyway")
         else:
             logger.info("All engines ready.")
 
-    # Use the existing event loop or create one for startup checks
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # Engines run in their own sessions (start_new_session=True), so a SIGTERM
+    # sent to the gateway does not reach them. uvicorn captures SIGINT/SIGTERM
+    # to exit gracefully, then *restores the previous handlers and re-raises
+    # the signal* after run() returns. With Python's default SIGTERM
+    # disposition that kills the process before any `finally:` block runs and
+    # orphans the engines (measured: rc=-15, no cleanup output). Install a
+    # handler beforehand so the re-raised signal lands here instead.
+    def _stop_engines(signum, _frame):
+        logger.info("Signal %d: stopping engines", signum)
+        gateway.shutdown()
+        raise SystemExit(128 + signum)
 
-    loop.run_until_complete(startup())
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, _stop_engines)
 
     try:
+        asyncio.run(startup())
         uvicorn.run(gateway.app, host=config.host, port=config.port, log_level="info")
+    except KeyboardInterrupt:
+        pass
     finally:
         gateway.shutdown()

@@ -1,401 +1,218 @@
 # Setup Guide
 
-This guide covers installing engines and downloading models for litmoe.
-All sizes and requirements are verified against HuggingFace model repositories
-and engine source code as of August 2026.
+Installing an engine, picking a model that fits your machine, and connecting
+your tools. Model sizes and quant lists come from `litmoe/models.py`, which
+was checked against the HuggingFace API on 2026-09-16; run `litmoe models`
+for the live version of every table below.
 
 ## Prerequisites
 
 - Python 3.10+
-- 50 GB free disk for engine binaries + logs (models need much more, see below)
-- Linux or macOS. Windows via WSL2.
+- Linux or macOS (Apple Silicon: Metal). Windows via WSL2.
+- Disk: 20–70 GB for a laptop-tier model; hundreds of GB for server tiers.
 
-> **Important for macOS users with multiple Python installations:**
-> Always install and run litmoe with the same Python interpreter. If `python3`
-> and `pip` point to different installations (e.g. Homebrew 3.14 vs conda 3.12),
-> the `litmoe` entry point may run with the wrong Python, causing TCC file access
-> errors when loading models from `~/.litmoe/models/`.
->
-> Check with: `python3 -c "import sys; print(sys.executable)"` and
-> `pip --version` — if they differ, use the pip Python explicitly:
-> ```bash
-> /path/to/correct/python -m pip install -e .
-> /path/to/correct/python -m litmoe serve
-> ```
-> Run `litmoe doctor` to verify your Python has no access issues.
+> **macOS with several Pythons (Homebrew + conda):** install and run litmoe
+> with the *same* interpreter, or the entry point may start under a Python
+> that cannot read `~/.litmoe/models/` (TCC). `litmoe doctor` checks this.
 
 ## Step 1: Install litmoe
 
 ```bash
-git clone https://github.com/chazhyseni/litMoE
-cd litMoE
+git clone https://github.com/chazhyseni/litMoE && cd litMoE
 pip install -e .
+litmoe doctor          # Python, RAM, CPU cores, engines found, config sanity
 ```
 
 ## Step 2: Install an engine
 
-litmoe routes requests to inference engines. You need at least one.
-
-### Option A: llama.cpp (recommended — supports all models below)
-
-llama.cpp has native support for every model listed in this guide.
-All architectures are merged to master and CI-tested.
-
-**Prebuilt binary (fastest):**
+### llama.cpp (default; every model in the catalog has a GGUF)
 
 ```bash
-litmoe install --engine llamacpp
+litmoe install --engine llamacpp                            # prebuilt release binary (auto: cuda if NVIDIA visible, else cpu)
+litmoe install --engine llamacpp --llamacpp-variant vulkan  # or cpu | cuda | cuda13 | rocm
 ```
 
-This downloads the latest release from github.com/ggml-org/llama.cpp/releases,
-extracts `llama-server`, and symlinks it into `~/.local/bin/`.
+The prebuilt path downloads the current `ggml-org/llama.cpp` release asset for
+your OS/arch/variant, verifies it runs, and symlinks `llama-server` into
+`~/.local/bin/`. On Linux the release binaries need glibc ≥ 2.34 — older
+distros fall back to a source build automatically. Metal on macOS is in the
+standard macOS asset; no variant flag needed.
 
-**Build from source (for CUDA/HIP/Metal/Vulkan support):**
+### ktransformers / sglang-kt (Linux + NVIDIA; CPU expert offload)
+
+Since v0.4 the ktransformers serving stack is **SGLang + kt-kernel**: attention
+runs on the GPU, routed experts on the CPU (AMX/AVX-512 fastest, AVX2 works).
+This is the engine for the big MoEs on a single-GPU box with lots of RAM.
 
 ```bash
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-cmake -B build -DGGML_CUDA=ON    # or -DGGML_HIP=ON, -DGGML_METAL=ON, etc.
-cmake --build build --config Release -j --target llama-server
-# Binary is at build/bin/llama-server — add it to your PATH
+litmoe install --engine ktransformers     # PyPI wheels for kt-kernel + sglang-kt
 ```
 
-### Option B: ktransformers (Linux + NVIDIA only)
+Not available on macOS (triton/CUDA dependency). Requires a CUDA GPU; the
+upstream tutorials target SM90 (H100/H20) but SM80/SM86 work for most models.
 
-ktransformers supports DeepSeek-V3/R1, Kimi-K2, GLM-5.x, MiniMax-M2.5/M3,
-Qwen3-30B-A3B. Does NOT support Kimi-K3 or Qwen3.8-2.4T.
+## Step 3: Pick a model for your RAM
 
-**Not available on macOS.** kt-kernel depends on triton, which requires
-Linux + NVIDIA GPU. See [triton-lang/triton#3443](https://github.com/triton-lang/triton/issues/3443).
-On macOS, use llama.cpp (Metal backend) instead.
+`litmoe models` prints the catalog grouped by tier and marks what fits this
+machine. `litmoe install --model <id>` downloads the default quant (or
+`--quant <Q>`) and adds it to `models.yaml` with a memory-aware context size.
 
-```bash
-litmoe install --engine ktransformers
-```
+RAM column = weights × 1.08 (mmap + compute buffers) + KV cache at 32K tokens
++ 4 GB headroom. macOS gets 75 % of physical RAM as its budget (unified memory
+shared with the OS/GPU). All laptop-tier models are MoEs with 3–5 B active
+parameters or ≤ 31 B dense — the ones that are actually fast on CPU/Metal.
 
-This clones the repo and builds from source via `pip install ./kt-kernel`,
-which bypasses the prebuilt wheel glibc requirement. Requires Python 3.11+
-and a C++ compiler (gcc/clang). CUDA toolkit is needed for GPU backend.
+### 48 GB laptop — default tier
 
-Manual install (same thing):
+| Model | Type | Native ctx | Default quant | Size | RAM | Notes |
+|---|---|---|---|---|---|---|
+| **gemma-4-26b-a4b** (default) | MoE, 4B active | 256K | UD-Q4_K_XL | 17 GB | ~26 GB | Vision (mmproj included). `litmoe init` picks this. |
+| qwen3.6-35b-a3b | MoE, 3B active | 256K | UD-Q4_K_XL | 22 GB | ~31 GB | Strong coding/agentic; thinking on by default |
+| nemotron-3.5-lightning-30b-a3b | hybrid MoE, 3B active | 1M | UD-Q4_K_XL | 26 GB | ~35 GB | Mamba-2 hybrid, tiny KV |
+| gpt-oss-20b | MoE, 3.6B active | 128K | UD-Q4_K_XL | 12 GB | ~20 GB | Native MXFP4; Harmony format |
+| gemma-4-12b | dense | 256K | Q4_K_M | 7 GB | ~16 GB | Vision; fits 16 GB |
+| qwen3.8-9b-distill | dense | 256K | Q4_K_M | 6 GB | ~14 GB | Reasoning distill; emits `reasoning_content` |
+| qwen3.8-27b | dense | 256K | UD-Q4_K_XL | 18 GB | ~28 GB | Slower than the MoEs (27B active) |
+| gemma-4-31b | dense | 256K | UD-Q4_K_XL | 19 GB | ~32 GB | Vision; slower than the MoEs |
+| kimi-linear-48b | MoE, 3B active | 1M | Q4_K_M | 30 GB | ~39 GB | KDA linear attention: 1M ctx cheap |
 
-```bash
-git clone https://github.com/kvcache-ai/ktransformers.git
-cd ktransformers
-git submodule update --init --recursive
-pip install ./kt-kernel    # builds C++/CUDA kernels
-pip install .              # installs the ktransformers wrapper
-```
+### 96 GB laptop / desktop
 
-CPU-only mode works with AVX-512 or AMX (Intel Xeon 4th gen+).
-AVX2-only CPUs (AMD EPYC) work but slower.
-
-## Step 3: Download model weights
-
-### Smaller models (laptops, desktops, 16-96 GB RAM)
-
-These run on CPU-only machines via llama.cpp. No GPU required.
-
-#### Gemma-4-12B (12B dense, Aug 2026)
-
-```
-litmoe install --model gemma-4-12b
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| UD-IQ2_M | 4 GB | ~8 GB | 16 GB laptop |
-| Q4_K_M | 7 GB | ~10 GB | 16 GB laptop |
-| Q8_0 | 13 GB | ~16 GB | 16 GB laptop |
-| BF16 | 24 GB | ~28 GB | 32 GB |
-
-Google's latest 12B. Multimodal (text + image). Runs on any laptop.
-
-#### Gemma-4-31B (31B dense, Aug 2026)
-
-```
-litmoe install --model gemma-4-31b
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| UD-IQ2_XXS | 9 GB | ~12 GB | 16 GB laptop |
-| UD-Q4_K_XL | 19 GB | ~24 GB | 32 GB |
-| Q8_0 | 33 GB | ~40 GB | 64 GB |
-| BF16 | 61 GB | ~70 GB | 96 GB |
-
-Google's latest 31B. Most capable model that fits a 16 GB laptop at IQ2_XXS.
-
-#### Llama-4-Scout (109B total, 17B active MoE, 2026)
-
-```
-litmoe install --model llama-4-scout
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| Q3_K_M | 52 GB | ~60 GB | 64 GB |
-| Q4_K_M | 65 GB | ~75 GB | 96 GB |
-| Q6_K | 88 GB | ~96 GB | 96 GB (tight) |
-
-Meta's latest MoE. 109B total but only 17B active per token — fast inference,
-high capability. 16 experts.
-
-#### DeepSeek-V4-Flash (MoE, 256 experts top-6, Jul 2026)
-
-```
-litmoe install --model deepseek-v4-flash
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| UD-IQ1_S | 83 GB | ~90 GB | 96 GB |
-| UD-IQ1_M | 87 GB | ~95 GB | 96 GB (tight) |
-| UD-Q2_K_XL | 97 GB | ~110 GB | 128 GB |
-| UD-Q4_K_XL | 155 GB | ~170 GB | 192 GB |
-
-DeepSeek's newest compact MoE. 43 layers, 4096 hidden, 256 experts.
-Outperforms V4-Pro despite smaller size, per DeepSeek's benchmarks.
-
-### Large models (128 GB+ RAM)
-
-#### MiniMax-M3 (428B total, 23B active MoE, 2026)
-
-```
-litmoe install --model minimax-m3
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| UD-IQ1_M | 128 GB | ~140 GB | 128 GB (tight) / 192 GB |
-| UD-Q2_K_XL | 143 GB | ~160 GB | 192 GB |
-| UD-Q4_K_M | 264 GB | ~290 GB | 374 GB |
-| Q8_0 | 453 GB | ~500 GB | 512 GB |
-
-Engine: llama.cpp (native, merged 2026-07-26). ktransformers also supports M3
-(via SGLang + KT-Kernel, requires SM90 GPU).
-
-Most accessible trillion-scale model. At 128 GB IQ1_M, fits on a Mac Studio
-with 128 GB unified memory or a workstation with 192 GB RAM.
-
-#### Kimi-K3 (2.78T total, 93B active MoE, Aug 2026)
-
-```
-litmoe install --model kimi-k3
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| UD-IQ1_S | 594 GB | ~650 GB | 768 GB machine |
-| UD-IQ1_M | 649 GB | ~700 GB | 768 GB machine |
-| UD-Q2_K_XL | 861 GB | ~950 GB | 1 TB machine |
-
-Engine: llama.cpp only. ktransformers does not support K3.
-
-#### Qwen3.8-2.4T (2.4T total, 95B active MoE, 2026)
-
-```
-litmoe install --model qwen3.8
-```
-
-| Quant | Size | RAM needed | Fits |
-|---|---|---|---|
-| UD-Q1_0 | 397 GB | ~440 GB | 512 GB machine |
-| UD-IQ1_S | 508 GB | ~560 GB | 768 GB machine |
-| UD-IQ1_M | 564 GB | ~620 GB | 768 GB machine |
-
-Engine: llama.cpp only. ktransformers does not support Qwen3.8-2.4T.
-
-Note: Qwen3.8-27B (a smaller variant of the same architecture) has several
-open bugs in llama.cpp (CUDA lockups, long-context crashes). The 2.4T variant
-shares the same architecture (Qwen3_5MoeForCausalLM) but has no reported
-issues specific to it. Test before relying on it in production.
-
-## Hardware requirements and expected performance
-
-Memory determines whether a model loads. Throughput determines whether
-it's usable. These are different things — a model that "fits in RAM"
-can still be too slow for interactive use.
-
-### What "usable" means
-
-- **Interactive chat**: >5 tokens/second. You can have a conversation.
-- **Batch processing**: 0.5-5 tokens/second. Usable for one-shot
-  completions, summaries, code generation — not back-and-forth chat.
-- **Impractical**: <0.5 tokens/second. Each response takes minutes.
-  Only viable for offline batch jobs.
-
-### Measured throughput on this project's hardware
-
-AMD EPYC 7B13 (24 physical cores, 48 SMT, AVX2 only, 377 GB DDR4-3200,
-no GPU, Google Cloud PersistentDisk ~379 MB/s random / ~778 MB/s
-sequential).
-
-| Model | Type | Quant | Size | t/s | Usability |
+| Model | Type | Native ctx | Default quant | Size | RAM |
 |---|---|---|---|---|---|
-| Kimi-K3 (2.78T) | MoE 93B active | UD-IQ1_S | 594 GB | 0.85 | Impractical |
-| DeepSeek-V4-Flash (~150B) | MoE ~30B active | UD-IQ1_S | 83 GB | 0.33 | Impractical |
-| Kimi-Linear-48B | MoE 3B active | Q4_K_M | 30 GB | 0.58 | Impractical |
-| Qwen3.8-9B-Distill | Dense 9B | Q4_K_M | 6 GB | 0.69 | Impractical |
+| gpt-oss-120b | MoE, 5.1B active | 128K | UD-Q4_K_XL | 63 GB | ~77 GB |
+| qwen3.5-122b-a10b | MoE, 10B active | 256K | UD-IQ4_XS | 60 GB | ~73 GB |
+| nemotron-3-super-120b-a12b | hybrid MoE, 12B active | 1M | UD-IQ4_XS | 64 GB | ~77 GB |
+| llama-4-scout | MoE, 17B active | 10M | UD-Q4_K_XL | 62 GB | ~76 GB |
 
-All measured via llama.cpp, CPU-only, no GPU, in Docker containers.
-Hardware: AMD EPYC 7B13, 24 physical cores, AVX2 only (no AVX-512/AMX),
-DDR4-3200, Google Cloud PersistentDisk.
+### 192 GB workstation
 
-**Finding: no model is usable for interactive chat on this hardware.**
-Even a 9B dense model is 0.69 t/s. The bottleneck is CPU memory
-bandwidth — AVX2-only with DDR4-3200 is too slow for any model
-architecture. Community benchmarks showing 10-20 t/s for 9B models
-assume AVX-512 or Apple Silicon with higher memory bandwidth.
+| Model | Engine | Type | Default | Size | RAM |
+|---|---|---|---|---|---|
+| qwen3.8-flash-next | llama.cpp | MoE | UD-Q4_K_XL | 111 GB | ~129 GB |
+| minimax-m2.7 | llama.cpp | MoE, 10B active | UD-Q4_K_XL | 141 GB | ~169 GB |
+| deepseek-v4-flash | llama.cpp | MoE (MLA) | UD-Q4_K_XL | 155 GB | ~179 GB |
+| deepseek-v4-flash-kt | sglang-kt | FP8 safetensors | — | 160 GB | ~185 GB + GPU |
 
-### Measured throughput from ktransformers docs (GPU hardware)
+### 512 GB server
 
-These are from ktransformers' official tutorials, not measured by us.
+| Model | Engine | Type | Default | Size | RAM |
+|---|---|---|---|---|---|
+| minimax-m3 | llama.cpp | 428B MoE, 23B active | UD-Q4_K_XL | 265 GB | ~302 GB |
+| glm-5.3 | llama.cpp | MoE | UD-Q2_K_XL | 254 GB | ~288 GB |
+| deepseek-v3.2 | llama.cpp | 671B MoE, 37B active | UD-Q2_K_XL | 247 GB | ~280 GB |
+| kimi-k2.6 / kimi-k2.5 | llama.cpp | 1T MoE, 32B active | UD-Q2_K_XL / UD-IQ2_M | 340 / 345 GB | ~382 / ~388 GB |
+| glm-5.3-flash | sglang-kt | MoE, 18B active, 1M ctx, multimodal | — | 328 GB | ~367 GB + GPU |
+| minimax-m2.7-kt | sglang-kt | — | — | 230 GB | ~267 GB + GPU |
+| minimax-m3-kt | sglang-kt | MXFP8 | — | 444 GB | ~498 GB + GPU |
 
-| Model | Hardware | t/s | Source |
-|---|---|---|---|
-| Kimi-K2 | 1 GPU + 600 GB RAM | ~10 | ktransformers Kimi-K2 tutorial |
-| DeepSeek-V3 | 1 GPU + 382 GB RAM | 10-16 | ktransformers tutorial |
-| DeepSeek-R1 | 8xL20 + Xeon | 227 | ktransformers README |
-| SmallThinker-21B | 1 GPU + 42 GB RAM | ~26 | ktransformers tutorial |
+### 768 GB server
 
-### What works for interactive chat
+| Model | Engine | Type | Default | Size | RAM |
+|---|---|---|---|---|---|
+| qwen3.8 (2.4T-A95B) | llama.cpp | 2.4T MoE, 95B active | UD-IQ1_S | 508 GB | ~568 GB |
+| kimi-k3 | llama.cpp | 2.78T MoE, 93B active, 1M ctx | UD-IQ1_S | 594 GB | ~663 GB |
+| kimi-k2-thinking | sglang-kt | INT4 safetensors | — | 594 GB | ~662 GB + GPU |
+| deepseek-v3.2-kt | sglang-kt | FP8 safetensors | — | 689 GB | ~766 GB + GPU |
 
-The only way to get >5 t/s on CPU-only hardware is a dense model
-(no MoE expert routing). Based on llama.cpp community benchmarks
-for similar hardware (not measured here):
+## Speed: what to expect
 
-| Model type | Size | t/s on THIS machine | Usability here |
-|---|---|---|---|
-| 7-9B dense | 5-10 GB | 0.69 (measured) | Impractical |
-| 12B dense | 7-18 GB | not measured | Unknown |
-| 27-32B dense | 16-55 GB | not measured | Unknown |
-| Any MoE >30B | varies | 0.3-0.85 (measured) | Impractical |
+Throughput on CPU is bounded by memory bandwidth × active parameters. Rough
+rules from this project's measurements and community numbers:
 
-The 9B dense measurement (0.69 t/s) is far below community estimates
-(10-20 t/s). The bottleneck is this machine's CPU: AVX2-only (no
-AVX-512, no AMX, no VNNI) with DDR4-3200. Models that run at 10-20 t/s
-on AVX-512 or Apple Silicon run at <1 t/s here.
+- **3–5 B active MoE, Q4** (the 48 GB tier): 25–60 t/s on Apple M-series
+  Max/Ultra, 10–25 t/s on a modern desktop with DDR5, 3–8 t/s on an AVX2-only
+  DDR4 cloud VM. Interactive everywhere except the last case.
+- **10–17 B active** (96 GB tier): roughly a third of the above.
+- **≥ 23 B active** (server tiers): needs a GPU for attention (sglang-kt) or a
+  many-channel EPYC/Xeon to be interactive; otherwise batch-only.
 
-The tradeoff: dense models have fewer total parameters than MoE models
-of equivalent quality, so you get less capability per token but actual
-conversation speed — on hardware with sufficient memory bandwidth.
+Measured in this project (all CPU-only, llama.cpp):
 
-No model has been measured at interactive speed on this machine.
+| Machine | Model | t/s (generation) |
+|---|---|---|
+| Mac M2 Max 96 GB (Metal) | Qwen3.8-9B dense Q4_K_M | 47 |
+| AMD EPYC 7B13 24c, AVX2, DDR4-3200, cloud disk | gemma-4-26b-a4b UD-Q4_K_XL, page cache warm | 9–11.6 (prompt 20–30) |
+| same, first requests after load (experts still paging from disk) | same | 1.6–4.3 |
+| same | Qwen3.8-9B dense Q4_K_M | 0.7 |
+| same | Kimi-K3 UD-IQ1_S (594 GB) | 0.85 |
+| same | DeepSeek-V4-Flash UD-IQ1_S (83 GB) | 0.33 |
 
-### Kimi-K3 and Qwen3.8-2.4T — hardware table
+The gemma numbers are from this session's `logs/gemma-4-26b-a4b.log`
+(`print_timing` lines, 2026-09-16). The 9B-dense at 0.7 t/s vs 47 t/s on the
+Mac is the memory-bandwidth gap (DDR4 vs 400 GB/s unified); the two big MoEs
+were paging experts from a ~400 MB/s disk, a storage number rather than a model
+number. That a 4B-active MoE reaches double digits even on this slow box is
+why the default tier is small-active MoEs.
 
-These are trillion-parameter models. They require datacenter-class
-hardware for interactive use.
+## Step 4: models.yaml
 
-| Hardware | RAM needed (IQ1_S) | Est. t/s | Usability |
-|---|---|---|---|
-| CPU only (this machine) | 594 GB (K3) / 508 GB (Qwen3.8) | ~0.85 (measured) | Impractical |
-| CPU only, local NVMe | same | ~5-10 (est.) | Batch processing |
-| 1 GPU, 24 GB VRAM | ~570 GB (K3) | ~1-3 (est.) | Batch processing |
-| 2 GPU, 160 GB VRAM | ~434 GB (K3) | ~3-8 (est.) | Batch / slow chat |
-| 4 GPU, 320 GB VRAM | ~274 GB (K3) | ~5-15 (est.) | Interactive chat |
-| 8 GPU, 640 GB VRAM | ~0 GB extra | ~15-50 (est.) | Interactive chat |
-
-RAM numbers are arithmetic (GGUF size minus VRAM). t/s numbers are
-estimates based on scaling from the measured 0.85 t/s data point.
-No GPU measurements exist in this project.
-
-### MiniMax-M3 — hardware table
-
-| Hardware | RAM needed (IQ1_M) | Est. t/s | Usability |
-|---|---|---|---|
-| CPU only, 128 GB RAM | 128 GB | not measured | Unknown |
-| CPU only, 192 GB RAM | 128 GB | not measured | Unknown |
-| 1 GPU, 24 GB VRAM | ~104 GB | not measured | Unknown |
-| 2 GPU, 48 GB VRAM | ~80 GB | not measured | Unknown |
-| Mac Studio, 192 GB unified (Metal) | 128 GB | not measured | Unknown |
-
-M3 has not been benchmarked in this project. At 428B params / 23B
-active, it is 5x smaller than K3 — but whether that translates to
-usable speed on CPU is unverified. The ktransformers M3 tutorial
-targets 8x H20 GPUs.
-
-### DeepSeek-V4-Flash — hardware table
-
-| Hardware | RAM needed (IQ1_S) | t/s | Usability |
-|---|---|---|---|
-| CPU only (this machine) | 83 GB | 0.33 (measured) | Impractical |
-| CPU only, local NVMe | 83 GB | not measured | Unknown |
-| 1 GPU, 24 GB VRAM | ~60 GB | not measured | Unknown |
-| 4 GPU, 320 GB VRAM | ~0 GB extra | not measured | Unknown |
-
-V4-Flash at 0.33 t/s on this machine is not usable for chat despite
-fitting comfortably in 378 GB RAM. The bottleneck is expert loading
-from cloud disk, not RAM capacity.
-
-## Step 4: Configure models.yaml
-
-After `litmoe install --model <name>`, the model is added to `models.yaml`
-automatically. You can also edit it manually:
+`litmoe install --model` writes entries like these; `litmoe init` creates the
+file with the default model and Claude-name aliases.
 
 ```yaml
 host: 127.0.0.1
 port: 8080
-api_key: null
+api_key: null              # or a string → Bearer auth required
 
 models:
-  - id: kimi-k3
+  - id: gemma-4-26b-a4b
     engine: llamacpp
-    model_path: /home/user/.litmoe/models/kimi-k3/UD-IQ1_S
-    n_gpu_layers: -1    # -1 = all layers to GPU, 0 = CPU only
-    n_ctx: 65536
+    model_path: ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+    n_gpu_layers: -1       # -1 all layers on GPU (no-op on CPU builds), 0 CPU only
+    n_ctx: 262144          # native; lowered automatically if RAM cannot hold the KV cache
+    extra_args: ["--mmproj", "~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf"]
+    aliases: [claude-sonnet-4-5, claude-haiku-4-5, claude-opus-4-1]
 
-  - id: minimax-m3
-    engine: llamacpp
-    model_path: /home/user/.litmoe/models/minimax-m3/UD-IQ1_M
-    n_gpu_layers: 0     # CPU only if no GPU
-    n_ctx: 65536
+  - id: glm-5.3-flash
+    engine: ktransformers
+    model_path: ~/.litmoe/models/glm-5.3-flash      # safetensors dir (or the HF id zai-org/GLM-5.3-Flash)
+    kt_method: FP8                                  # native precision, per the upstream tutorial; RAWINT4 for Kimi-K2.x
+    kt_num_gpu_experts: 8
+    kt_cpuinfer: 48
+    extra_args: ["--tool-call-parser", "glm47", "--reasoning-parser", "glm45"]
 ```
 
-`n_gpu_layers` controls GPU offload in llama.cpp:
-- `-1`: try to put all layers on GPU (fails if not enough VRAM)
-- `0`: CPU only
-- `N`: put N layers on GPU, rest on CPU
+Field reference (see `litmoe/config.py`):
 
-## Step 5: Start and test
+| Field | Engine | Meaning |
+|---|---|---|
+| `model_path` | both | GGUF file/dir, `repo:QUANT` HF spec, or safetensors dir |
+| `n_ctx` | llama.cpp | context; `0` = memory-aware native |
+| `n_gpu_layers` | llama.cpp | `-ngl` |
+| `extra_args` | both | passed through verbatim to `llama-server` / `sglang.launch_server` (`-t N` overrides the physical-core thread default) |
+| `env` | both | extra environment for the engine process only |
+| `kt_method` | kt | CPU expert backend: `FP8`, `FP8_PERCHANNEL`, `BF16`, `RAWINT4`, `MXFP4`, `MXFP8` (AVX-512); `AMXINT4`, `AMXINT8` (Intel AMX); `LLAMAFILE` (AVX2, GGUF experts via `gguf_path`) |
+| `kt_num_gpu_experts` | kt | experts pinned on GPU |
+| `kt_cpuinfer` / `kt_threadpool_count` | kt | CPU threads for expert compute (default physical cores) / thread pools (default NUMA nodes) |
+| `aliases` | both | additional model ids that route here |
+
+## Step 5: Run
 
 ```bash
-litmoe serve                          # starts gateway + all configured engines
-curl http://127.0.0.1:8080/v1/models  # list available models
-litmoe status                         # check engine health
-litmoe stop                           # stop all engines
+litmoe serve                            # gateway + engines; Ctrl-C stops everything
+litmoe status                           # gateway health + per-engine state
+litmoe stop                             # stop engines litmoe started (PID files)
+curl http://127.0.0.1:8080/v1/models
 ```
 
-Test a request:
+Engines get ports counting up from 8081, skipping the gateway port and any
+port another process already holds (so a stray llama-server on 8081 does not
+kill yours). Engine logs append to `logs/<model-id>.log` with a session header
+per start.
 
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "minimax-m3", "messages": [{"role": "user", "content": "hello"}]}'
-```
+Environment variables litmoe reads (all optional, all `LITMOE_*` — it never
+reads or sets `ANTHROPIC_*` / `OPENAI_*`): `LITMOE_CONFIG` (models.yaml path),
+`LITMOE_MODELS_DIR`, `LITMOE_PREFIX` (engine install prefix), `LITMOE_RUN_DIR`
+(PID files), `LITMOE_READY_TIMEOUT`, `LITMOE_LLAMACPP_TAG` (pin a release).
 
-## Quick reference: which engine for which model?
+## Step 6: Connect Claude Code / Hermes / Open WebUI
 
-| Model | llama.cpp | ktransformers | Default quant | Size | Measured t/s (CPU) |
-|---|---|---|---|---|---|
-| Qwen3.8-9B-Distill | Yes (native) | No | Q4_K_M | 6 GB | 0.69 (impractical) |
-| Gemma-4-12B | Yes (native) | No | Q4_K_M | 7 GB | not measured |
-| Gemma-4-31B | Yes (native) | No | UD-Q4_K_XL | 19 GB | not measured |
-| Llama-4-Scout | Yes (native) | No | Q4_K_M | 65 GB | not measured |
-| DeepSeek-V4-Flash | Yes (native) | No | UD-IQ1_S | 83 GB | 0.33 (impractical) |
-| Kimi-Linear-48B | Yes (native) | No | Q4_K_M | 30 GB | 0.58 (impractical) |
-| MiniMax-M3 | Yes (native) | Yes (SM90 GPU) | UD-IQ1_M | 128 GB | not measured |
-| Kimi-K3 | Yes (native) | No | UD-IQ1_S | 594 GB | 0.85 (impractical) |
-| Qwen3.8-2.4T | Yes (native) | No | UD-IQ1_S | 508 GB | not measured |
-| DeepSeek-V3 | Yes | Yes (Linux+NVIDIA) | varies | ~600 GB | not measured |
-| Kimi-K2 | Yes | Yes (Linux+NVIDIA, ~10 t/s) | Q4_K_M | ~600 GB | not measured |
+See [HARNESSES.md](HARNESSES.md). Short version: use `scripts/claude-local`
+and `scripts/hermes-local`; never `export ANTHROPIC_BASE_URL` in your shell.
 
-Measured on AMD EPYC 7B13, 24 cores, AVX2 only, 377 GB RAM, no GPU, cloud disk.
-No model measured at interactive speed on this hardware.
-ktransformers requires Linux + NVIDIA GPU (triton dependency).
-llama.cpp works on Linux, macOS (Metal), and Windows (Vulkan/DirectML).
+## Docker
 
-Sources: llama.cpp source (LLM_ARCH registrations, model .cpp files), ktransformers
-optimize rules and tutorials, HuggingFace model configs and GGUF repositories. All
-verified August 2026.
+`deploy/docker-compose.yml` builds a CPU llama.cpp image and runs the gateway
+on `127.0.0.1:8000` plus Open WebUI on `:8080`. Edit `deploy/models.yaml`
+(paths are `/models/...`, a read-only mount of `~/.litmoe/models`).

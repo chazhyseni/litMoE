@@ -1,6 +1,11 @@
-# Caddyfile for litmoe
+# Optional TLS/reverse-proxy front for the Docker stack. Not started by
+# docker-compose.yml by default — add a `caddy` service that mounts this file if
+# you want LAN/HTTPS exposure. The gateway has no auth unless models.yaml sets
+# api_key, so put Caddy auth (basic_auth / forward_auth) in front if you do.
+#
+# Gateway container listens on 8000 (see deploy/models.yaml).
 
 :80 {
-    reverse_proxy litmoe-gateway:8080
+    reverse_proxy litmoe-gateway:8000
     encode zstd gzip
 }

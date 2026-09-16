@@ -1,22 +1,23 @@
 # litmoe models.yaml for Docker deployment
 # Gateway listens on port 8000 (Docker network + host loopback 127.0.0.1:8000).
 # Open WebUI on port 8080 externally, connects to gateway at litmoe-gateway:8000.
+# Weights: ~/.litmoe/models on the host, mounted read-only at /models.
 
 host: 0.0.0.0
 port: 8000
 api_key: null
 
 models:
-  # Qwen3.8-9B-Distill (9B dense, distilled from Qwen3.8-2.4T, 6 GB Q4_K_M)
-  # Dense model — no MoE overhead, interactive speed on CPU
-  - id: qwen3.8-9b-distill
+  # Gemma-4-26B-A4B (MoE, 4B active, 256K ctx, vision) — 17 GB UD-Q4_K_XL.
+  # Measured 9–11.6 t/s generation on the 24-core EPYC host once the page cache
+  # is warm (logs/gemma-4-26b-a4b.log, 2026-09-16); the 9B dense it replaces
+  # ran at 0.7 t/s on the same box.
+  - id: gemma-4-26b-a4b
     engine: llamacpp
-    model_path: /models/qwen3.8-9b-distill/Q4_K_M/Qwen3.8-9B-Q4_K_M.gguf
+    model_path: /models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
     n_gpu_layers: 0
-    # 128K native — Claude Code system prompt + tools alone exceed 16K
-    n_ctx: 131072
-    # --jinja enables the model's chat template with tool calling
-    extra_args: ["--jinja"]
+    n_ctx: 262144              # lowered automatically if the container has less RAM
+    extra_args: ["--mmproj", "/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf"]
     # Route Anthropic API clients (Claude Code) to this model unchanged
     aliases:
       - claude-sonnet-4-5
@@ -29,10 +30,16 @@ models:
       - claude-3-5-sonnet-latest
       - claude-3-5-haiku-latest
 
-  # Kimi-Linear-48B (48B MoE, 3B active, 30 GB Q4_K_M)
-  # Loads but 0.58 t/s on CPU — impractical for chat
+  # Qwen3.8-9B-Distill (9B dense) — kept for comparison; 0.7 t/s on this CPU.
+  # - id: qwen3.8-9b-distill
+  #   engine: llamacpp
+  #   model_path: /models/qwen3.8-9b-distill/Q4_K_M/Qwen3.8-9B-Q4_K_M.gguf
+  #   n_gpu_layers: 0
+  #   n_ctx: 131072
+
+  # Kimi-Linear-48B (48B MoE, 3B active, 30 GB Q4_K_M) — 0.58 t/s here (disk-bound)
   # - id: kimi-linear-48b
   #   engine: llamacpp
   #   model_path: /models/kimi-linear-48b/Q4_K_M/Kimi-Linear-48B-A3B-Instruct.Q4_K_M.gguf
   #   n_gpu_layers: 0
-  #   n_ctx: 16384
+  #   n_ctx: 1048576

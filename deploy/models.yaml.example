@@ -1,31 +1,34 @@
-# litmoe models.yaml — example configuration
-# Copy this to models.yaml and edit the paths to your model checkpoints.
-# See docs/SETUP.md for full installation instructions.
+# litmoe models.yaml — Docker deployment example
+# Copy to deploy/models.yaml and edit. Weights live in ~/.litmoe/models on the
+# host, mounted read-only at /models in the container.
+#
+# Gateway listens on 8000 inside the compose network; the host sees it on
+# 127.0.0.1:8000 only (no auth by default → never expose to the LAN).
+# Open WebUI is published on :8080.
 
-host: 127.0.0.1
-port: 8080
-api_key: null   # or a string to require Bearer auth
+host: 0.0.0.0
+port: 8000
+api_key: null
 
 models:
-  # Example: llama.cpp engine (Kimi-K3, Qwen3.8, MiniMax-M3, etc.)
-  # - id: minimax-m3
+  # Default: Gemma-4-26B-A4B (MoE, 4B active, 256K ctx, vision). Download on the host:
+  #   litmoe install --model gemma-4-26b-a4b --engine none
+  - id: gemma-4-26b-a4b
+    engine: llamacpp
+    model_path: /models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+    n_gpu_layers: 0            # CPU image
+    n_ctx: 262144              # lowered automatically if the container has less RAM
+    extra_args: ["--mmproj", "/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf"]
+    aliases:                   # Anthropic model names Claude Code may send
+      - claude-sonnet-4-5
+      - claude-haiku-4-5
+      - claude-opus-4-1
+
+  # Qwen3.6-35B-A3B — 3B active; strong coding. 22 GB.
+  # - id: qwen3.6-35b-a3b
   #   engine: llamacpp
-  #   model_path: unsloth/MiniMax-M3-GGUF:UD-IQ1_M   # 128 GB
-  #   n_gpu_layers: -1     # -1 = all, 0 = CPU only
-  #   n_ctx: 65536
+  #   model_path: /models/qwen3.6-35b-a3b/UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+  #   n_gpu_layers: 0
+  #   n_ctx: 262144
 
-  # - id: kimi-k3
-  #   engine: llamacpp
-  #   model_path: unsloth/Kimi-K3-GGUF:UD-IQ1_S      # 594 GB
-  #   n_gpu_layers: -1
-  #   n_ctx: 65536
-
-  # Example: ktransformers engine (DeepSeek-V3, GLM, Kimi-K2, etc.)
-  # - id: deepseek-v3
-  #   engine: ktransformers
-  #   model_path: /data/deepseek-v3
-  #   n_gpu_layers: -1
-  #   n_ctx: 8192
-
-  # Empty list = gateway starts but no models are loaded
-  # Add your models above
+  # Empty list = gateway starts with no models loaded.

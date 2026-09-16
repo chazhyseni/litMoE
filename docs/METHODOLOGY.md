@@ -5,17 +5,20 @@ Python dispatcher over ktransformers and llama.cpp, with no custom inference cod
 
 ## The problem
 
-Kimi K3 and other trillion-parameter MoE models are open-source but unusable
-on most hardware. The HuggingFace checkpoint is 1.45 TB. To run interactively
-you need either:
+Open MoE models span 17 GB (Gemma-4-26B-A4B) to 600 GB+ (Kimi-K3). Two
+engines cover all of them well, on different hardware:
 
-1. **A GPU machine**: A single H100 ($25k-$40k) gets you 5-15 tokens/second.
-2. **More RAM than disk is cheap:** 1 TB DDR4 lets you hold the model in memory.
-3. **Local NVMe** (7 GB/s vs 379 MB/s cloud disk) makes cold-cache fast.
-4. **An engine that supports your hardware**: ktransformers for AMX/AVX-512/AVX2
-   + CUDA, llama.cpp for CUDA/HIP/Metal/Vulkan.
+1. **llama.cpp** — GGUF, every quant from 1.5 to 8 bit, CUDA/HIP/Metal/Vulkan/
+   SYCL/CPU. The right tool from a 48 GB laptop up to a many-core server.
+2. **ktransformers (sglang-kt + kt-kernel)** — attention on one GPU, routed
+   experts on the CPU with AMX/AVX-512 kernels. The right tool for the
+   200 GB–1 TB models on a single-GPU box with lots of RAM.
 
-The previous version of litmoe tried to be the fifth option: a custom
+Neither engine needs help with inference. What users lack is one endpoint,
+one config, sane defaults for their RAM, and a way to point their agent
+harnesses at it without breaking those harnesses.
+
+The previous version of litmoe tried to be a third engine: a custom
 CPU-only C99 forward pass. It was 0.019 t/s on a 24-core EPYC. The math:
 
 - 67 prompt tokens × 92 MoE layers × 16 experts = 98,496 expert lookups
@@ -34,15 +37,19 @@ engines and uses them. Two open-source projects cover everything:
 
 | Engine | Hardware | Strength |
 |---|---|---|
-| **ktransformers** (Tsinghua MADSys Lab, SOSP 2025) | CUDA + AMX + AVX-512 + AVX2 | Heterogeneous CPU+GPU MoE, expert offloading |
-| **llama.cpp** | CUDA + HIP + Metal + Vulkan + SYCL | Mature cross-platform, every quant format |
+| **ktransformers** (Tsinghua MADSys Lab, SOSP 2025) — served via sglang-kt | CUDA GPU + AMX / AVX-512 / AVX2 CPU | Heterogeneous CPU+GPU MoE, expert offloading, INT4/INT8/FP8/RAWINT4 experts |
+| **llama.cpp** | CUDA + HIP + Metal + Vulkan + SYCL + CPU | Mature cross-platform, every quant format, every model tier |
 
 litmoe is the front door: a Python package that:
 
-1. Reads a `models.yaml` config.
-2. Starts the chosen engine as a subprocess (`kt run` or `llama-server`).
-3. Exposes a single OpenAI/Anthropic-compatible API on port 8080.
-4. Routes `/v1/chat/completions` requests to the right engine by model name.
+1. Reads a `models.yaml` config; ships a catalog (`litmoe/models.py`) tiered
+   by RAM so `litmoe init` picks something that is fast on *this* machine.
+2. Starts the chosen engine as a subprocess (`python -m sglang.launch_server`
+   or `llama-server`), supervises it, and stops it cleanly.
+3. Exposes a single OpenAI + Anthropic-compatible API on 127.0.0.1:8080.
+4. Routes requests to the right engine by model name or alias.
+5. Connects agent harnesses (Claude Code, Hermes) **per process**, never by
+   rewriting their global configuration.
 
 That's it. No custom forward pass. No CUDA kernels. No safetensors parsing.
 
@@ -53,14 +60,21 @@ heterogeneous-expert scheduler; llama.cpp ships 1.5-bit to 8-bit quantization
 across every GPU vendor. The optimization space is enormous and competition
 between these engines is healthy. Reimplementing kernels loses to both.
 
-**Engines already speak HTTP.** Both `kt run` (sglang-kt backend) and
-`llama-server` ship OpenAI-compatible servers. The gateway is a pass-through.
+**Engines already speak HTTP.** Both `sglang.launch_server` (the ktransformers
+serving stack since v0.4) and `llama-server` ship OpenAI-compatible servers.
+The gateway is a pass-through plus an Anthropic translation layer.
 
 **Configuration is the hard part.** Users don't care which engine is running;
-they care which model responds. The dispatcher lets a single `models.yaml`
-mix engines: kimi-k3 → llama.cpp (native GGUF support), deepseek-v3 →
-ktransformers (native AMX/AVX optimization), tiny test model → ktransformers
-CPU. The user writes `model: kimi-k3` and gets a response.
+they care which model responds, and that it is fast enough on the hardware
+they have. The dispatcher lets a single `models.yaml` mix engines:
+gemma-4-26b-a4b → llama.cpp on a laptop, glm-5.3-flash → sglang-kt on a
+GPU server. The catalog encodes what fits where so the default is never a
+594 GB download on a 96 GB machine.
+
+**Defaults must be fast, not just fit.** A 9B dense model "fits" a 16 GB
+laptop but ran at 0.7 t/s on an AVX2 DDR4 box; a 26B MoE with 4B active ran
+at 9–11 t/s on the same box. Small-active MoEs are the laptop tier; dense
+models and big MoEs are listed, not defaulted.
 
 **Inference is hardware-bound, not software-bound.** The previous "optimization"
 work (cross-layer prefetch, 2-bit quantization, mmap advisor, fused matmul)
@@ -75,12 +89,12 @@ Google Cloud PersistentDisk at ~379 MB/s random / ~778 MB/s sequential read).
 
 | Engine | Mode | Tokens/sec | Notes |
 |---|---|---|---|
-| Previous C99 AVX2 forward pass | CPU | 0.019 | 158s TTFT for 4-token prompt; thread stuck in DISK SLEEP |
-| llama.cpp (BF16 trunk, IQ1_S experts) | CPU | 0.85 | 1.17 s/token measured in this environment |
-| llama.cpp + Q2_0 expert quant | CPU | not measured in this env | the disk math says 1.4 t/s is a theoretical max |
-| ktransformers AVX2 CPU backend | CPU | not measured (no installation) | ktransformers docs: comparable to llama.cpp |
-| ktransformers sglang-kt GPU backend | GPU | 5-50 t/s typical | needs GPU machine; 8x L20 = 87.58 t/s concurrent |
-| llama.cpp CUDA + Q2_K | GPU | 5-30 t/s typical | depends on VRAM size |
+| Previous C99 AVX2 forward pass, Kimi-K3 | CPU | 0.019 | 158s TTFT for 4-token prompt; thread stuck in DISK SLEEP |
+| llama.cpp, Kimi-K3 UD-IQ1_S (594 GB) | CPU | 0.85 | experts paging from cloud disk |
+| llama.cpp, Qwen3.8-9B dense Q4_K_M | CPU | 0.7 | in RAM; DDR4 bandwidth-bound |
+| llama.cpp, Gemma-4-26B-A4B UD-Q4_K_XL | CPU | 9–11.6 warm (1.6–4.3 cold) | 2026-09-16, `logs/gemma-4-26b-a4b.log` |
+| llama.cpp, Qwen3.8-9B dense Q4_K_M | Mac M2 Max, Metal | 47 | 96 GB unified memory |
+| ktransformers sglang-kt GPU backend | GPU + CPU experts | 5–50 t/s typical | upstream tutorials; needs a CUDA GPU |
 
 The previous engine was 45x slower than llama.cpp on the same hardware doing
 the same thing. The gap to GPU is 100-1000x. There's no path from the custom
@@ -88,10 +102,14 @@ C engine to "interactive inference on this VM."
 
 ## What you get
 
-- **CPU machine, AVX2 only:** ktransformers AVX2 backend, ~0.5-1 t/s for K3.
-  Viable for batch processing, not for chat.
-- **GPU machine:** ktransformers sglang-kt, 5-50 t/s. Viable for chat.
-- **Anything else:** llama.cpp. Works on CUDA/HIP/Metal/Vulkan.
+- **Laptop, 48–96 GB (Apple Silicon or x86):** llama.cpp with a 3–5B-active
+  MoE from the default tier. Interactive.
+- **Workstation, 192 GB:** llama.cpp with DeepSeek-V4-Flash / MiniMax-M2.7 /
+  Qwen3.8-Flash-Next at Q4.
+- **Server with a CUDA GPU and 512 GB+:** sglang-kt with CPU expert offload
+  for GLM-5.3-Flash, Kimi-K2.x, DeepSeek-V3.2, MiniMax-M3.
+- **Server, CPU only, 768 GB+:** llama.cpp with Kimi-K3 / Qwen3.8-2.4T at
+  IQ1 — batch use, not chat, unless the CPU has many memory channels.
 
 Pick the engine per model in `models.yaml`. Both engines speak OpenAI HTTP.
 The dispatcher adds latency in the single-digit-millisecond range and never
@@ -112,24 +130,29 @@ touches the forward pass.
 litmoe/
 ├── pyproject.toml          # modern Python package
 ├── litmoe/
+│   ├── models.py           # model catalog by RAM tier (HF-verified sizes, ctx, KV)
 │   ├── config.py           # Pydantic models.yaml schema
-│   ├── server.py           # FastAPI OpenAI/Anthropic gateway
+│   ├── server.py           # FastAPI OpenAI/Anthropic gateway + engine supervision
+│   ├── platform_utils.py   # RAM, physical cores, macOS quirks
 │   ├── engines/
-│   │   ├── base.py         # Engine abstract base
-│   │   ├── ktransformers.py  # kt run subprocess adapter
+│   │   ├── base.py         # Engine abstract base, PID files, log headers
+│   │   ├── ktransformers.py  # sglang-kt subprocess adapter
 │   │   └── llamacpp.py     # llama-server subprocess adapter
 │   └── cli/
-│       ├── main.py         # litmoe doctor|init|install|serve|status|stop
+│       ├── main.py         # litmoe doctor|init|models|install|serve|status|stop
 │       └── install.py      # one-command engine + model installer
-├── examples/
-│   └── models.yaml         # engine routes
-├── deploy/
-│   └── docker-compose.yml  # gateway + caddy + openwebui
-├── docs/
-│   ├── SETUP.md           # installation and hardware requirements
-│   ├── METHODOLOGY.md      # this file
-│   ├── ARCHITECTURE.md     # architecture diagram
-│   └── architecture.svg    # rendered diagram
+├── scripts/
+│   ├── claude-local        # Claude Code → gateway, per-process env only
+│   └── hermes-local        # Hermes Agent → gateway, per-process env only
+├── tests/test_litmoe.py    # unit tests (no network, no engines)
+├── examples/models.yaml    # tiered example config
+├── deploy/                 # docker-compose: gateway (CPU llama.cpp) + Open WebUI
+└── docs/
+    ├── SETUP.md            # install, tiers, models.yaml reference
+    ├── HARNESSES.md        # Claude Code / Hermes isolation and revert
+    ├── METHODOLOGY.md      # this file
+    ├── ARCHITECTURE.md     # architecture diagram
+    └── architecture.svg    # rendered diagram
 ```
 
 ## What was learned along the way

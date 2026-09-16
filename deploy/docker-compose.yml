@@ -6,8 +6,8 @@
 #
 # Prerequisites:
 #   1. Copy models.yaml.example to models.yaml and edit model paths
-#   2. Model weights downloaded via: litmoe install --model <name>
-#   3. Model weights at ~/.litmoe/models/ (mounted to /models in container)
+#   2. Model weights downloaded via: litmoe install --model <name> --engine none
+#   3. Weights at ~/.litmoe/models (override with LITMOE_MODELS_DIR=...), mounted read-only at /models
 
 services:
   # Main gateway: routes requests to engines (llama.cpp built into image)
@@ -21,12 +21,13 @@ services:
       - "8000"
     ports:
       # Loopback only — gateway has no auth (api_key: null); not for LAN exposure.
-      # Lets host clients (e.g. Claude Code via ANTHROPIC_BASE_URL) reach /v1.
+      # Host clients reach it at http://127.0.0.1:8000 (e.g. scripts/claude-local
+      # --gateway http://127.0.0.1:8000 — per-process, never a global export).
       - "127.0.0.1:8000:8000"
     volumes:
       - ./models.yaml:/config/models.yaml:ro
       - ./logs:/app/logs
-      - /home/chaz/.litmoe/models:/models:ro
+      - ${LITMOE_MODELS_DIR:-${HOME}/.litmoe/models}:/models:ro
     environment:
       - LITMOE_CONFIG=/config/models.yaml
     healthcheck:

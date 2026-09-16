@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import platform
-import shutil
 import signal
 import subprocess
 import sys
@@ -13,15 +12,27 @@ import click
 import yaml
 
 from litmoe import __version__
-from litmoe.config import GatewayConfig, load_config, default_config_path, expand_path
+from litmoe.cli.install import install_cmd, print_model_table
+from litmoe.config import default_config_path, expand_path, load_config
 from litmoe.engines import kt_installed, llama_installed
-from litmoe.cli.install import install_cmd
+from litmoe.models import (CLAUDE_ALIASES, DEFAULT_MODEL, KNOWN_MODELS, quant_size_gb,
+                           recommended_for_ram, smallest_gguf_model)
+from litmoe.platform_utils import (
+    cpu_flags,
+    get_numa_nodes,
+    get_physical_cores,
+    get_total_memory_bytes,
+    has_amx,
+    has_avx512,
+    is_macos,
+    nvidia_gpus,
+)
 
 
 @click.group()
 @click.version_option(version=__version__, prog_name="litmoe")
 def cli():
-    """litmoe - OpenAI-compatible gateway for ktransformers and llama.cpp"""
+    """litmoe - OpenAI-compatible gateway for llama.cpp and ktransformers"""
     pass
 
 
@@ -32,23 +43,16 @@ def doctor():
     click.echo(f"Python: {sys.executable} ({sys.version.split()[0]})")
     click.echo()
 
-    from litmoe.platform_utils import is_macos, get_total_memory_bytes
-
-    # CPU detection
     click.echo("=== CPU ===")
     if is_macos():
         try:
-            result = subprocess.run(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True, text=True, timeout=5,
-            )
+            result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                    capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 click.echo(f"  {result.stdout.strip()}")
-            # Check for ARM64 features
             if platform.machine() == "arm64":
-                click.echo("  Architecture: Apple Silicon (ARM64)")
-                click.echo("  Features: Metal, NEON, AMX")
-        except Exception:
+                click.echo("  Architecture: Apple Silicon (ARM64) — Metal, NEON, AMX")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
             click.echo("  (could not detect CPU)")
     else:
         try:
@@ -57,137 +61,141 @@ def doctor():
                     if "model name" in line:
                         click.echo(f"  {line.split(':')[1].strip()}")
                         break
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if "flags" in line:
-                        flags = line.split(":")[1].strip().split()
-                        interesting = ["sse4_2", "avx", "avx2", "avx512f", "avx512_bf16",
-                                       "avx512_vnni", "amx_tile", "amx_bf16", "amx_int8"]
-                        supported = [flag for flag in interesting if flag in flags]
-                        click.echo(f"  Instruction sets: {', '.join(supported)}")
-                        break
         except FileNotFoundError:
             click.echo("  (not Linux)")
+        flags = cpu_flags()
+        interesting = ["sse4_2", "avx", "avx2", "avx512f", "avx512_bf16", "avx512_vnni",
+                       "amx_tile", "amx_bf16", "amx_int8"]
+        click.echo(f"  Instruction sets: {', '.join(fl for fl in interesting if fl in flags) or 'unknown'}")
+    click.echo(f"  Physical cores: {get_physical_cores()} (threads used by llama-server), "
+               f"NUMA nodes: {get_numa_nodes()}")
 
-    # Memory — cross-platform
     click.echo()
     click.echo("=== Memory ===")
     total_mem = get_total_memory_bytes()
-    if total_mem:
-        click.echo(f"  Total: {total_mem / 1e9:.1f} GB")
+    ram_gb = total_mem / 1e9 if total_mem else None
+    if ram_gb:
+        click.echo(f"  Total: {ram_gb:.0f} GB")
+        if is_macos():
+            click.echo(f"  Metal can use ~{ram_gb * 0.75:.0f} GB of it by default "
+                       f"(raise with: sudo sysctl iogpu.wired_limit_mb=<MB>)")
     else:
         click.echo("  (could not detect memory)")
 
-    # GPU detection
     click.echo()
     click.echo("=== GPU ===")
-    if shutil.which("nvidia-smi"):
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                click.echo(f"  {line}")
-        else:
-            click.echo("  nvidia-smi not working")
+    gpus = nvidia_gpus()
+    if gpus:
+        for g in gpus:
+            click.echo(f"  {g}")
+    elif is_macos():
+        click.echo("  Apple GPU (Metal) via llama.cpp")
     else:
         click.echo("  No NVIDIA GPU detected")
 
-    # Engine availability
     click.echo()
     click.echo("=== Engines ===")
-    if kt_installed():
-        click.echo("  ktransformers: installed")
-    else:
-        click.echo("  ktransformers: NOT installed (litmoe install --engine ktransformers)")
     if llama_installed():
         click.echo("  llama.cpp: installed")
     else:
         click.echo("  llama.cpp: NOT installed (litmoe install --engine llamacpp)")
-
-    # Recommendation
-    click.echo()
-    click.echo("=== Recommended engine ===")
     if kt_installed():
-        if shutil.which("nvidia-smi"):
-            click.echo("  ktransformers (GPU + CUDA available)")
-        else:
-            click.echo("  ktransformers (CPU AMX/AVX2/AVX512)")
-    elif llama_installed():
-        click.echo("  llama.cpp")
+        click.echo("  ktransformers (kt-kernel + sglang-kt): installed")
     else:
-        click.echo("  None - run 'litmoe install --engine llamacpp' or 'litmoe install --engine ktransformers'")
+        from litmoe.engines.ktransformers import missing_components
+        click.echo(f"  ktransformers: NOT installed — missing {', '.join(missing_components())} "
+                   f"(litmoe install --engine ktransformers)")
+
+    click.echo()
+    click.echo("=== Recommendation ===")
+    if is_macos():
+        click.echo("  Engine: llama.cpp (Metal). ktransformers needs Linux + NVIDIA GPU.")
+    elif gpus and has_avx512():
+        click.echo("  Engine: llama.cpp for GGUF models; ktransformers for native FP8/INT4 MoE "
+                   f"checkpoints (AVX-512 {'+ AMX ' if has_amx() else ''}CPU backend available).")
+    elif gpus:
+        click.echo("  Engine: llama.cpp. ktransformers only with kt_method LLAMAFILE here "
+                   "(no AVX-512: FP8/BF16/RAWINT4 CPU backends unavailable).")
+    else:
+        click.echo("  Engine: llama.cpp (CPU). ktransformers serving requires an NVIDIA GPU.")
+    if ram_gb:
+        budget = ram_gb * (0.75 if is_macos() else 1.0)
+        recs = recommended_for_ram(budget)
+        if recs:
+            click.echo(f"  Models that fit {ram_gb:.0f} GB RAM (fastest first): "
+                       + ", ".join(f"{r} ({quant_size_gb(r, None):.0f} GB)" for r in recs))
+        click.echo("  Full list with fit info: litmoe models")
+
+
+@cli.command("models")
+def models_cmd():
+    """List the model catalog by RAM tier and show what fits this machine."""
+    total = get_total_memory_bytes()
+    print_model_table(total / 1e9 if total else None)
 
 
 @cli.command()
-def init():
-    """Create a default models.yaml config file."""
+@click.option("--force", is_flag=True, help="Overwrite an existing models.yaml")
+def init(force):
+    """Create a models.yaml with fast defaults for this machine's RAM.
+
+    Entries use HuggingFace repo specs (owner/repo:QUANT): llama-server
+    downloads them on first start. Use `litmoe install --model X` to
+    pre-download instead.
+    """
     cfg_path = Path("models.yaml")
-    if cfg_path.exists():
-        click.echo(f"{cfg_path} already exists. Refusing to overwrite.")
+    if cfg_path.exists() and not force:
+        click.echo(f"{cfg_path} already exists. Use --force to overwrite.")
         sys.exit(1)
 
-    # Detect engines
-    # Both engines are first-class — pick based on what's installed.
-    # ktransformers supports DeepSeek-V3, GLM, Kimi-K2, Qwen3, MiniMax.
-    # llama.cpp supports Kimi-K3, Qwen3.8, and many more via GGUF.
-    if llama_installed():
-        engine = "llamacpp"
-    elif kt_installed():
-        engine = "ktransformers"
+    total = get_total_memory_bytes()
+    ram_gb = total / 1e9 if total else None
+    budget = ram_gb * (0.75 if is_macos() else 1.0) if ram_gb else None
+    if budget:
+        # recommended_for_ram already leads with DEFAULT_MODEL when it fits.
+        picks = recommended_for_ram(budget, max_models=3)
+        if not picks:
+            picks = [smallest_gguf_model()]
+            click.echo(f"Warning: {ram_gb:.0f} GB RAM is below every catalog tier; "
+                       f"picking the smallest model ({picks[0]}) — expect a reduced context.", err=True)
     else:
-        engine = "llamacpp"
+        picks = [DEFAULT_MODEL]
 
-    default_models = {
-        "llamacpp": [
-            {
-                "id": "kimi-k3",
-                "engine": "llamacpp",
-                "model_path": "unsloth/Kimi-K3-GGUF:UD-IQ1_S",
-                "n_gpu_layers": -1,
-                "n_ctx": 65536,
-            },
-            {
-                "id": "qwen3.8-2.4t",
-                "engine": "llamacpp",
-                "model_path": "unsloth/Qwen3.8-2.4T-A95B-GGUF:UD-IQ1_S",
-                "n_gpu_layers": -1,
-                "n_ctx": 65536,
-            },
-        ],
-        "ktransformers": [
-            {
-                "id": "deepseek-v3",
-                "engine": "ktransformers",
-                "model_path": "/data/deepseek-v3",
-                "n_gpu_layers": -1,
-                "n_ctx": 65536,
-            },
-        ],
-    }
+    models = []
+    for i, mid in enumerate(picks):
+        info = KNOWN_MODELS[mid]
+        entry = {
+            "id": mid,
+            "engine": "llamacpp",
+            "model_path": f"{info['hf_repo']}:{info['default_quant']}",
+            "n_gpu_layers": -1,
+            # 0 = "memory-aware native": the gateway raises this to the largest
+            # context (up to the model's native max) that fits RAM at start-up
+            # and writes the result back here.
+            "n_ctx": 0,
+        }
+        if i == 0:
+            # Anthropic-API clients (Claude Code) send Claude model names.
+            entry["aliases"] = list(CLAUDE_ALIASES)
+        models.append(entry)
 
-    cfg = {
-        "host": "127.0.0.1",
-        "port": 8080,
-        "api_key": None,
-        "models": default_models.get(engine, default_models["ktransformers"]),
-    }
-
+    cfg = {"host": "127.0.0.1", "port": 8080, "api_key": None, "models": models}
     with open(cfg_path, "w") as f:
+        f.write("# litmoe gateway config. Docs: https://github.com/chazhyseni/litMoE\n")
+        f.write("# model_path may be a local GGUF, a HuggingFace spec owner/repo:QUANT, or a URL.\n")
+        if ram_gb:
+            f.write(f"# Defaults chosen for {ram_gb:.0f} GB RAM; see `litmoe models` for more.\n")
         yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
 
-    click.echo(f"Created {cfg_path}")
-    click.echo("Edit model paths then run: litmoe serve")
-    click.echo()
-    click.echo("Tip: Use absolute paths in model_path fields. If you use ~")
-    click.echo("     it will be expanded automatically, but absolute paths")
-    click.echo("     avoid any ambiguity.")
+    click.echo(f"Created {cfg_path} with: {', '.join(picks)}")
+    if ram_gb:
+        click.echo(f"  (chosen for {ram_gb:.0f} GB RAM — fastest models that fit; edit freely)")
+    click.echo("Next: litmoe serve   (first start downloads the weights)")
+    click.echo("Or pre-download:  litmoe install --model " + picks[0])
 
 
 @cli.command()
-@click.option("--config", "-c", type=click.Path(), default=None,
-              help="Path to models.yaml")
+@click.option("--config", "-c", type=click.Path(), default=None, help="Path to models.yaml")
 @click.option("--log-dir", default="logs", help="Directory for engine logs")
 def serve(config, log_dir):
     """Start the gateway with all configured engines."""
@@ -199,8 +207,7 @@ def serve(config, log_dir):
 
     cfg = load_config(cfg_path)
     click.echo(f"litmoe v{__version__} starting gateway on {cfg.host}:{cfg.port}")
-    model_ids = [m.id for m in cfg.models]
-    click.echo(f"Models: {model_ids}")
+    click.echo(f"Models: {[m.id for m in cfg.models]}")
     click.echo(f"Log dir: {log_dir}")
     click.echo()
 
@@ -223,9 +230,9 @@ def status(config):
     cfg = load_config(cfg_path)
     click.echo(f"Configured models: {[m.id for m in cfg.models]}")
 
-    # Poll gateway health
+    host = "127.0.0.1" if cfg.host in ("0.0.0.0", "::") else cfg.host
     try:
-        r = httpx.get(f"http://{cfg.host}:{cfg.port}/health", timeout=5.0)
+        r = httpx.get(f"http://{host}:{cfg.port}/health", timeout=5.0)
         if r.status_code == 200:
             data = r.json()
             click.echo()
@@ -238,25 +245,50 @@ def status(config):
 
 
 @cli.command()
-def stop():
-    """Stop all engines (sends SIGTERM to running processes)."""
-    patterns = ["kt run", "llama-server", "ktransformers.server.main"]
-    click.echo(f"Looking for engine processes matching: {patterns}")
+@click.option("--all", "kill_all", is_flag=True,
+              help="Also SIGTERM any llama-server / sglang process not started by litmoe")
+def stop(kill_all):
+    """Stop the engines litmoe started (from ~/.litmoe/run/*.pid).
+
+    Only litmoe's own engine processes are touched, so an Ollama, LM Studio or
+    manually launched llama-server keeps running. Use --all to override.
+    """
+    from litmoe.engines.base import pid_dir
+
     found = False
-    for pattern in patterns:
-        result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
-        if result.stdout:
+    run_dir = pid_dir()
+    for pidfile in sorted(run_dir.glob("*.pid")) if run_dir.exists() else []:
+        try:
+            pid = int(pidfile.read_text().strip())
+        except ValueError:
+            pidfile.unlink(missing_ok=True)
+            continue
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            click.echo(f"  {pidfile.stem}: SIGTERM to process group of PID {pid}")
             found = True
-            for pid in result.stdout.strip().split("\n"):
-                click.echo(f"  Sending SIGTERM to {pid}")
+        except ProcessLookupError:
+            click.echo(f"  {pidfile.stem}: PID {pid} already gone")
+        except PermissionError:
+            subprocess.run(["kill", "-TERM", f"-{pid}"])
+            found = True
+        pidfile.unlink(missing_ok=True)
+
+    if kill_all:
+        patterns = ["llama-server", "sglang.launch_server", "kt run"]
+        for pattern in patterns:
+            result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+            for pid in result.stdout.split():
+                if int(pid) == os.getpid():
+                    continue
+                click.echo(f"  --all: SIGTERM to {pid} ({pattern})")
                 try:
                     os.kill(int(pid), signal.SIGTERM)
-                except PermissionError:
-                    subprocess.run(["kill", "-TERM", str(pid)])
-                except ProcessLookupError:
+                    found = True
+                except (ProcessLookupError, PermissionError):
                     pass
     if not found:
-        click.echo("  No engine processes found")
+        click.echo("  No litmoe engine processes found" + ("" if kill_all else " (use --all to match by name)"))
 
 
 cli.add_command(install_cmd)

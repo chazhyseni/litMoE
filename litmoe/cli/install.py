@@ -1,12 +1,16 @@
 """litmoe install - one-command engine + model installation.
 
-Installs an inference engine (llama.cpp prebuilt binary or ktransformers pip package)
-and downloads model weights, then writes the model entry into models.yaml.
+Installs an inference engine (llama.cpp release binaries or a source build;
+ktransformers via PyPI wheels or the upstream install.sh) and downloads model
+weights, then writes the model entry into models.yaml.
+
+The model catalog lives in litmoe.models (single source of truth).
 """
 from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -14,406 +18,401 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import click
 import yaml
 
-from litmoe.config import default_config_path
+from litmoe.config import default_config_path, expand_path
+from litmoe.models import (
+    CLAUDE_ALIASES,
+    DEFAULT_MODEL,
+    GGUF,
+    KNOWN_MODELS,
+    SAFETENSORS,
+    TIER_LABELS,
+    fit_context,
+    largest_quant_that_fits,
+    lookup,
+    quant_size_gb,
+    ram_needed_gb,
+    recommended_for_ram,
+)
+from litmoe.platform_utils import (
+    get_total_memory_bytes,
+    has_avx512,
+    is_macos,
+    nvidia_gpus,
+)
 
-# ---------------------------------------------------------------------------
-# Known models: friendly name -> (hf_repo, default_quant, engine)
-# Quant availability verified against HuggingFace API, 2026-08.
-# ---------------------------------------------------------------------------
-KNOWN_MODELS = {
-    "kimi-k3": {
-        "hf_repo": "unsloth/Kimi-K3-GGUF",
-        "engine": "llamacpp",
-        "quants": ["UD-IQ1_S", "UD-IQ1_M", "UD-IQ2_XXS", "UD-Q1_0", "UD-Q2_K_XL",
-                   "UD-Q4_K_XL", "UD-Q8_K_XL", "UD-TQ1_0", "UD-TQ2_0"],
-        "default_quant": "UD-IQ1_S",
-        "size_gb": {"UD-IQ1_S": 594, "UD-IQ1_M": 649, "UD-Q2_K_XL": 861, "UD-Q4_K_XL": 1509},
+LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+# Curated "stable" pointer maintained by llama.cpp CI: the latest release
+# (tagged vX.Y.Z) carries only this file; binaries live in the bNNNNN prereleases.
+LLAMA_NIGHTLY_POINTER = "nightly-tag.txt"
+
+# llama.cpp release asset name fragments per (system, machine, variant).
+# Verified against release b11005 (2026-09-16).
+LLAMACPP_ASSETS: dict[tuple[str, str], dict[str, str]] = {
+    ("linux", "x86_64"): {
+        "cpu": "bin-ubuntu-x64",
+        "cuda": "bin-ubuntu-cuda-12.8-x64",
+        "cuda13": "bin-ubuntu-cuda-13.3-x64",
+        "vulkan": "bin-ubuntu-vulkan-x64",
+        "rocm": "bin-ubuntu-rocm-10.0-x64",
     },
-    "qwen3.8": {
-        "hf_repo": "unsloth/Qwen3.8-2.4T-A95B-GGUF",
-        "engine": "llamacpp",
-        "quants": ["UD-IQ1_S", "UD-IQ1_M", "UD-IQ2_XS", "UD-IQ2_XXS", "UD-IQ3_XXS",
-                   "UD-IQ4_XS", "UD-Q1_0", "Q8_0", "BF16"],
-        "default_quant": "UD-IQ1_S",
-        "size_gb": {"UD-IQ1_S": 508, "UD-IQ1_M": 564, "UD-Q1_0": 397, "UD-IQ2_XXS": 657},
+    ("linux", "aarch64"): {
+        "cpu": "bin-ubuntu-arm64",
+        "cuda": "bin-ubuntu-cuda-13.3-arm64",
+        "cuda13": "bin-ubuntu-cuda-13.3-arm64",
+        "vulkan": "bin-ubuntu-vulkan-arm64",
     },
-    "minimax-m3": {
-        "hf_repo": "unsloth/MiniMax-M3-GGUF",
-        "engine": "llamacpp",
-        "quants": ["UD-IQ1_M", "UD-IQ2_M", "UD-IQ2_XXS", "UD-IQ3_S", "UD-IQ3_XXS",
-                   "UD-IQ4_NL", "UD-IQ4_XS", "UD-Q2_K_XL", "UD-Q3_K_M", "UD-Q3_K_XL",
-                   "UD-Q4_K_M", "UD-Q4_K_S", "UD-Q4_K_XL", "UD-Q5_K_M", "UD-Q5_K_S",
-                   "UD-Q5_K_XL", "UD-Q6_K", "UD-Q6_K_XL", "UD-Q8_K_XL", "Q8_0", "BF16"],
-        "default_quant": "UD-IQ1_M",
-        "size_gb": {"UD-IQ1_M": 128, "UD-IQ2_M": 134, "UD-Q2_K_XL": 143, "UD-Q4_K_M": 264, "Q8_0": 453, "BF16": 852},
-    },
-    "deepseek-v4-flash": {
-        "hf_repo": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
-        "engine": "llamacpp",
-        "quants": ["UD-IQ1_S", "UD-IQ1_M", "UD-IQ2_M", "UD-IQ2_XXS", "UD-IQ3_S",
-                   "UD-IQ3_XXS", "UD-IQ4_NL", "UD-IQ4_XS", "UD-Q2_K_XL", "UD-Q3_K_M",
-                   "UD-Q3_K_XL", "UD-Q4_K_XL", "UD-Q8_K_XL"],
-        "default_quant": "UD-IQ1_S",
-        "size_gb": {"UD-IQ1_S": 83, "UD-IQ1_M": 87, "UD-Q2_K_XL": 97, "UD-Q4_K_XL": 155},
-    },
-    "gemma-4-31b": {
-        "hf_repo": "unsloth/gemma-4-31b-it-GGUF",
-        "engine": "llamacpp",
-        "quants": ["UD-IQ2_XXS", "UD-IQ2_M", "UD-IQ3_XXS", "UD-Q2_K_XL", "UD-Q3_K_XL",
-                   "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL",
-                   "Q3_K_M", "Q3_K_S", "Q4_0", "Q4_1", "Q4_K_M", "Q4_K_S",
-                   "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "BF16"],
-        "default_quant": "UD-Q4_K_XL",
-        "size_gb": {"UD-IQ2_XXS": 9, "UD-IQ2_M": 11, "Q4_K_M": 18, "Q8_0": 33, "BF16": 61},
-    },
-    "gemma-4-12b": {
-        "hf_repo": "unsloth/gemma-4-12b-it-GGUF",
-        "engine": "llamacpp",
-        "quants": ["UD-IQ2_M", "UD-IQ3_XXS", "UD-Q2_K_XL", "UD-Q3_K_XL", "UD-Q4_K_XL",
-                   "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL",
-                   "Q3_K_M", "Q3_K_S", "Q4_0", "Q4_1", "Q4_K_M", "Q4_K_S",
-                   "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "BF16"],
-        "default_quant": "Q4_K_M",
-        "size_gb": {"UD-IQ2_M": 4, "Q4_K_M": 7, "Q8_0": 13, "BF16": 24},
-    },
-    "llama-4-scout": {
-        "hf_repo": "unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF",
-        "engine": "llamacpp",
-        "quants": ["BF16", "IQ4_NL", "IQ4_XS", "Q3_K_M", "Q4_0", "Q4_1", "Q4_K_M",
-                   "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0",
-                   "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "UD-Q8_K_XL"],
-        "default_quant": "Q4_K_M",
-        "size_gb": {"Q3_K_M": 52, "Q4_K_M": 65, "Q6_K": 88, "Q8_0": 115, "BF16": 216},
-    },
-    "kimi-linear-48b": {
-        "hf_repo": "mradermacher/Kimi-Linear-48B-A3B-Instruct-GGUF",
-        "engine": "llamacpp",
-        "quants": ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "IQ4_XS",
-                   "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"],
-        "default_quant": "Q4_K_M",
-        "size_gb": {"Q2_K": 18, "Q3_K_M": 24, "Q4_K_M": 30, "Q5_K_M": 35, "Q6_K": 40, "Q8_0": 52},
-        "file_layout": "root",
-    },
-    "qwen3.8-9b-distill": {
-        "hf_repo": "empero-ai/Qwen3.8-9B-Distill-GGUF",
-        "engine": "llamacpp",
-        "quants": ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "BF16"],
-        "default_quant": "Q4_K_M",
-        "size_gb": {"Q4_K_M": 6, "Q5_K_M": 7, "Q6_K": 8, "Q8_0": 10, "BF16": 18},
-        "file_layout": "root",
-    },
+    ("darwin", "arm64"): {"cpu": "bin-macos-arm64"},   # Metal is built in
+    ("darwin", "x86_64"): {"cpu": "bin-macos-x64"},
 }
-
-LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+LLAMACPP_VARIANTS = ("auto", "cpu", "cuda", "cuda13", "vulkan", "rocm")
+# Ubuntu release binaries link against GLIBC_2.34 symbols; older glibc needs a source build.
+LLAMACPP_PREBUILT_MIN_GLIBC = (2, 34)
 
 
 def _default_models_dir() -> Path:
-    """Default models directory, with ~ and $VARS expanded."""
     raw = os.environ.get("LITMOE_MODELS_DIR", str(Path.home() / ".litmoe" / "models"))
     return Path(os.path.expanduser(os.path.expandvars(raw)))
 
 
 def _default_prefix() -> Path:
-    """Default install prefix, with ~ and $VARS expanded."""
     raw = os.environ.get("LITMOE_PREFIX", str(Path.home() / ".local"))
     return Path(os.path.expanduser(os.path.expandvars(raw)))
+
+
+def _normalize_machine(machine: str) -> str:
+    m = machine.lower()
+    return {"amd64": "x86_64", "arm64": "arm64" if platform.system() == "Darwin" else "aarch64",
+            "aarch64": "aarch64"}.get(m, m)
+
+
+def glibc_version() -> tuple[int, int] | None:
+    """(major, minor) of the running glibc, or None (macOS, musl, unknown)."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        getver = libc.gnu_get_libc_version
+        getver.restype = ctypes.c_char_p
+        major, minor = getver().decode().split(".")[:2]
+        return int(major), int(minor)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp release resolution
+# ---------------------------------------------------------------------------
+
+def _asset_named(release: dict, fragment: str) -> dict | None:
+    """The 'llama-<tag>-<fragment>.tar.gz' asset of a release, or None."""
+    pattern = re.compile(rf"^llama-b\d+-{re.escape(fragment)}\.tar\.gz$")
+    for a in release.get("assets", []):
+        if pattern.match(a["name"]):
+            return a
+    return None
+
+
+def _cudart_asset(release: dict, fragment: str) -> dict | None:
+    pattern = re.compile(rf"^cudart-llama-b\d+-{re.escape(fragment)}\.tar\.gz$")
+    for a in release.get("assets", []):
+        if pattern.match(a["name"]):
+            return a
+    return None
+
+
+def resolve_llamacpp_release(fragment: str, client, tag: str | None = None) -> dict:
+    """Find a llama.cpp release that carries the wanted binary asset.
+
+    Order: an explicit tag (LITMOE_LLAMACPP_TAG or --llamacpp-tag); the curated
+    nightly-tag.txt pointer attached to the 'latest' release; then the newest
+    prerelease that actually has the asset (the very newest tag is often still
+    uploading its 30+ assets).
+    """
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "litmoe"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+
+    def fetch(url: str) -> Any:
+        r = client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+    if tag:
+        rel = fetch(f"{LLAMA_RELEASES_API}/tags/{tag}")
+        if not _asset_named(rel, fragment):
+            raise RuntimeError(f"release {tag} has no asset matching '{fragment}'")
+        return rel
+
+    latest = fetch(f"{LLAMA_RELEASES_API}/latest")
+    if _asset_named(latest, fragment):
+        return latest
+    pointer = next((a for a in latest.get("assets", []) if a["name"] == LLAMA_NIGHTLY_POINTER), None)
+    if pointer:
+        try:
+            r = client.get(pointer["browser_download_url"], headers={"User-Agent": "litmoe"})
+            r.raise_for_status()
+            nightly_tag = r.text.strip()
+            if re.fullmatch(r"b\d+", nightly_tag):
+                rel = fetch(f"{LLAMA_RELEASES_API}/tags/{nightly_tag}")
+                if _asset_named(rel, fragment):
+                    return rel
+        except Exception as e:  # network / 404 — fall through to the scan
+            click.echo(f"  nightly pointer unusable ({e}); scanning recent releases...")
+
+    for rel in fetch(f"{LLAMA_RELEASES_API}?per_page=30"):
+        if _asset_named(rel, fragment):
+            return rel
+    raise RuntimeError(
+        f"No llama.cpp release in the last 30 has an asset matching '{fragment}'. "
+        f"Set LITMOE_LLAMACPP_TAG to a known tag (see {LLAMA_RELEASES_API.replace('api.', '').replace('/repos', '')})."
+    )
+
+
+def pick_llamacpp_variant(variant: str) -> str:
+    """Resolve 'auto' to cpu/cuda based on the machine."""
+    if variant != "auto":
+        return variant
+    if not is_macos() and nvidia_gpus():
+        return "cuda"
+    return "cpu"
 
 
 # ---------------------------------------------------------------------------
 # Engine installers
 # ---------------------------------------------------------------------------
 
-def install_llamacpp(prefix: Path) -> Path:
+def install_llamacpp(prefix: Path, variant: str = "auto", tag: str | None = None) -> Path:
     """Install llama.cpp.
 
-    On macOS: always uses prebuilt binaries (or source build as fallback).
-    On Linux: downloads prebuilt binaries if glibc is new enough (>= 2.34).
-    Falls back to building from source on older systems (Debian 11, etc.).
+    macOS: release binaries (Metal built in), source build as fallback.
+    Linux: release binaries when glibc >= 2.35 (they are built on Ubuntu 22.04),
+    otherwise a source build.
     """
-    from litmoe.platform_utils import is_macos
-
+    variant = pick_llamacpp_variant(variant)
     if is_macos():
-        # macOS: try prebuilt first, fall back to source
         try:
-            return _install_llamacpp_prebuilt(prefix)
+            return _install_llamacpp_prebuilt(prefix, variant, tag)
         except RuntimeError as e:
-            if "No prebuilt" in str(e):
-                click.echo(f"  No prebuilt binary for this platform: {e}")
-                click.echo("  Building from source instead...")
-                return _install_llamacpp_source(prefix)
-            raise
+            click.echo(f"  Release binary unusable ({e}); building from source instead...")
+            return _install_llamacpp_source(prefix)
 
-    # Linux: check glibc version
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6")
-        getver = libc.gnu_get_libc_version
-        getver.restype = ctypes.c_char_p
-        glibc_ver = getver().decode()
-        major, minor = glibc_ver.split(".")[:2]
-        glibc_ok = (int(major), int(minor)) >= (2, 34)
-    except Exception:
-        glibc_ok = False
-        glibc_ver = "unknown"
-
-    if glibc_ok:
-        return _install_llamacpp_prebuilt(prefix)
-    else:
-        click.echo(f"  Prebuilt binary needs glibc 2.34+, this machine has {glibc_ver}.")
-        click.echo("  Building from source instead...")
-        return _install_llamacpp_source(prefix)
+    ver = glibc_version()
+    if ver is not None and ver >= LLAMACPP_PREBUILT_MIN_GLIBC:
+        return _install_llamacpp_prebuilt(prefix, variant, tag)
+    click.echo(f"  Release binaries need glibc {'.'.join(map(str, LLAMACPP_PREBUILT_MIN_GLIBC))}+, "
+               f"this machine has {'.'.join(map(str, ver)) if ver else 'unknown'}.")
+    click.echo("  Building from source instead...")
+    return _install_llamacpp_source(prefix)
 
 
-def _install_llamacpp_prebuilt(prefix: Path) -> Path:
-    """Download prebuilt llama.cpp binaries from GitHub releases."""
-    system = platform.system().lower()
-    machine = platform.machine().lower()
+def _download_to(client, url: str, dest: Path) -> None:
+    with open(dest, "wb") as f:
+        with client.stream("GET", url, headers={"User-Agent": "litmoe"}) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                f.write(chunk)
 
-    if system == "linux" and machine in ("x86_64", "amd64"):
-        asset_substr = "bin-ubuntu-x64.tar.gz"
-    elif system == "linux" and machine in ("aarch64", "arm64"):
-        asset_substr = "bin-ubuntu-arm64.tar.gz"
-    elif system == "darwin" and machine == "arm64":
-        asset_substr = "bin-macos-arm64.tar.gz"
-    elif system == "darwin" and machine in ("x86_64", "amd64"):
-        asset_substr = "bin-macos-x64.tar.gz"
-    else:
-        raise RuntimeError(
-            f"No prebuilt llama.cpp for {system}/{machine}. "
-            "Build from source: https://github.com/ggml-org/llama.cpp"
-        )
 
-    click.echo("  Resolving latest llama.cpp release...")
-    import httpx
-    with httpx.Client(follow_redirects=True, timeout=30.0) as client:
-        r = client.get(LLAMA_RELEASES_API)
-        r.raise_for_status()
-        data = r.json()
-        tag = data["tag_name"]
-        # Find matching asset — may not exist for all platforms
-        asset = None
-        for a in data.get("assets", []):
-            if asset_substr in a["name"]:
-                asset = a
-                break
-        if not asset:
-            available = [a["name"] for a in data.get("assets", [])]
-            raise RuntimeError(
-                f"No llama.cpp release asset matching '{asset_substr}' "
-                f"in release {tag}. Available: {available[:5]}..."
-            )
-        url = asset["browser_download_url"]
-        size_mb = asset["size"] / 1e6
-        click.echo(f"  Downloading {asset['name']} ({size_mb:.0f} MB)...")
-
-        dest_dir = prefix / "lib" / "llama.cpp" / "prebuilt"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                for chunk in resp.iter_bytes(chunk_size=1 << 20):
-                    tmp.write(chunk)
-
-    click.echo(f"  Extracting to {dest_dir}...")
-    with tarfile.open(tmp_path, "r:gz") as tar:
-        # Python 3.12+ requires explicit filter for security
+def _extract_tar(archive: Path, dest_dir: Path) -> None:
+    with tarfile.open(archive, "r:gz") as tar:
         try:
-            tar.extractall(dest_dir, filter="data")
+            tar.extractall(dest_dir, filter="data")  # Python 3.12+ safe extraction
         except TypeError:
-            # Older Python doesn't support the filter argument
             tar.extractall(dest_dir)
 
-    tmp_path.unlink()
 
-    # Find the llama-server binary
-    server = None
-    for candidate in dest_dir.rglob("llama-server"):
-        if candidate.is_file():
-            server = candidate
-            break
+def _install_llamacpp_prebuilt(prefix: Path, variant: str = "cpu", tag: str | None = None) -> Path:
+    """Download llama.cpp release binaries from GitHub."""
+    system = platform.system().lower()
+    machine = _normalize_machine(platform.machine())
+    variants = LLAMACPP_ASSETS.get((system, machine))
+    if not variants:
+        raise RuntimeError(f"No llama.cpp release binaries for {system}/{machine}; build from source.")
+    fragment = variants.get(variant)
+    if not fragment:
+        raise RuntimeError(f"variant '{variant}' is not published for {system}/{machine}; "
+                           f"available: {', '.join(variants)}")
+
+    import httpx
+    click.echo(f"  Resolving llama.cpp release with '{fragment}'...")
+    with httpx.Client(follow_redirects=True, timeout=60.0) as client:
+        release = resolve_llamacpp_release(fragment, client, tag or os.environ.get("LITMOE_LLAMACPP_TAG"))
+        rel_tag = release["tag_name"]
+        asset = _asset_named(release, fragment)
+        assert asset is not None
+        cudart = _cudart_asset(release, fragment) if "cuda" in variant else None
+
+        dest_dir = prefix / "lib" / "llama.cpp" / "prebuilt" / f"llama-{rel_tag}"
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        for a in [asset] + ([cudart] if cudart else []):
+            click.echo(f"  Downloading {a['name']} ({a['size'] / 1e6:.0f} MB)...")
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                _download_to(client, a["browser_download_url"], tmp_path)
+                click.echo(f"  Extracting to {dest_dir}...")
+                _extract_tar(tmp_path, dest_dir)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+    server = next((c for c in dest_dir.rglob("llama-server") if c.is_file()), None)
     if not server:
         raise RuntimeError(f"llama-server not found in extracted archive at {dest_dir}")
+    # Archives nest binaries under build/bin/; move everything next to llama-server
+    # so lib discovery (LD_LIBRARY_PATH = binary dir) is trivial.
+    if server.parent != dest_dir:
+        for item in list(server.parent.iterdir()):
+            shutil.move(str(item), str(dest_dir / item.name))
+        for sub in [p for p in dest_dir.iterdir() if p.is_dir() and not any(p.iterdir())]:
+            sub.rmdir()
+        server = dest_dir / "llama-server"
 
-    # Strip macOS quarantine/provenance attributes by copying binary to a
-    # new file. macOS applies com.apple.provenance to files from certain
-    # sources (including tar extraction) which blocks Python's execve()
-    # and subprocess from launching the binary. Copying creates a clean
-    # file without the attribute.
-    if platform.system() == "Darwin":
-        import shutil as _shutil
-        clean = server.parent / "llama-server.clean"
-        _shutil.copy2(str(server), str(clean))
-        _shutil.move(str(clean), str(server))
-        # Also clean all dylibs
-        for dylib in server.parent.glob("*.dylib*"):
-            if dylib.is_file():
-                clean = dylib.parent / f".{dylib.name}.clean"
-                _shutil.copy2(str(dylib), str(clean))
-                _shutil.move(str(clean), str(dylib))
-
+    if is_macos():
+        # Strip com.apple.provenance/quarantine (blocks execve from Python) by
+        # copying the binary and dylibs over themselves.
+        for f in [server] + [d for d in server.parent.glob("*.dylib*") if d.is_file()]:
+            clean = f.parent / f".{f.name}.clean"
+            shutil.copy2(str(f), str(clean))
+            shutil.move(str(clean), str(f))
     server.chmod(server.stat().st_mode | stat.S_IEXEC)
 
-    # Fix dylib paths on macOS (prebuilt binaries may have stale rpaths)
-    if platform.system() == "Darwin":
+    bin_dir = prefix / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher = bin_dir / "llama-server"
+    if launcher.exists() or launcher.is_symlink():
+        launcher.unlink()
+    if is_macos():
         from litmoe.platform_utils import fix_macos_dylib_paths
         click.echo("  Fixing macOS dylib paths...")
         fix_macos_dylib_paths(server, server.parent)
-
-        # Also copy OpenSSL dylibs if needed
-        import glob as _glob
-        for ssl_lib in ["libssl.3.dylib", "libcrypto.3.dylib",
-                        "libssl.35.dylib", "libcrypto.35.dylib"]:
-            if not (server.parent / ssl_lib).exists():
-                for search in ["/opt/homebrew/lib", "/usr/local/lib",
-                               "/opt/homebrew/opt/openssl@3/lib"]:
-                    found = _glob.glob(f"{search}/{ssl_lib}")
-                    if found:
-                        shutil.copy2(found[0], str(server.parent / ssl_lib))
-                        break
-
-        # Create wrapper script that sets DYLD_FALLBACK_LIBRARY_PATH
-        # (not stripped by SIP for non-restricted binaries)
-        bin_dir = prefix / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        wrapper = bin_dir / "llama-server"
-        if wrapper.exists() or wrapper.is_symlink():
-            wrapper.unlink()
-        wrapper.write_text(
+        _copy_homebrew_openssl(server.parent)
+        launcher.write_text(
             f"#!/bin/bash\n"
             f"export DYLD_FALLBACK_LIBRARY_PATH={server.parent}:$DYLD_FALLBACK_LIBRARY_PATH\n"
             f"export DYLD_LIBRARY_PATH={server.parent}:$DYLD_LIBRARY_PATH\n"
             f"exec {server} \"$@\"\n"
         )
-        wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        launcher.chmod(0o755)
     else:
-        # Symlink into prefix/bin for PATH discovery (Linux)
-        bin_dir = prefix / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        link = bin_dir / "llama-server"
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(server)
+        # A wrapper (not a symlink) so `llama-server` on PATH finds its .so files.
+        launcher.write_text(
+            f"#!/bin/bash\n"
+            f"export LD_LIBRARY_PATH={server.parent}:$LD_LIBRARY_PATH\n"
+            f"exec {server} \"$@\"\n"
+        )
+        launcher.chmod(0o755)
 
-    click.echo(f"  llama-server installed: {server}")
+    # Only one prebuilt release is kept; remove older ones.
+    for old in (prefix / "lib" / "llama.cpp" / "prebuilt").iterdir():
+        if old.is_dir() and old != dest_dir:
+            shutil.rmtree(old, ignore_errors=True)
+
+    click.echo(f"  llama-server {rel_tag} ({variant}) installed: {server}")
     return dest_dir
 
 
-def _install_llamacpp_source(prefix: Path) -> Path:
-    """Build llama.cpp from source (for systems with glibc < 2.34 or macOS).
+def _copy_homebrew_openssl(dest_dir: Path) -> None:
+    """macOS: copy OpenSSL dylibs next to the binary if it links against Homebrew's."""
+    import glob as _glob
+    for ssl_lib in ["libssl.3.dylib", "libcrypto.3.dylib", "libssl.35.dylib", "libcrypto.35.dylib"]:
+        if (dest_dir / ssl_lib).exists():
+            continue
+        for search in ["/opt/homebrew/lib", "/usr/local/lib", "/opt/homebrew/opt/openssl@3/lib"]:
+            found = _glob.glob(f"{search}/{ssl_lib}")
+            if found:
+                shutil.copy2(found[0], str(dest_dir / ssl_lib))
+                break
 
-    On macOS, builds with CMAKE_INSTALL_RPATH baked in AND rewrites all
-    @rpath references to absolute paths post-build so the binary works
-    without any DYLD_* environment variables.
+
+def _install_llamacpp_source(prefix: Path) -> Path:
+    """Build llama.cpp from source (glibc < 2.35, or no usable release binary).
+
+    Linux: CPU build with OpenBLAS (needs libopenblas-dev) and -march=native.
+    macOS: Metal + Accelerate (the default BLAS on macOS), rpath baked in and
+    all @rpath references rewritten to absolute paths post-build.
     """
-    import tempfile
-    from litmoe.platform_utils import is_macos, fix_macos_dylib_paths
+    from litmoe.platform_utils import fix_macos_dylib_paths
+
+    for tool in ("git", "cmake"):
+        if not shutil.which(tool):
+            raise RuntimeError(f"'{tool}' is required to build llama.cpp from source "
+                               f"(apt install {tool} / brew install {tool})")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         click.echo(f"  Cloning llama.cpp to {tmpdir}...")
         clone = subprocess.run(
             ["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", tmpdir],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=300,
         )
         if clone.returncode != 0:
-            raise RuntimeError(f"git clone failed: {clone.stderr.strip()[:200]}")
+            raise RuntimeError(f"git clone failed: {clone.stderr.strip()[:300]}")
 
-        # Install directory — must be an absolute path for rpath to work
         dest_dir = (prefix / "lib" / "llama.cpp" / "local").resolve()
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build with rpath baked in at compile time
-        cmake_args = [
-            "cmake", "-B", "build",
-            "-DGGML_CUDA=OFF", "-DGGML_BLAS=ON",
-            "-DGGML_BLAS_VENDOR=OpenBLAS",
-            "-DGGML_NATIVE=ON",
-            "-DCMAKE_BUILD_TYPE=Release",
-        ]
-
+        cmake_args = ["cmake", "-B", "build", "-DGGML_NATIVE=ON", "-DCMAKE_BUILD_TYPE=Release",
+                      "-DLLAMA_CURL=ON"]
         if is_macos():
-            # Metal backend for Apple Silicon
-            cmake_args.extend([
+            cmake_args += [
                 "-DGGML_METAL=ON",
-                # Bake rpath into the binary at build time so it finds
-                # its dylibs in the install dir without any env vars.
                 f"-DCMAKE_INSTALL_RPATH={dest_dir}",
                 "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
-                # Also set the build rpath for intermediate linking
                 f"-DCMAKE_BUILD_RPATH={dest_dir}",
-            ])
+            ]
+        else:
+            cmake_args += ["-DGGML_CUDA=OFF", "-DGGML_BLAS=ON", "-DGGML_BLAS_VENDOR=OpenBLAS"]
 
-        click.echo("  Building (cmake + make, CPU-only with BLAS, this takes a few minutes)...")
-        cmake = subprocess.run(
-            cmake_args,
-            cwd=tmpdir, capture_output=True, text=True, timeout=120,
-        )
+        click.echo("  Configuring (cmake)...")
+        cmake = subprocess.run(cmake_args, cwd=tmpdir, capture_output=True, text=True, timeout=300)
         if cmake.returncode != 0:
-            raise RuntimeError(f"cmake configure failed: {cmake.stderr.strip()[:200]}")
+            err = cmake.stderr.strip()
+            hint = ""
+            if "BLAS" in err or "OpenBLAS" in err:
+                hint = " (install libopenblas-dev / openblas)"
+            if "CURL" in err.upper():
+                hint = " (install libcurl4-openssl-dev / curl)"
+            raise RuntimeError(f"cmake configure failed{hint}: {err[:400]}")
 
+        click.echo("  Building llama-server (this takes several minutes)...")
         build = subprocess.run(
-            ["cmake", "--build", "build", "--config", "Release", "-j",
-             "--target", "llama-server"],
-            cwd=tmpdir, timeout=600,
+            ["cmake", "--build", "build", "--config", "Release", "-j", "--target", "llama-server"],
+            cwd=tmpdir, timeout=3600,
         )
         if build.returncode != 0:
             raise RuntimeError("Build failed. See output above.")
 
-        # Install: copy binary + shared libs
         build_bin = Path(tmpdir) / "build" / "bin"
         server_bin = build_bin / "llama-server"
         if not server_bin.exists():
             raise RuntimeError(f"llama-server not found at {server_bin}")
 
-        # Copy binary
         shutil.copy2(str(server_bin), str(dest_dir / "llama-server"))
-        # Copy shared libs (.so on Linux, .dylib on macOS)
-        for so in list(build_bin.glob("lib*.so*")) + list(build_bin.glob("lib*.dylib*")):
-            shutil.copy2(str(so), str(dest_dir))
-
-        # Also copy any .so/.dylib from subdirectories (cmake may put them elsewhere)
-        for sub in list(build_bin.rglob("lib*.so*")) + list(build_bin.rglob("lib*.dylib*")):
-            target = dest_dir / sub.name
-            if not target.exists():
-                shutil.copy2(str(sub), str(target))
+        for so in list(build_bin.rglob("lib*.so*")) + list(build_bin.rglob("lib*.dylib*")):
+            target = dest_dir / so.name
+            if not target.exists() or so.parent == build_bin:
+                shutil.copy2(str(so), str(target))
 
         if is_macos():
-            # Copy OpenSSL dylibs from Homebrew if the binary links against them
-            import glob as _glob
-            for ssl_lib in ["libssl.3.dylib", "libcrypto.3.dylib",
-                            "libssl.35.dylib", "libcrypto.35.dylib"]:
-                if not (dest_dir / ssl_lib).exists():
-                    for search in ["/opt/homebrew/lib", "/usr/local/lib",
-                                   "/opt/homebrew/opt/openssl@3/lib"]:
-                        found = _glob.glob(f"{search}/{ssl_lib}")
-                        if found:
-                            shutil.copy2(found[0], str(dest_dir / ssl_lib))
-                            break
-
-            # Nuclear fix: rewrite ALL @rpath and @loader_path references
-            # in the binary and every .dylib to absolute paths.
-            # This makes the binary fully self-contained — no DYLD_* env needed.
+            _copy_homebrew_openssl(dest_dir)
             click.echo("  Fixing dylib paths (rewriting @rpath to absolute)...")
-            binary_path = dest_dir / "llama-server"
-            if fix_macos_dylib_paths(binary_path, dest_dir):
-                click.echo("  Dylib paths fixed successfully.")
-            else:
+            if not fix_macos_dylib_paths(dest_dir / "llama-server", dest_dir):
                 click.echo("  WARNING: could not fix dylib paths, will rely on env vars.")
 
-        # Create a wrapper script that sets library path as a fallback.
-        # On macOS, we set BOTH DYLD_LIBRARY_PATH and DYLD_FALLBACK_LIBRARY_PATH.
-        # DYLD_FALLBACK_LIBRARY_PATH is NOT stripped by SIP for non-restricted
-        # binaries, making it the reliable mechanism.
         bin_dir = prefix / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-
+        wrapper = bin_dir / "llama-server"
+        # Never write through an existing symlink — that overwrites its target
+        # (a previous install did exactly this to the release binary).
+        if wrapper.exists() or wrapper.is_symlink():
+            wrapper.unlink()
         if is_macos():
-            wrapper = bin_dir / "llama-server"
             wrapper.write_text(
                 f"#!/bin/bash\n"
                 f"export DYLD_FALLBACK_LIBRARY_PATH={dest_dir}:$DYLD_FALLBACK_LIBRARY_PATH\n"
@@ -421,199 +420,237 @@ def _install_llamacpp_source(prefix: Path) -> Path:
                 f"exec {dest_dir}/llama-server \"$@\"\n"
             )
         else:
-            wrapper = bin_dir / "llama-server"
             wrapper.write_text(
                 f"#!/bin/bash\n"
                 f"export LD_LIBRARY_PATH={dest_dir}:$LD_LIBRARY_PATH\n"
                 f"exec {dest_dir}/llama-server \"$@\"\n"
             )
-        wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        wrapper.chmod(0o755)
 
         click.echo(f"  llama-server built and installed: {dest_dir}/llama-server")
         return dest_dir
 
 
+def ktransformers_wheel_supported() -> tuple[bool, str]:
+    """Can `pip install ktransformers[sglang]` work here? (ok, reason)."""
+    if platform.system() != "Linux" or _normalize_machine(platform.machine()) != "x86_64":
+        return False, "PyPI wheels exist only for Linux x86-64"
+    if sys.version_info[:2] not in ((3, 11), (3, 12)):
+        return False, f"PyPI wheels exist only for Python 3.11/3.12 (running {sys.version_info.major}.{sys.version_info.minor})"
+    ver = glibc_version()
+    if ver is None or ver < (2, 35):
+        return False, f"PyPI wheels are manylinux_2_35 (glibc 2.35+), this machine has {'.'.join(map(str, ver)) if ver else 'unknown'}"
+    return True, "ok"
+
+
 def install_ktransformers() -> None:
-    """Install ktransformers.
+    """Install ktransformers (kt-kernel + sglang-kt) for serving.
 
-    Clones the repo and pip-installs from source. This bypasses the prebuilt
-    wheel glibc requirement (manylinux_2_35) by building locally.
+    Serving uses `python -m sglang.launch_server --kt-method ...`; both
+    kt-kernel and sglang-kt are required. Two paths:
 
-    Limitations:
-    - Does not work on macOS (kt-kernel depends on triton, which is
-      Linux+NVIDIA only: https://github.com/triton-lang/triton/issues/3443)
-    - Requires Python 3.11+ and a C++ compiler (gcc/clang)
-    - CUDA toolkit needed for GPU backend (CPU-only mode works without it)
+    1. PyPI: `pip install "ktransformers[sglang]"` — Linux x86-64, Python
+       3.11/3.12, glibc >= 2.35 (manylinux_2_35 wheels).
+    2. Source: `git clone --recursive` + upstream `install.sh`, which builds
+       sglang from third_party/ and kt-kernel from source (needs a C++
+       toolchain, CMake, and the CUDA toolkit for the GPU parts).
+
+    Not available on macOS (CUDA/triton). Serving requires an NVIDIA GPU.
     """
-    import tempfile
-
     if platform.system() == "Darwin":
-        click.echo("  ktransformers is not available on macOS.")
-        click.echo("  kt-kernel depends on triton, which requires Linux + NVIDIA GPU.")
-        click.echo("  See: https://github.com/triton-lang/triton/issues/3443")
-        click.echo("  Use llama.cpp instead: litmoe install --engine llamacpp")
-        click.echo("  llama.cpp supports macOS via the Metal backend.")
+        click.echo("  ktransformers is not available on macOS (CUDA + triton required).")
+        click.echo("  Use llama.cpp instead: litmoe install --engine llamacpp (Metal backend).")
+        sys.exit(1)
+    if not nvidia_gpus():
+        click.echo("  WARNING: no NVIDIA GPU detected. sglang-kt serving needs one (SM 8.0+); "
+                   "installing anyway.")
+    if not has_avx512():
+        click.echo("  NOTE: CPU has no AVX-512 — only the LLAMAFILE (GGUF) expert backend will work; "
+                   "FP8/BF16/RAWINT4/MXFP* kt_method values need AVX-512.")
+
+    pip_env = os.environ.copy()
+    # Some machines carry a pip.conf with an unreachable extra index (NGC) that
+    # adds minutes of retries per package; force plain PyPI unless overridden.
+    pip_env.setdefault("PIP_INDEX_URL", "https://pypi.org/simple/")
+    pip_env["PIP_EXTRA_INDEX_URL"] = pip_env.get("LITMOE_PIP_EXTRA_INDEX_URL", "")
+
+    ok, reason = ktransformers_wheel_supported()
+    if ok:
+        click.echo("  Installing ktransformers[sglang] from PyPI (kt-kernel + sglang-kt)...")
+        result = subprocess.run([sys.executable, "-m", "pip", "install", "ktransformers[sglang]"],
+                                timeout=3600, env=pip_env)
+        if result.returncode == 0:
+            _verify_ktransformers()
+            return
+        click.echo("  PyPI install failed; falling back to a source build.", err=True)
+    else:
+        click.echo(f"  PyPI wheels not usable here ({reason}); building from source.")
+
+    for tool in ("git", "cmake"):
+        if not shutil.which(tool):
+            click.echo(f"  '{tool}' is required for a source build.", err=True)
+            sys.exit(1)
+
+    src_dir = _default_prefix() / "src" / "ktransformers"
+    src_dir.parent.mkdir(parents=True, exist_ok=True)
+    if src_dir.exists():
+        shutil.rmtree(src_dir)
+    click.echo(f"  Cloning ktransformers (with submodules) to {src_dir}...")
+    clone = subprocess.run(
+        ["git", "clone", "--recursive", "--depth", "1", "--shallow-submodules",
+         "https://github.com/kvcache-ai/ktransformers.git", str(src_dir)],
+        timeout=1800,
+    )
+    if clone.returncode != 0:
+        click.echo("  git clone failed. Manual: https://github.com/kvcache-ai/ktransformers", err=True)
         sys.exit(1)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        click.echo(f"  Cloning ktransformers to {tmpdir}...")
-        clone = subprocess.run(
-            ["git", "clone", "--depth", "1",
-             "https://github.com/kvcache-ai/ktransformers.git", tmpdir],
-            capture_output=True, text=True, timeout=180,
-        )
-        if clone.returncode != 0:
-            click.echo(f"  git clone failed: {clone.stderr.strip()[:200]}", err=True)
-            click.echo("  Manual: https://github.com/kvcache-ai/ktransformers", err=True)
-            sys.exit(1)
+    click.echo("  Running upstream install.sh (deps + sglang + kt-kernel; this can take 30+ minutes)...")
+    result = subprocess.run(["bash", "install.sh"], cwd=str(src_dir), env=pip_env, timeout=7200)
+    if result.returncode != 0:
+        click.echo("  install.sh failed. See output above and "
+                   "https://github.com/kvcache-ai/ktransformers/blob/main/kt-kernel/README.md", err=True)
+        sys.exit(1)
+    _verify_ktransformers()
 
-        # Initialize submodules (kt-kernel needs them for C++/CUDA code)
-        click.echo("  Initializing submodules...")
-        sub = subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive", "--depth", "1"],
-            cwd=tmpdir, capture_output=True, text=True, timeout=180,
-        )
-        if sub.returncode != 0:
-            click.echo(f"  submodule init warning: {sub.stderr.strip()[:200]}", err=True)
 
-        # Install kt-kernel from local source (builds C++/CUDA via cmake+pybind11)
-        # Clear NGC registry (pypi.ngc.nvidia.com) from pip config — it fails
-        # DNS resolution on this machine and causes 15+ minutes of retry timeouts
-        # per package. --index-url alone doesn't remove extra-index-url from
-        # pip.conf, so we override via environment variables.
-        click.echo("  Building kt-kernel from source (pip install ./kt-kernel)...")
-        click.echo("  This compiles C++/CUDA kernels and may take several minutes.")
-        pip_env = os.environ.copy()
-        pip_env["PIP_INDEX_URL"] = "https://pypi.org/simple/"
-        pip_env["PIP_EXTRA_INDEX_URL"] = ""
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", f"{tmpdir}/kt-kernel"],
-            timeout=600, env=pip_env,
-        )
-        if result.returncode != 0:
-            click.echo("  kt-kernel build failed. See output above.", err=True)
-            click.echo("  Manual: https://github.com/kvcache-ai/ktransformers", err=True)
-            sys.exit(1)
-
-        # Install the ktransformers wrapper package
-        click.echo("  Installing ktransformers package...")
-        result2 = subprocess.run(
-            [sys.executable, "-m", "pip", "install", tmpdir],
-            timeout=120, env=pip_env,
-        )
-        if result2.returncode != 0:
-            click.echo("  ktransformers package install failed. See output above.", err=True)
-            click.echo("  Manual: https://github.com/kvcache-ai/ktransformers", err=True)
-            sys.exit(1)
-
-    click.echo("  ktransformers installed from source.")
+def _verify_ktransformers() -> None:
+    from litmoe.engines.ktransformers import missing_components
+    missing = missing_components()
+    if missing:
+        click.echo(f"  WARNING: ktransformers install incomplete, missing: {', '.join(missing)}", err=True)
+    else:
+        click.echo("  ktransformers installed (kt_kernel + sglang importable).")
 
 
 # ---------------------------------------------------------------------------
 # Model downloader
 # ---------------------------------------------------------------------------
 
-def download_model(model_name: str, quant: str | None, models_dir: Path) -> Path:
-    """Download model weights from HuggingFace. Returns path to first GGUF shard."""
-    info = KNOWN_MODELS[model_name]
-    quant = quant or info["default_quant"]
+_SKIP_BASENAMES = ("mmproj", "imatrix", "mtp")
 
-    if quant not in info["quants"]:
-        raise click.BadParameter(
-            f"{model_name} quant must be one of: {', '.join(info['quants'])}"
-        )
 
-    size_note = info["size_gb"].get(quant)
-    if size_note:
-        click.echo(f"  NOTE: {model_name} {quant} is ~{size_note} GB. Ensure you have the disk space.")
+def select_gguf_files(repo_files: list[str], quant: str) -> list[str]:
+    """Pick exactly the GGUF file(s) for one quant from a repo file listing.
 
-    repo = info["hf_repo"]
-    dest = models_dir / model_name / quant
-    dest.mkdir(parents=True, exist_ok=True)
+    Handles both layouts used on HuggingFace:
+      subdir: 'UD-Q4_K_XL/Model-UD-Q4_K_XL-00001-of-00003.gguf'
+      root:   'Model-Q4_K_M.gguf', 'Model.Q4_K_M.gguf', 'Model-UD-Q4_K_XL.gguf'
+    A plain quant (e.g. Q4_K_M) never matches its UD- variant (UD-Q4_K_M) and
+    vice versa. mmproj/imatrix/MTP files are excluded.
+    """
+    q = re.escape(quant)
+    ud_guard = "" if quant.upper().startswith("UD-") else r"(?<!UD-)"
+    pat = re.compile(rf"(?:^|[/._-]){ud_guard}{q}(?:-\d{{5}}-of-\d{{5}})?\.gguf$", re.IGNORECASE)
+    out = []
+    for f in repo_files:
+        base = f.rsplit("/", 1)[-1].lower()
+        if base.startswith(_SKIP_BASENAMES):
+            continue
+        if not pat.search(f):
+            continue
+        # Subdirectory layouts name the directory after the quant; anything in a
+        # differently named directory (MTP/, dspark/, another quant) is not ours.
+        parts = f.split("/")
+        if len(parts) > 1 and parts[0].upper() != quant.upper():
+            continue
+        out.append(f)
+    return sorted(out)
 
-    # Some repos (e.g. mradermacher) store GGUFs as single files at root
-    # level, not in quant subdirectories like unsloth
-    file_layout = info.get("file_layout", "subdir")
-    
-    if file_layout == "root":
-        # Files are named like "Model-Q4_K_M.gguf" at root level
-        allow_patterns = f"*{quant}*.gguf"
-    else:
-        allow_patterns = f"{quant}/*"
 
-    click.echo(f"  Downloading {repo} [{quant}] -> {dest}")
+def select_mmproj_file(repo_files: list[str]) -> str | None:
+    """Prefer mmproj-F16.gguf, then mmproj-BF16.gguf, at the repo root."""
+    for name in ("mmproj-F16.gguf", "mmproj-BF16.gguf", "mmproj-f16.gguf"):
+        if name in repo_files:
+            return name
+    return next((f for f in repo_files if f.lower().startswith("mmproj") and "/" not in f), None)
+
+
+def _hf_api():
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import HfApi, snapshot_download
     except ImportError:
         click.echo("  Installing huggingface_hub...", err=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", "huggingface_hub[hf_transfer]"],
-                       check=True)
-        from huggingface_hub import snapshot_download
+        subprocess.run([sys.executable, "-m", "pip", "install", "huggingface_hub[hf_transfer]"], check=True)
+        from huggingface_hub import HfApi, snapshot_download
+    return HfApi(), snapshot_download
 
-    snapshot_download(
-        repo_id=repo,
-        allow_patterns=allow_patterns,
-        local_dir=str(dest),
-    )
 
-    # snapshot_download may nest files under subdirectories matching the
-    # allow_pattern or repo structure. Recursively flatten ALL nested dirs
-    # so GGUFs are directly in dest/.
-    def _flatten_dir(d: Path, depth: int = 0) -> None:
-        """Recursively move all files from subdirs to d, then remove subdirs."""
-        if depth > 10:  # safety limit
-            return
-        for item in list(d.iterdir()):
-            if item.is_dir():
-                # Recurse into subdirectory first
-                _flatten_dir(item, depth + 1)
-                # Now move all files up (the subdir should only have files left)
-                for sub_item in list(item.iterdir()):
-                    target = d / sub_item.name
-                    if target.exists():
-                        if target.is_file():
-                            target.unlink()
-                        else:
-                            shutil.rmtree(str(target))
-                    shutil.move(str(sub_item), str(target))
-                # Remove the now-empty directory
-                try:
-                    item.rmdir()
-                except OSError:
-                    pass  # not empty or permission issue
-                if depth == 0:
-                    click.echo(f"  Flattened nested directory: {item.name}/")
+def download_model(model_name: str, quant: str | None, models_dir: Path,
+                   with_mmproj: bool = True) -> tuple[Path, Path | None]:
+    """Download model weights from HuggingFace.
 
-    _flatten_dir(dest)
+    GGUF: returns (path to the first shard, mmproj path or None).
+    safetensors (ktransformers): returns (model directory, None).
+    """
+    info = lookup(model_name)
+    if not info:
+        raise click.BadParameter(f"unknown model {model_name}")
+    api, snapshot_download = _hf_api()
+    repo = info["hf_repo"]
 
-    # Find the first GGUF shard — llama-server needs a file path, not a directory
-    gguf_files = sorted(dest.glob("*.gguf"))
+    if info["format"] == SAFETENSORS:
+        dest = models_dir / model_name
+        dest.mkdir(parents=True, exist_ok=True)
+        click.echo(f"  Downloading {repo} (safetensors, ~{info['size_gb']} GB) -> {dest}")
+        snapshot_download(repo_id=repo, local_dir=str(dest))
+        if not any(dest.glob("*.safetensors")):
+            raise RuntimeError(f"No .safetensors files in {dest} after download.")
+        return dest, None
+
+    quant = quant or info["default_quant"]
+    if quant not in info["quants"]:
+        raise click.BadParameter(
+            f"{model_name} quant must be one of: {', '.join(info['quants'])}")
+
+    click.echo(f"  Listing {repo}...")
+    files_info = list(api.list_repo_tree(repo, recursive=True))
+    repo_files = [f.path for f in files_info if hasattr(f, "size")]  # RepoFile only, not RepoFolder
+    sizes = {f.path: (getattr(f, "size", 0) or 0) for f in files_info if hasattr(f, "size")}
+
+    wanted = select_gguf_files(repo_files, quant)
+    if not wanted:
+        raise RuntimeError(f"{repo} has no GGUF files for quant '{quant}'. "
+                           f"Files present: {', '.join(sorted(repo_files)[:12])}...")
+    mmproj = select_mmproj_file(repo_files) if with_mmproj else None
+    total_gb = sum(sizes.get(f, 0) for f in wanted + ([mmproj] if mmproj else [])) / 1e9
+    click.echo(f"  {len(wanted)} file(s) for {quant}" + (f" + {mmproj}" if mmproj else "")
+               + f", {total_gb:.1f} GB total")
+
+    dest = models_dir / model_name / quant
+    dest.mkdir(parents=True, exist_ok=True)
+    click.echo(f"  Downloading {repo} [{quant}] -> {dest}")
+    snapshot_download(repo_id=repo, allow_patterns=wanted + ([mmproj] if mmproj else []),
+                      local_dir=str(dest))
+
+    # Files that lived in a quant subdirectory land in dest/<quant>/ — move them
+    # up so llama-server gets a flat directory. Never touch HF's .cache dir.
+    for f in wanted:
+        if "/" in f:
+            src = dest / f
+            if src.exists():
+                shutil.move(str(src), str(dest / src.name))
+    for sub in [p for p in dest.iterdir() if p.is_dir() and not p.name.startswith(".")]:
+        if not any(sub.iterdir()):
+            sub.rmdir()
+
+    gguf_files = sorted(p for p in dest.glob("*.gguf") if not p.name.lower().startswith("mmproj"))
     if not gguf_files:
-        raise RuntimeError(
-            f"No .gguf files found in {dest} after download. "
-            f"The repo '{repo}' may not have files matching '{allow_patterns}', "
-            f"or the download may have failed."
-        )
-
-    n_files = len(gguf_files)
-    first_shard = str(gguf_files[0])
-    click.echo(f"  {n_files} GGUF shards downloaded.")
-    return Path(first_shard)
+        raise RuntimeError(f"No .gguf files found in {dest} after download.")
+    first = next((p for p in gguf_files if "-00001-of-" in p.name), gguf_files[0])
+    mmproj_path = (dest / Path(mmproj).name) if mmproj and (dest / Path(mmproj).name).exists() else None
+    click.echo(f"  {len(gguf_files)} GGUF file(s) downloaded ({sum(p.stat().st_size for p in gguf_files) / 1e9:.1f} GB).")
+    return first, mmproj_path
 
 
 # ---------------------------------------------------------------------------
 # models.yaml writer
 # ---------------------------------------------------------------------------
 
-def add_model_to_config(model_name: str, engine: str, model_path: Path,
-                        n_ctx: int, config_path: Path) -> None:
-    """Insert or replace a model entry in models.yaml.
-
-    Always writes absolute paths (with ~ and $VARS expanded) so that
-    the config file works regardless of where litmoe is run from.
-    """
-    # Expand the model path to absolute before writing
-    from litmoe.config import expand_path
+def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: int,
+                        config_path: Path, extra_args: list[str] | None = None,
+                        kt_method: str | None = None, aliases: list[str] | None = None) -> None:
+    """Insert or replace a model entry in models.yaml (absolute paths)."""
     model_path = expand_path(model_path)
 
     if config_path.exists():
@@ -621,27 +658,81 @@ def add_model_to_config(model_name: str, engine: str, model_path: Path,
             cfg = yaml.safe_load(f) or {}
     else:
         cfg = {"host": "127.0.0.1", "port": 8080, "api_key": None, "models": []}
-
     cfg.setdefault("host", "127.0.0.1")
     cfg.setdefault("port", 8080)
     cfg.setdefault("api_key", None)
     models = cfg.setdefault("models", [])
 
-    entry = {
-        "id": model_name,
-        "engine": engine,
-        "model_path": str(model_path),
-        "n_gpu_layers": -1,
-        "n_ctx": n_ctx,
-    }
+    entry: dict = {"id": model_name, "engine": engine, "model_path": str(model_path), "n_ctx": n_ctx}
+    if engine == "llamacpp":
+        entry["n_gpu_layers"] = -1
+    if kt_method:
+        entry["kt_method"] = kt_method
+        entry["kt_num_gpu_experts"] = 0
+    if extra_args:
+        entry["extra_args"] = list(extra_args)
+    # Keep aliases the user already had for this id; otherwise give the first
+    # model in the file the Claude names so Anthropic-API clients route.
+    old = next((m for m in models if m.get("id") == model_name), None)
+    others = [m for m in models if m.get("id") != model_name]
+    if old and old.get("aliases"):
+        entry["aliases"] = old["aliases"]
+    elif aliases:
+        entry["aliases"] = aliases
+    elif not any(m.get("aliases") for m in others):
+        entry["aliases"] = list(CLAUDE_ALIASES)
 
-    models[:] = [m for m in models if m.get("id") != model_name]
+    models[:] = others
     models.append(entry)
-
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
-
     click.echo(f"  models.yaml updated: {model_name} -> {engine} @ {model_path}")
+
+
+def choose_n_ctx(model_name: str, weights_gb: float | None, requested: int | None) -> int:
+    """Context to write: the user's value, else the memory-fitted native context."""
+    if requested:
+        return requested
+    info = lookup(model_name) or {}
+    target = info.get("native_ctx", 131072)
+    total = get_total_memory_bytes()
+    if total is None or weights_gb is None:
+        return target
+    ctx, note = fit_context(info.get("kv_bytes_per_token", 65_536), weights_gb, total / 1e9, target)
+    if note:
+        click.echo(f"  NOTE: {note}")
+    return ctx
+
+
+def print_model_table(ram_gb: float | None) -> None:
+    """`litmoe models`: the catalog grouped by RAM tier, with what fits this machine."""
+    budget = 0.0
+    if ram_gb:
+        budget = ram_gb * (0.75 if is_macos() else 1.0)
+        click.echo(f"Detected {ram_gb:.0f} GB RAM" + (f" (Metal can use ~{budget:.0f} GB by default)" if is_macos() else ""))
+        click.echo()
+    tiers = sorted({v["tier"] for v in KNOWN_MODELS.values()})
+    for tier in tiers:
+        click.echo(f"== {TIER_LABELS[tier]} ==")
+        for mid, info in KNOWN_MODELS.items():
+            if info["tier"] != tier:
+                continue
+            size = quant_size_gb(mid, None)
+            default = info.get("default_quant", info.get("kt_method"))
+            engine = "llama.cpp" if info["engine"] == "llamacpp" else "ktransformers (GPU)"
+            fit = ""
+            if ram_gb and info["format"] == GGUF:
+                need = ram_needed_gb(mid) or 0
+                if need <= budget:
+                    fit = "fits"
+                else:
+                    q = largest_quant_that_fits(mid, budget)
+                    fit = f"fits with --quant {q}" if q else "does not fit"
+            click.echo(f"  {mid:32s} {engine:20s} {default:>12s} {size:5.0f} GB  {info['params']}"
+                       + (f"  [{fit}]" if fit else ""))
+        click.echo()
+    click.echo("Install: litmoe install --model <name> [--quant <quant>]")
 
 
 # ---------------------------------------------------------------------------
@@ -651,63 +742,62 @@ def add_model_to_config(model_name: str, engine: str, model_path: Path,
 @click.command("install")
 @click.argument("targets", nargs=-1)
 @click.option("--model", "model_name", type=click.Choice(sorted(KNOWN_MODELS.keys())),
-              default=None, help="Model to download")
-@click.option("--quant", default=None, help="Quantization level (default: UD-IQ1_S)")
+              default=None, help="Model to download (see `litmoe models`)")
+@click.option("--quant", default=None, help="Quantization (default: the model's default_quant)")
 @click.option("--engine", type=click.Choice(["llamacpp", "ktransformers", "both", "none"]),
-              default=None, help="Which engine(s) to install")
+              default=None, help="Which engine(s) to install (default: the model's engine, else llamacpp)")
+@click.option("--llamacpp-variant", type=click.Choice(LLAMACPP_VARIANTS), default="auto",
+              help="llama.cpp release binary variant (auto = cuda if an NVIDIA GPU is visible, else cpu)")
+@click.option("--llamacpp-tag", default=None, help="Pin a llama.cpp release tag (e.g. b11005)")
 @click.option("--models-dir", type=click.Path(), default=None,
               help="Where to store model weights (default: ~/.litmoe/models)")
 @click.option("--prefix", type=click.Path(), default=None,
               help="Install prefix for engine binaries (default: ~/.local)")
-@click.option("--n-ctx", default=65536, type=int, help="Context size written to models.yaml")
+@click.option("--n-ctx", default=None, type=int,
+              help="Context size written to models.yaml (default: native context, reduced to fit RAM)")
+@click.option("--no-mmproj", is_flag=True, help="Skip the vision projector for multimodal models")
 @click.option("--config", "-c", type=click.Path(), default=None, help="Path to models.yaml")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompts")
-def install_cmd(targets, model_name, quant, engine, models_dir, prefix, n_ctx, config, yes):
+def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_tag, models_dir,
+                prefix, n_ctx, no_mmproj, config, yes):
     """Install an engine and/or download model weights in one command.
 
     \b
     Examples:
-      litmoe install                          # engine + pick a model interactively
-      litmoe install --model gemma-4-12b      # 7 GB, runs on any 16 GB laptop
-      litmoe install --model gemma-4-31b      # 18 GB, 32 GB RAM
-      litmoe install --model llama-4-scout    # 65 GB MoE, 96 GB RAM
-      litmoe install --model deepseek-v4-flash # 83 GB MoE, 96 GB RAM
-      litmoe install --model kimi-linear-48b   # 30 GB MoE (3B active), 32 GB RAM
-      litmoe install --model qwen3.8-9b-distill # 6 GB dense, 16 GB laptop (interactive on CPU)
-      litmoe install --model minimax-m3       # 128 GB MoE, 128 GB RAM
-      litmoe install --model kimi-k3          # 594 GB MoE, 600+ GB RAM
-      litmoe install --engine ktransformers   # ktransformers (Linux + NVIDIA only)
+      litmoe install                                # llama.cpp + recommendations for this RAM
+      litmoe install --model gemma-4-26b-a4b        # 17 GB MoE (4B active) — laptop default
+      litmoe install --model qwen3.6-35b-a3b        # 22 GB MoE (3B active)
+      litmoe install --model gpt-oss-120b           # 63 GB MoE (5B active), 96 GB machines
+      litmoe install --model qwen3.5-122b-a10b      # 60 GB MoE (10B active), 96 GB machines
+      litmoe install --model minimax-m2.7           # 141 GB MoE, 192 GB workstation
+      litmoe install --model kimi-k3                # 594 GB MoE, 768 GB server
+      litmoe install --model glm-5.3-flash          # ktransformers (Linux + NVIDIA GPU)
+      litmoe install --engine llamacpp --llamacpp-variant cuda
     """
-    from litmoe.config import expand_path
-
     models_dir = expand_path(models_dir) if models_dir else _default_models_dir()
     prefix = expand_path(prefix) if prefix else _default_prefix()
     config_path = expand_path(config) if config else default_config_path()
 
-    # Positional targets act as shortcuts: "llamacpp", "ktransformers", "both", or a model name
     for t in targets:
         if t in ("llamacpp", "ktransformers", "both"):
             engine = t if engine is None else engine
-        elif t in KNOWN_MODELS:
+        elif lookup(t):
             model_name = t if model_name is None else model_name
         else:
             raise click.BadParameter(f"unknown target: {t}")
 
-    # Default: engine matching the model, or both if nothing specified
+    info = lookup(model_name) if model_name else None
     if engine is None:
-        engine = "llamacpp" if model_name else "both"
+        engine = info["engine"] if info else "llamacpp"
 
-    # ------------------------------------------------------------------
     # 1. Engine install
-    # ------------------------------------------------------------------
     if engine in ("llamacpp", "both"):
-        click.echo("Installing llama.cpp (prebuilt binaries)...")
+        click.echo("Installing llama.cpp...")
         try:
-            install_llamacpp(prefix)
+            install_llamacpp(prefix, variant=llamacpp_variant, tag=llamacpp_tag)
         except Exception as e:
             click.echo(f"  llama.cpp install failed: {e}", err=True)
             sys.exit(1)
-
     if engine in ("ktransformers", "both"):
         click.echo("Installing ktransformers...")
         try:
@@ -716,86 +806,59 @@ def install_cmd(targets, model_name, quant, engine, models_dir, prefix, n_ctx, c
             click.echo(f"  ktransformers install failed: {e}", err=True)
             sys.exit(1)
 
-    # ------------------------------------------------------------------
     # 2. Model download
-    # ------------------------------------------------------------------
-    if model_name:
-        info = KNOWN_MODELS[model_name]
-        quant_val = quant or info["default_quant"]
-        size_note = info["size_gb"].get(quant_val)
-        if size_note and not yes:
-            click.echo(f"  WARNING: {model_name} {quant_val} is ~{size_note} GB.")
-            click.confirm("Proceed with download?", abort=True)
-        click.echo(f"Installing model: {model_name}")
-        dest = download_model(model_name, quant, models_dir)
-        engine_for_model = KNOWN_MODELS[model_name]["engine"]
-
-        # Set model-native context size if user didn't override (--n-ctx default)
-        if n_ctx == 65536:
-            # Native context sizes per model — must match KNOWN_MODELS keys
-            native_ctx = {
-                "deepseek-v4-flash": 131072,   # 128K MLA
-                "kimi-linear-48b": 1048576,     # 1M KDA+MLA
-                "kimi-k3": 262144,              # 256K MLA
-                "qwen3.8": 262144,              # 256K (1M with YaRN)
-                "qwen3.8-9b-distill": 131072,   # 128K (1M with YaRN)
-                "minimax-m3": 1048576,          # 1M
-                "gemma-4-12b": 131072,          # 128K
-                "gemma-4-31b": 131072,          # 128K
-                "llama-4-scout": 10485760,     # 10M
-            }
-            n_ctx = native_ctx.get(model_name, 131072)  # default 128K
-
-            # Check if model + KV cache fits in available memory.
-            # If not, reduce context to what fits.
-            # Uses platform_utils for cross-platform memory detection.
-            from litmoe.platform_utils import get_total_memory_bytes
-            total_mem = get_total_memory_bytes()
-
-            if total_mem:
-                total_mem_gb = total_mem / 1e9
-                model_size_gb = info["size_gb"].get(quant_val, 0)
-
-                # KV cache per model at native context (rough estimates)
-                # MLA/KDA models use much less than standard attention
-                # Keys must match KNOWN_MODELS keys
-                kv_per_ctx = {
-                    "deepseek-v4-flash": 23.1 / 131072,    # MLA, ~23 GB at 128K
-                    "kimi-linear-48b": 15.0 / 1048576,      # KDA, ~15 GB at 1M
-                    "kimi-k3": 49.9 / 262144,              # MLA, ~50 GB at 256K
-                    "qwen3.8": 1580 / 262144,             # standard, ~1580 GB at 256K
-                    "qwen3.8-9b-distill": 17.2 / 131072,  # dense, ~17 GB at 128K
-                    "minimax-m3": 386.5 / 1048576,        # standard, ~387 GB at 1M
-                    "gemma-4-12b": 85.9 / 131072,          # dense, ~86 GB at 128K
-                    "gemma-4-31b": 86.0 / 131072,          # dense
-                    "llama-4-scout": 206.2 / 10485760,    # MoE, ~206 GB at 10M
-                }
-                kv_rate = kv_per_ctx.get(model_name, 17.2 / 131072)
-                kv_gb = kv_rate * n_ctx
-
-                # Need: model_size + kv_cache + 3 GB overhead < total_mem * 0.9
-                needed_gb = model_size_gb + kv_gb + 3
-                avail_gb = total_mem_gb * 0.9
-
-                if needed_gb > avail_gb:
-                    # Reduce context to fit
-                    max_kv_gb = avail_gb - model_size_gb - 3
-                    if max_kv_gb > 1:
-                        n_ctx = int(max_kv_gb / kv_rate)
-                        # Round down to nearest 4096
-                        n_ctx = (n_ctx // 4096) * 4096
-                        n_ctx = max(n_ctx, 8192)  # minimum 8K
-                        click.echo(f"  NOTE: reduced context to {n_ctx} to fit "
-                                   f"{model_size_gb:.0f} GB model + KV cache in {total_mem_gb:.0f} GB RAM")
-                    else:
-                        click.echo(f"  WARNING: model ({model_size_gb:.0f} GB) may not fit in {total_mem_gb:.0f} GB RAM")
-
-        add_model_to_config(model_name, engine_for_model, dest, n_ctx, config_path)
+    if not model_name:
+        total = get_total_memory_bytes()
         click.echo()
-        click.echo("Done. Next:")
-        click.echo(f"  litmoe serve")
+        if total:
+            ram_gb = total / 1e9
+            recs = recommended_for_ram(ram_gb * (0.75 if is_macos() else 1.0))
+            click.echo(f"Detected {ram_gb:.0f} GB RAM. Models that fit, fastest first:")
+            for r in recs:
+                ri = KNOWN_MODELS[r]
+                click.echo(f"  litmoe install --model {r:32s} # {quant_size_gb(r, None):.0f} GB, {ri['params']}")
+        else:
+            click.echo(f"To add a model:  litmoe install --model {DEFAULT_MODEL}")
+        click.echo("Full list:  litmoe models")
+        return
+
+    assert info is not None
+    quant_val = quant or info.get("default_quant")
+    size_note = quant_size_gb(model_name, quant_val)
+    if size_note and not yes:
+        need = ram_needed_gb(model_name, quant_val)
+        total = get_total_memory_bytes()
+        msg = f"  {model_name} {quant_val or ''} is ~{size_note:.0f} GB on disk"
+        if need and total:
+            msg += f"; needs ~{need:.0f} GB RAM at 32K context (this machine: {total / 1e9:.0f} GB)"
+        click.echo(msg)
+        click.confirm("Proceed with download?", abort=True)
+
+    click.echo(f"Installing model: {model_name}")
+    path, mmproj = download_model(model_name, quant, models_dir, with_mmproj=not no_mmproj)
+    engine_for_model = info["engine"]
+
+    if info["format"] == GGUF:
+        weights_gb = None
+        try:
+            pat = re.sub(r"-\d{5}-of-(\d{5})\.gguf$", r"-*-of-\1.gguf", path.name)
+            files = list(path.parent.glob(pat)) if pat != path.name else [path]
+            weights_gb = sum(f.stat().st_size for f in files) / 1e9
+        except OSError:
+            pass
+        ctx = choose_n_ctx(model_name, weights_gb, n_ctx)
+        extra = list(info.get("extra_args", []))
+        if mmproj:
+            extra += ["--mmproj", str(mmproj)]
+        add_model_to_config(model_name, engine_for_model, path, ctx, config_path, extra_args=extra or None)
     else:
-        click.echo()
-        click.echo("Engine installed. To add a model:")
-        click.echo("  litmoe install --model kimi-k3")
-        click.echo("  litmoe install --model qwen3.8")
+        ctx = n_ctx or info["native_ctx"]
+        add_model_to_config(model_name, engine_for_model, path, ctx, config_path,
+                            extra_args=list(info.get("extra_args", [])) or None,
+                            kt_method=info["kt_method"])
+        click.echo("  ktransformers entry written: needs an NVIDIA GPU at serve time "
+                   "(kt_num_gpu_experts=0 keeps all experts on CPU).")
+    if info.get("notes"):
+        click.echo(f"  NOTE: {info['notes']}")
+    click.echo()
+    click.echo("Done. Next:  litmoe serve")

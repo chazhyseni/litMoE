@@ -2,164 +2,146 @@
 
 **lit + MoE** — a light gateway for Mixture-of-Experts models.
 
-OpenAI-compatible gateway for [ktransformers](https://github.com/kvcache-ai/ktransformers) and [llama.cpp](https://github.com/ggml-org/llama.cpp). Run trillion-parameter MoE models behind a single API.
+OpenAI- and Anthropic-compatible gateway for [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ktransformers](https://github.com/kvcache-ai/ktransformers). One `models.yaml`, one port, every model reachable by name — from a 4B-active MoE that chats interactively on a 48 GB laptop to trillion-parameter models on a server.
 
-litmoe is not an inference engine — the forward pass runs in ktransformers or llama.cpp. What litmoe adds:
+litmoe is not an inference engine — the forward pass runs in llama.cpp or ktransformers. What litmoe adds:
 
-- **One API for multiple engines.** Mix ktransformers and llama.cpp in the same `models.yaml`. Clients see one flat model list at one endpoint. No multiple ports, no multiple clients.
-- **Anthropic Messages API.** `/v1/messages` is translated to OpenAI chat completions, so Claude Code, Hermes Agent, and other Anthropic-format tools work without changes.
-- **One-command install.** `litmoe install --model kimi-k3` downloads the GGUF, installs llama.cpp, and writes the config entry. No manual HuggingFace repo hunting, shard counting, or launch scripts.
-- **Hardware-aware setup.** `litmoe doctor` detects CPU instruction sets (AVX2/AVX-512/AMX), RAM, and GPU, then recommends which engine to use.
-- **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-engine log files, and per-model environment/CLI flag passthrough.
-- **Streaming.** Full SSE streaming passthrough for both OpenAI and Anthropic request formats.
+- **One API for multiple engines.** Mix llama.cpp and ktransformers in the same `models.yaml`. Clients see one flat model list at one endpoint.
+- **Anthropic Messages API.** `/v1/messages` (and `/v1/messages/count_tokens`) are translated to OpenAI chat completions, so Claude Code, Hermes Agent, and other Anthropic-format tools work unchanged. Model aliases (`claude-sonnet-4-5` → your local model) are built in, and `scripts/claude-local` / `scripts/hermes-local` run a harness against the gateway **without touching its normal configuration** — plain `claude` keeps using your Anthropic account.
+- **A curated, RAM-tiered model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` downloads exactly the right GGUF files (root or per-quant repo layouts, sharded or not, plus the vision projector for multimodal models) and writes the config entry.
+- **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. Context size is set to the model's native window and reduced only when the KV cache would not fit in RAM.
+- **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual llama-server.
+- **Streaming.** Raw SSE passthrough for OpenAI requests; event-by-event translation for Anthropic requests (text, thinking, tool_use).
 
 ---
 
-## What it does and why it matters
+## Which models, on what hardware
 
-Trillion-parameter MoE models (Kimi K3, Qwen3.8-2.4T, DeepSeek-V3) are open weights but hard to run: no single tool covers all of them, each engine has a different CLI and config format, and nothing presents them behind one API. litmoe solves that with four features:
+Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs. Every entry below was verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the same table with a fits / does-not-fit column for your RAM.
 
-**1. One config file for every model/engine combination.** `models.yaml` lists model IDs and which engine serves them. Mix engines freely — Kimi-K3 on llama.cpp next to DeepSeek-V3 on ktransformers — and clients see one flat model list.
+| Tier | Model (`--model`) | Total / active | Default quant | Disk | Why |
+|---|---|---|---|---|---|
+| **48 GB laptop** | `gemma-4-26b-a4b` **(default)** | 26B / 4B | UD-Q4_K_XL | 17 GB | Fast, multimodal (vision), 256K ctx |
+| | `qwen3.6-35b-a3b` | 35B / 3B | UD-Q4_K_XL | 22 GB | Fast, strong coder |
+| | `nemotron-3.5-lightning-30b-a3b` | 30B / 3B | UD-Q4_K_XL | 26 GB | Hybrid Mamba-MoE, 1M ctx |
+| | `gpt-oss-20b` | 21B / 3.6B | UD-Q4_K_XL | 12 GB | Native MXFP4 |
+| | `kimi-linear-48b` | 48B / 3B | Q4_K_M | 30 GB | KDA linear attention, 1M ctx |
+| | `gemma-4-12b`, `qwen3.8-9b-distill` | dense 12B / 9B | Q4_K_M | 7 / 6 GB | Small dense |
+| | `qwen3.8-27b`, `gemma-4-31b` | dense 27B / 31B | UD-Q4_K_XL | 18 / 19 GB | Strongest small models, ~3-4× slower than the MoEs |
+| **96 GB laptop / desktop** | `gpt-oss-120b` | 117B / 5.1B | UD-Q4_K_XL | 63 GB | Native MXFP4, fast |
+| | `qwen3.5-122b-a10b` | 122B / 10B | UD-IQ4_XS | 60 GB | |
+| | `nemotron-3-super-120b-a12b` | 120B / 12B | UD-IQ4_XS | 64 GB | 1M ctx |
+| | `llama-4-scout` | 109B / 17B | UD-Q4_K_XL | 62 GB | 10M ctx |
+| **192 GB workstation** | `qwen3.8-flash-next` | 177B MoE | UD-Q4_K_XL | 111 GB | Sep 2026; needs a Sep-2026+ llama.cpp |
+| | `minimax-m2.7` | 229B / 10B | UD-Q4_K_XL | 141 GB | |
+| | `deepseek-v4-flash` | 284B MoE | UD-Q4_K_XL | 155 GB | 1M ctx |
+| **512 GB server** | `minimax-m3`, `glm-5.3`, `deepseek-v3.2`, `kimi-k2.5`, `kimi-k2.6` | 426B–1.03T | Q2–Q4 | 247–345 GB | |
+| **768 GB server** | `qwen3.8` (2.4T/95B), `kimi-k3` (2.78T/93B) | | UD-IQ1_S | 508 / 594 GB | 93–95B *active*: ~1 t/s on a 24-core CPU regardless of RAM |
 
-**2. One OpenAI + Anthropic API for everything.** `/v1/chat/completions`, `/v1/completions`, `/v1/models`, and `/v1/messages` (Anthropic format auto-translated). Point Claude Code, Hermes Agent, Open WebUI, aider, or curl at port 8080 and every configured model is reachable by name.
+ktransformers entries (Linux + NVIDIA GPU, native precision safetensors, no GGUF): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal — supported by ktransformers since 2026-08-26 and *not* by released llama.cpp), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), `deepseek-v3.2-kt` (FP8).
 
-**3. Engine lifecycle management.** `litmoe serve` spawns each engine as a subprocess, waits for readiness, and routes traffic. `litmoe stop` shuts them down cleanly. `litmoe status` shows what is running. Engines log to per-model files under `logs/`.
-
-**4. Hardware-aware engine selection.** `litmoe doctor` reports your CPU instruction sets (AVX2/AVX-512/AMX), RAM, and GPU, checks which engines are installed, and recommends which to use. ktransformers covers AMX/AVX-512/AVX2 CPU plus CUDA; llama.cpp covers CUDA/HIP/Metal/Vulkan/SYCL plus every quantization format.
+Any model can drop a tier with a smaller quant: `litmoe install --model qwen3.5-122b-a10b --quant UD-IQ2_M` (39 GB). On Apple Silicon, Metal can use ~75% of RAM by default; `litmoe models` applies that budget.
 
 ---
 
 ## Engines
 
-### ktransformers
-
-**Repo:** https://github.com/kvcache-ai/ktransformers
-**Authors:** MADSys Lab @ Tsinghua University + Approaching.AI
-**Paper:** SOSP 2025 — "KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models"
-
-- **Linux + NVIDIA GPU only** (kt-kernel depends on triton; macOS not supported)
-- **GPU offloading:** Hot experts on GPU, cold experts on CPU
-- **CPU kernels:** AMX (Intel Xeon 4th gen+), AVX-512, AVX2 (broad CPU compatibility)
-- **Native precision:** BF16, FP8, AMXINT4/INT8
-- **AVX2-only CPU backend** — works on AMD EPYC
-- **Supported model families:** DeepSeek-V3/R1, GLM-5.x, MiniMax-M2.x, Kimi-K2.x, Qwen3, SmallThinker (see their model registry)
-
-**Install:** `litmoe install --engine ktransformers` (builds from source) or see [SETUP.md](docs/SETUP.md)
-
-### llama.cpp
+### llama.cpp (default)
 
 **Repo:** https://github.com/ggml-org/llama.cpp
 
-- CUDA, HIP (AMD), Metal (Apple), Vulkan, SYCL, OpenCL, CANN (Ascend)
-- 1.5/2/3/4/5/6/8-bit quantization
-- AVX, AVX2, AVX-512, AMX
-- Most mature cross-platform LLM server
-- **Kimi-K3**: native support via `conversion/kimi_k3.py` and `src/models/kimi-k3.cpp`
-- **Qwen3.8-2.4T-A95B**: native support via `conversion/qwen.py` (Qwen3_5MoeForCausalLM) and `src/models/qwen35moe.cpp`
-- Pre-quantized GGUFs available from [Unsloth](https://huggingface.co/unsloth)
+- CUDA, HIP (AMD), Metal (Apple), Vulkan, SYCL, OpenCL, CANN — and plain CPU
+- 1–8-bit GGUF quantization; pre-quantized GGUFs from [Unsloth](https://huggingface.co/unsloth)
+- Every model in the catalog above has its architecture in `src/llama-arch.cpp` (gemma4, qwen35moe, qwen4exp, nemotron_h_moe, gpt-oss, kimi-k3, deepseek4, glm-dsa, minimax-m3, llama4, kimi-linear, …)
+- `--jinja` chat templates (tool calling) are on by default in current builds
 
-**Install:** build from source or download from [releases](https://github.com/ggml-org/llama.cpp/releases)
+**Install:** `litmoe install --engine llamacpp` — downloads the matching release binary (`--llamacpp-variant cpu|cuda|cuda13|vulkan|rocm`, auto-selects CUDA when an NVIDIA GPU is visible) or builds from source when glibc < 2.34.
+
+### ktransformers
+
+**Repo:** https://github.com/kvcache-ai/ktransformers · MADSys Lab @ Tsinghua + Approaching.AI · SOSP 2025
+
+Since v0.4 the serving stack is **SGLang + kt-kernel** (`python -m sglang.launch_server --kt-method …`): attention and dense layers on the GPU, MoE experts on the CPU in their native precision.
+
+- **Requirements:** Linux x86-64, NVIDIA GPU (SM 8.0+), Python 3.11/3.12. PyPI wheels need glibc ≥ 2.35; otherwise `litmoe install --engine ktransformers` runs the upstream source build.
+- **CPU expert backends (`kt_method`):** FP8, FP8_PERCHANNEL, BF16, RAWINT4, MXFP4, MXFP8 need **AVX-512**; AMXINT4/AMXINT8 need Intel AMX; LLAMAFILE (GGUF weights) runs on AVX2.
+- **Models:** registry entries (DeepSeek-V3.x/V4-Flash, Kimi-K2-Thinking, MiniMax-M2.x/M3) plus tutorial-launched models (GLM-5.3-Flash, Kimi-K2.5/K2.6, Qwen3-Next). 2026 additions upstream: GLM-5.3-Flash native FP8 (Aug 26), LoRA fine-tuning on AVX-512 CPUs incl. AMD (Aug 17), Kimi K2.5/K2.6 RAWINT4 fine-tuning (Sep 13), DeepSeek-V4-Flash on Ascend NPU (Aug 16) — fine-tuning and NPU paths are outside litmoe's scope.
 
 ---
 
 ## Quick start
 
 ```bash
-# Install litmoe — always use the SAME Python for install and serve
-# If you have multiple Pythons, use the full path to avoid mismatches:
-#   /path/to/python -m pip install -e .
-#   /path/to/python -m litmoe serve
 git clone https://github.com/chazhyseni/litMoE
 cd litMoE
-pip install -e .
+pip install -e .            # use the SAME Python for install and serve
 
-# Install an engine + download a model
-litmoe install --engine llamacpp          # install llama.cpp prebuilt binary
-litmoe install --model minimax-m3         # download MiniMax-M3 (128 GB, smallest viable)
-# or:
-litmoe install --model kimi-k3            # 594 GB
-litmoe install --model qwen3.8            # 508 GB
-
-# Start
+litmoe doctor               # hardware, engines, recommended models for your RAM
+litmoe install              # installs llama.cpp and lists models that fit
+litmoe install --model gemma-4-26b-a4b   # 17 GB; writes the entry into models.yaml
 litmoe serve
 
-# Test
 curl http://127.0.0.1:8080/v1/models
 ```
 
-> **macOS users with multiple Python installations:** If you have both
-> Homebrew Python and conda/miniforge Python, always install and run litmoe
-> with the same interpreter. Homebrew Python 3.14+ may have TCC restrictions
-> that prevent accessing files in `~/.litmoe/models/`. Use conda/miniforge
-> Python instead:
-> ```bash
-> /usr/local/miniforge3/bin/python -m pip install -e .
-> /usr/local/miniforge3/bin/python -m litmoe serve
-> ```
-> Run `litmoe doctor` to check if your Python has access issues.
+Or skip the pre-download: `litmoe init` writes a `models.yaml` whose `model_path` entries are HuggingFace specs (`owner/repo:QUANT`); llama-server fetches them on first start.
 
-Full setup guide with hardware requirements, quantization options, and per-model
-instructions: [docs/SETUP.md](docs/SETUP.md)
+> **macOS with several Pythons:** install and run litmoe with the same interpreter (`/path/to/python -m pip install -e .` / `/path/to/python -m litmoe serve`). Homebrew Python 3.14 has TCC file-access restrictions on `~/.litmoe/models`; conda/miniforge Python does not.
+
+Full guide: [docs/SETUP.md](docs/SETUP.md)
 
 ---
 
-## Models.yaml
+## models.yaml
 
 ```yaml
 host: 127.0.0.1
 port: 8080
-api_key: null   # or a string to require Bearer auth
+api_key: null            # or a string to require Bearer / x-api-key auth
 
 models:
-  # Gemma-4-12B via llama.cpp (7 GB, runs on any 16 GB laptop)
-  - id: gemma-4-12b
+  # Laptop default: fast MoE with vision. HF spec -> llama-server downloads on first start.
+  - id: gemma-4-26b-a4b
     engine: llamacpp
-    model_path: unsloth/gemma-4-12b-it-GGUF:Q4_K_M
-    n_gpu_layers: -1     # -1 = all, 0 = CPU only
-    n_ctx: 4096
+    model_path: unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL
+    n_gpu_layers: -1       # -1 = offload what fits (Metal/CUDA), 0 = CPU only
+    n_ctx: 0               # 0 (or anything < 16384) = native context, reduced only if the KV cache won't fit RAM
+    aliases:               # Anthropic model names Claude Code sends; haiku is used for its background calls
+      - claude-sonnet-4-5
+      - claude-opus-4-1
+      - claude-haiku-4-5
 
-  # DeepSeek-V4-Flash via llama.cpp (83 GB MoE, 96 GB RAM)
-  - id: deepseek-v4-flash
+  # Pre-downloaded GGUF (what `litmoe install --model` writes)
+  - id: qwen3.6-35b-a3b
     engine: llamacpp
-    model_path: unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ1_S
-    n_gpu_layers: -1
-    n_ctx: 4096
+    model_path: /home/me/.litmoe/models/qwen3.6-35b-a3b/UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+    n_ctx: 262144
+    extra_args: ["-t", "12"]   # any llama-server flags; -t overrides the physical-core default
 
-  # MiniMax-M3 via llama.cpp (GGUF from Unsloth, 128 GB — smallest viable trillion-scale)
-  - id: minimax-m3
-    engine: llamacpp
-    model_path: unsloth/MiniMax-M3-GGUF:UD-IQ1_M
-    n_gpu_layers: -1
-    n_ctx: 4096
-
-  # Kimi-K3 via llama.cpp (GGUF from Unsloth, 594 GB)
-  - id: kimi-k3
-    engine: llamacpp
-    model_path: unsloth/Kimi-K3-GGUF:UD-IQ1_S
-    n_gpu_layers: -1
-    n_ctx: 4096
-
-  # DeepSeek-V3 via ktransformers (safetensors directory)
-  # - id: deepseek-v3
-  #   engine: ktransformers
-  #   model_path: /data/deepseek-v3
-  #   n_gpu_layers: -1
-  #   n_ctx: 4096
+  # ktransformers via sglang-kt (Linux + NVIDIA GPU)
+  - id: glm-5.3-flash
+    engine: ktransformers
+    model_path: zai-org/GLM-5.3-Flash      # HF id or local safetensors directory
+    kt_method: FP8                         # CPU expert backend; LLAMAFILE + gguf_path for GGUF experts
+    kt_num_gpu_experts: 0                  # experts kept on GPU (0 = all on CPU)
+    n_ctx: 262144
+    extra_args: ["--tool-call-parser", "glm47", "--reasoning-parser", "glm45"]
 ```
 
-Per-model fields: `id` (name clients use), `engine` (`ktransformers` or `llamacpp`), `model_path` (safetensors dir, HF repo, or GGUF path), `gguf_path` (explicit GGUF override), `n_gpu_layers`, `n_ctx`, plus optional `extra_args` (list of engine CLI flags) and `env` (environment variables).
+Per-model fields: `id`, `engine` (`llamacpp` | `ktransformers`), `model_path` (GGUF file, HF spec `owner/repo[:quant]`, URL, or safetensors directory), `gguf_path`, `n_gpu_layers`, `n_ctx`, `aliases`, `extra_args`, `env`; ktransformers only: `kt_method`, `kt_num_gpu_experts`, `kt_cpuinfer` (default: physical cores), `kt_threadpool_count` (default: NUMA nodes). llama-server gets `-t <physical cores>` unless `extra_args` sets `-t`. When the gateway raises a too-small `n_ctx` it writes the resolved value back into `models.yaml` (comments in the file are not preserved by that rewrite).
 
 ---
 
 ## Commands
 
 ```bash
-litmoe doctor          # Check CPU/GPU/RAM, engine availability, get a recommendation
-litmoe init            # Create models.yaml
-litmoe install         # Install engines and/or download model weights
-litmoe serve           # Start gateway + all configured engines
-litmoe status          # Show gateway health and per-engine status
-litmoe stop            # SIGTERM all engine subprocesses
+litmoe doctor          # CPU/GPU/RAM, engines, recommended models
+litmoe models          # catalog by RAM tier with fits / does-not-fit for this machine
+litmoe init            # write models.yaml with fast defaults for this RAM
+litmoe install         # install engines and/or download a model (--model, --quant, --engine)
+litmoe serve           # start gateway + all configured engines (Ctrl-C stops both)
+litmoe status          # gateway health and per-engine status
+litmoe stop            # stop the engines litmoe started (PID files); --all also matches by name
 ```
 
 ---
@@ -172,56 +154,53 @@ litmoe stop            # SIGTERM all engine subprocesses
    Clients (Claude Code, Hermes, Open WebUI, aider, curl)
         │  HTTP  /v1/chat/completions · /v1/messages · /v1/models
         ▼
-   litmoe gateway (litmoe/server.py, ~215 lines FastAPI)
-        │  parse body → read `model` field → look up engine in models.yaml
-        │  Anthropic /v1/messages → translated to OpenAI chat completions
+   litmoe gateway (litmoe/server.py, FastAPI)
+        │  read `model` → resolve alias → engine from models.yaml
+        │  Anthropic /v1/messages ⇄ OpenAI chat completions
         ▼
-   engine subprocess                    engine subprocess
-   ktransformers.server.main :10002     llama-server :8081
-        │                                     │
-   GPU (sglang-kt) or CPU (AMX/AVX2)     CUDA/HIP/Metal/Vulkan/CPU
+   engine subprocess                      engine subprocess
+   llama-server :8081                     python -m sglang.launch_server :8082
+   CPU / CUDA / Metal / Vulkan            GPU attention + kt-kernel CPU experts
 ```
 
-The gateway never touches the forward pass. It adds single-digit-millisecond latency per request and zero compute.
+Engine ports are assigned in `models.yaml` order starting at 8081, skipping the gateway's own port and any port another process already holds. The gateway never touches the forward pass.
 
-Full diagram with data flow, engine internals, and port table: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/architecture.svg](docs/architecture.svg)
-
-Design rationale and measured performance numbers: [docs/METHODOLOGY.md](docs/METHODOLOGY.md)
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/architecture.svg](docs/architecture.svg) · design rationale and measurements: [docs/METHODOLOGY.md](docs/METHODOLOGY.md)
 
 ---
 
 ## Connect your tools
 
+Design rule: **using a local model must never change what a harness does when you run it normally.** litmoe never writes to `~/.claude`, `~/.hermes/config.yaml`, or your shell rc; everything below is per-process or per-profile. Details and a verification checklist: [docs/HARNESSES.md](docs/HARNESSES.md).
+
 ### Claude Code
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-export ANTHROPIC_API_KEY=dummy
-claude --model kimi-k3
+./scripts/claude-local                              # Claude Code → local model, isolated
+./scripts/claude-local --model qwen3.6-35b-a3b -p "explain this repo"
+claude                                              # normal Claude Code, still your Anthropic account
 ```
+`claude-local` sets `ANTHROPIC_BASE_URL`, a dummy `ANTHROPIC_AUTH_TOKEN`, the model-alias variables, and a separate `CLAUDE_CONFIG_DIR` **only for that one process**, then execs `claude`. Do not `export ANTHROPIC_BASE_URL` in your shell — that redirects every Claude Code session and every Anthropic SDK client until you undo it.
 
 ### Hermes Agent
 ```bash
-hermes config set model.provider custom
-hermes config set model.base_url http://127.0.0.1:8080/v1
-hermes config set model.api_key dummy
-hermes config set model.default kimi-k3
+./scripts/hermes-local                              # one session against the gateway
+./scripts/hermes-local -q "one question"
+hermes                                              # unchanged
 ```
+For a persistent setup, create a separate profile (`hermes profile create litmoe --clone`, then `hermes -p litmoe model` → Custom endpoint `http://127.0.0.1:8080/v1`), or add a `model_aliases:` entry with its own `api_key` and switch with `/model local` — see [docs/HARNESSES.md](docs/HARNESSES.md) for the exact block. Avoid `hermes config set model.*` — it rewrites the default profile.
 
 ### Open WebUI
-Add an OpenAI API connection at `http://127.0.0.1:8080/v1`.
+Add `http://127.0.0.1:8080/v1` as an **additional** OpenAI API connection (keep the existing ones).
 
 ### curl
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "model": "kimi-k3",
+  "model": "gemma-4-26b-a4b",
   "messages": [{"role": "user", "content": "hello"}]
 }'
-```
 
-### Anthropic format
-```bash
 curl http://127.0.0.1:8080/v1/messages -H "Content-Type: application/json" -d '{
-  "model": "kimi-k3",
+  "model": "gemma-4-26b-a4b",
   "max_tokens": 1024,
   "messages": [{"role": "user", "content": "hello"}]
 }'
@@ -237,15 +216,16 @@ cp models.yaml.example models.yaml   # edit paths first
 docker compose up
 ```
 
-Services: **litmoe-gateway** (port 8080), **caddy** (optional TLS proxy), **openwebui** (chat UI). Engines run as subprocesses of the gateway container or on the host.
+Services: **litmoe-gateway** on port **8000** (`http://127.0.0.1:8000/v1`, loopback only — no auth by default) and **openwebui** on port **8080**. Model files are mounted read-only from `$LITMOE_MODELS_DIR` (default `~/.litmoe/models`). `deploy/caddy/Caddyfile` is an optional reverse-proxy front; it is not started by the compose file.
 
 ---
 
 ## What litmoe does NOT do
 
-- No inference code. No model weights, no kernels, no quantization. The engines do all compute.
-- No multi-node distribution. Single-node only.
-- No model conversion. Use `llama-quantize`, Unsloth, or download pre-quantized GGUFs.
+- No inference code, weights, kernels, or quantization — the engines do all compute.
+- No multi-node distribution. Single node.
+- No model conversion. Use `llama-quantize`, Unsloth, or pre-quantized GGUFs.
+- No fine-tuning. For LoRA on MoE experts see the ktransformers × LlamaFactory cookbook upstream.
 
 ---
 
