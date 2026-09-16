@@ -71,10 +71,11 @@ gemma-4-26b-a4b → llama.cpp on a laptop, glm-5.3-flash → sglang-kt on a
 GPU server. The catalog encodes what fits where so the default is never a
 594 GB download on a 96 GB machine.
 
-**Defaults must be fast, not just fit.** A 9B dense model "fits" a 16 GB
-laptop but ran at 0.7 t/s on an AVX2 DDR4 box; a 26B MoE with 4B active ran
-at 9–11 t/s on the same box. Small-active MoEs are the laptop tier; dense
-models and big MoEs are listed, not defaulted.
+**Defaults must be fast, not just fit.** A 9B dense model and a 26B MoE with
+4B active both ran at 8–13 t/s on an AVX2 DDR4 box — same speed class, but
+the MoE is a far stronger model (and multimodal). Speed on CPU tracks *active*
+parameters, so small-active MoEs are the laptop tier; dense models and big
+MoEs are listed, not defaulted.
 
 **Inference is hardware-bound, not software-bound.** The previous "optimization"
 work (cross-layer prefetch, 2-bit quantization, mmap advisor, fused matmul)
@@ -84,21 +85,25 @@ the right engine for the hardware and let it do what it's good at.
 
 ## What was measured
 
-Hardware: AMD EPYC 7B13 (24 physical cores, 377 GB DDR4-3200, no GPU,
-Google Cloud PersistentDisk at ~379 MB/s random / ~778 MB/s sequential read).
+Hardware: AMD EPYC 7B13 (24 physical cores, AVX2 only, 377–406 GB DDR4-3200,
+no GPU, Google Cloud PersistentDisk at ~379 MB/s random / ~778 MB/s
+sequential read). Raw logs: [`docs/measurements/`](measurements/README.md).
 
-| Engine | Mode | Tokens/sec | Notes |
-|---|---|---|---|
-| Previous C99 AVX2 forward pass, Kimi-K3 | CPU | 0.019 | 158s TTFT for 4-token prompt; thread stuck in DISK SLEEP |
-| llama.cpp, Kimi-K3 UD-IQ1_S (594 GB) | CPU | 0.85 | experts paging from cloud disk |
-| llama.cpp, Qwen3.8-9B dense Q4_K_M | CPU | 0.7 | in RAM; DDR4 bandwidth-bound |
-| llama.cpp, Gemma-4-26B-A4B UD-Q4_K_XL | CPU | 9–11.6 warm (1.6–4.3 cold) | 2026-09-16, `logs/gemma-4-26b-a4b.log` |
-| llama.cpp, Qwen3.8-9B dense Q4_K_M | Mac M2 Max, Metal | 47 | 96 GB unified memory |
-| ktransformers sglang-kt GPU backend | GPU + CPU experts | 5–50 t/s typical | upstream tutorials; needs a CUDA GPU |
+| Engine | Model | Threads | Tokens/sec | Notes |
+|---|---|---|---|---|
+| Previous C99 AVX2 forward pass | Kimi-K3 | 24 | 0.019 | 158s TTFT for 4-token prompt; thread stuck in DISK SLEEP (Aug 2026, log not retained) |
+| llama.cpp | Gemma-4-26B-A4B UD-Q4_K_XL (17 GB) | 24 | 9.0–12.7 resident; 1.6–4.6 while paging in | 2026-09-16, `gemma-4-26b-a4b.log` |
+| llama.cpp | Qwen3.8-9B dense Q4_K_M (6 GB) | 8 | 8.3–8.5 | 2026-09-01, `qwen3.8-9b-distill.log` |
+| llama.cpp | Kimi-Linear-48B-A3B Q4_K_M (30 GB) | 48 | 0.03–0.58 | disk-bound, `kimi-linear-48b.log` |
+| llama.cpp | DeepSeek-V4-Flash UD-IQ1_S (83 GB) | 48 | 0.11–0.34 | disk-bound, `deepseek-v4-flash.log` |
+| ktransformers sglang-kt | large MoEs, GPU attention + CPU experts | — | 5–50 typical | upstream tutorials; needs a CUDA GPU, not measured here |
 
-The previous engine was 45x slower than llama.cpp on the same hardware doing
-the same thing. The gap to GPU is 100-1000x. There's no path from the custom
-C engine to "interactive inference on this VM."
+The C engine was ~45x slower than llama.cpp on the same Kimi-K3 weights
+(0.019 vs the 0.85 t/s llama.cpp reached in Aug 2026, recorded in commit
+`cd9e97e`/`21819c5`; that llama.cpp log was later overwritten, so the K3
+figure comes from the commit history rather than a shipped log). The gap to
+GPU serving is 100–1000x. There is no path from a custom C engine to
+interactive inference on this VM.
 
 ## What you get
 
@@ -152,7 +157,8 @@ litmoe/
     ├── HARNESSES.md        # Claude Code / Hermes isolation and revert
     ├── METHODOLOGY.md      # this file
     ├── ARCHITECTURE.md     # architecture diagram
-    └── architecture.svg    # rendered diagram
+    ├── architecture.svg    # rendered diagram
+    └── measurements/       # raw llama-server logs behind every t/s figure
 ```
 
 ## What was learned along the way

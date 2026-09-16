@@ -29,10 +29,11 @@ RUN pip install --no-cache-dir -e .
 #       cp build/bin/llama-server /usr/local/bin/ && \
 #       cp build/bin/lib*.so* /usr/local/lib/ && ldconfig
 #
-# ktransformers (Linux + NVIDIA GPU only):
-#   RUN git clone https://github.com/kvcache-ai/ktransformers.git && \
-#       cd ktransformers && git submodule update --init --recursive && \
-#       pip install ./kt-kernel && pip install .
+# ktransformers (Linux + NVIDIA GPU only; wheels need glibc >= 2.35, Python 3.11/3.12):
+#   RUN pip install "ktransformers[sglang]"
+#   # or, when the wheels do not match this image:
+#   RUN git clone --recursive https://github.com/kvcache-ai/ktransformers.git && \
+#       cd ktransformers && bash install.sh
 
 # Config
 ENV LITMOE_CONFIG=/config/models.yaml

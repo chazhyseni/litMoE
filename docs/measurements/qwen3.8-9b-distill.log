@@ -1,0 +1,51 @@
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.011.213 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.011.916 W srv  llama_server: -----------------
+0.00.011.917 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.011.917 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.011.917 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.011.918 W srv  llama_server: -----------------
+0.00.032.269 I srv    load_model: loading model '/models/qwen3.8-9b-distill/Q4_K_M/Qwen3.8-9B-Q4_K_M.gguf'
+0.01.879.693 W model has unused tensor blk.32.attn_norm.weight (size = 16384 bytes) -- ignoring
+0.01.879.731 W model has unused tensor blk.32.post_attention_norm.weight (size = 16384 bytes) -- ignoring
+0.01.879.742 W model has unused tensor blk.32.attn_q.weight (size = 18874368 bytes) -- ignoring
+0.01.879.745 W model has unused tensor blk.32.attn_k.weight (size = 2359296 bytes) -- ignoring
+0.01.879.749 W model has unused tensor blk.32.attn_v.weight (size = 3440640 bytes) -- ignoring
+0.01.879.762 W model has unused tensor blk.32.attn_output.weight (size = 9437184 bytes) -- ignoring
+0.01.879.766 W model has unused tensor blk.32.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.01.879.772 W model has unused tensor blk.32.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.01.879.776 W model has unused tensor blk.32.ffn_gate.weight (size = 28311552 bytes) -- ignoring
+0.01.879.780 W model has unused tensor blk.32.ffn_down.weight (size = 41287680 bytes) -- ignoring
+0.01.879.784 W model has unused tensor blk.32.ffn_up.weight (size = 28311552 bytes) -- ignoring
+0.01.879.790 W model has unused tensor blk.32.nextn.eh_proj.weight (size = 18874368 bytes) -- ignoring
+0.01.879.794 W model has unused tensor blk.32.nextn.enorm.weight (size = 16384 bytes) -- ignoring
+0.01.879.798 W model has unused tensor blk.32.nextn.hnorm.weight (size = 16384 bytes) -- ignoring
+0.01.879.809 W model has unused tensor blk.32.nextn.shared_head_norm.weight (size = 16384 bytes) -- ignoring
+0.08.522.773 I cmn          init: llama threadpool init, n_threads = 8
+0.10.591.573 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 131072, kv_unified = 'true'
+0.10.597.745 I srv  llama_server: model loaded
+0.10.597.772 I srv  llama_server: listening on http://127.0.0.1:8081
+0.30.667.541 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.30.667.769 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+0.35.706.393 I slot print_timing: id  3 | task 0 | prompt eval time =     955.39 ms /    22 tokens (   43.43 ms per token,    23.03 tokens per second)
+0.35.706.417 I slot print_timing: id  3 | task 0 |        eval time =    4082.69 ms /    35 tokens (  120.08 ms per token,     8.33 tokens per second)
+0.35.706.418 I slot print_timing: id  3 | task 0 |       total time =    5038.07 ms /    57 tokens
+0.35.706.439 I slot print_timing: id  3 | task 0 |    graphs reused =         34
+0.35.706.724 I slot      release: id  3 | task 0 | stop processing: n_tokens = 56, truncated = 0
+0.48.501.551 I slot get_availabl: id  2 | task -1 | selected slot by LRU, t_last = -1
+0.48.501.740 I slot launch_slot_: id  2 | task 38 | processing task, is_child = 0
+0.51.633.494 W srv          stop: cancel task, id_task = 38
+0.51.741.237 I slot      release: id  2 | task 38 | stop processing: n_tokens = 38, truncated = 0
+1.02.024.156 W Wrong type supplied for parameter 'tool_choice', using default value: [json.exception.type_error.302] type must be string, but is object
+1.02.030.963 I slot get_availabl: id  1 | task -1 | selected slot by LRU, t_last = -1
+1.02.031.379 I slot launch_slot_: id  1 | task 63 | processing task, is_child = 0
+1.10.253.618 I slot print_timing: id  1 | task 63 | prompt processing, n_tokens =    257, progress = 0.94, t =   8.14 s / 31.57 tokens per second
+1.10.886.481 I slot print_timing: id  1 | task 63 | prompt processing, n_tokens =    270, progress = 0.99, t =   8.77 s / 30.78 tokens per second
+1.18.902.426 I slot print_timing: id  1 | task 63 | prompt eval time =    9004.03 ms /   274 tokens (   32.86 ms per token,    30.43 tokens per second)
+1.18.902.451 I slot print_timing: id  1 | task 63 |        eval time =    7785.23 ms /    67 tokens (  117.96 ms per token,     8.48 tokens per second)
+1.18.902.466 I slot print_timing: id  1 | task 63 |       total time =   16789.26 ms /   341 tokens
+1.18.902.468 I slot print_timing: id  1 | task 63 |    graphs reused =        119
+1.18.903.237 I slot      release: id  1 | task 63 | stop processing: n_tokens = 340, truncated = 0
+1.58.361.720 I srv    operator(): operator(): cleaning up before exit...

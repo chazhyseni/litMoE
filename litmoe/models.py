@@ -253,13 +253,13 @@ KNOWN_MODELS: dict[str, dict] = {
         {"UD-Q1_0": 397, "UD-IQ1_S": 508, "UD-IQ1_M": 564, "UD-IQ2_XXS": 657, "UD-IQ2_XS": 731,
          "UD-IQ3_XXS": 956, "UD-IQ4_XS": 1311, "Q8_0": 2600, "BF16": 4893},
         "UD-IQ1_S", 262144, 94_208, TIER_SERVER_768,  # 23 full-attention layers of 92 * 2*4*256*2
-        "95B active parameters: slow on CPU regardless of RAM (measured 0.5 t/s on a 24-core EPYC)."),
+        "95B active parameters: slow on CPU regardless of RAM (~1 t/s class on a 24-core AVX2 EPYC; not measured in this repo)."),
     "kimi-k3": _g(
         "unsloth/Kimi-K3-GGUF", "kimi-k3", "2.78T total, 93B active MoE, 1M context", 93.0,
         {"UD-Q1_0": 466, "UD-TQ1_0": 509, "UD-TQ2_0": 551, "UD-IQ1_S": 594, "UD-IQ1_M": 649,
          "UD-IQ2_XXS": 711, "UD-Q2_K_XL": 861, "UD-Q4_K_XL": 1509, "UD-Q8_K_XL": 1561},
         "UD-IQ1_S", 1048576, 107_136, TIER_SERVER_768,  # 93 MLA layers * (512+64) * 2
-        "93B active parameters: slow on CPU regardless of RAM (measured 0.85 t/s on a 24-core EPYC)."),
+        "93B active parameters: slow on CPU regardless of RAM (0.85 t/s on a 24-core AVX2 EPYC, Aug 2026, per commit history)."),
 
     # ==================================================================
     # ktransformers — safetensors served by sglang-kt (python -m sglang.launch_server)

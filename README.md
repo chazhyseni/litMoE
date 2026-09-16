@@ -17,7 +17,7 @@ litmoe is not an inference engine — the forward pass runs in llama.cpp or ktra
 
 ## Which models, on what hardware
 
-Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs. Every entry below was verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the same table with a fits / does-not-fit column for your RAM.
+Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs: on the project's 24-core AVX2 box the 4B-active default runs at 9–12.7 t/s, the same band as a 9B dense model, while being a far stronger model (numbers and raw logs in [docs/measurements/](docs/measurements/README.md)). Every entry below was verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the same table with a fits / does-not-fit column for your RAM.
 
 | Tier | Model (`--model`) | Total / active | Default quant | Disk | Why |
 |---|---|---|---|---|---|
@@ -27,7 +27,7 @@ Speed on CPU/Metal is governed by *active* parameters per token, so the default 
 | | `gpt-oss-20b` | 21B / 3.6B | UD-Q4_K_XL | 12 GB | Native MXFP4 |
 | | `kimi-linear-48b` | 48B / 3B | Q4_K_M | 30 GB | KDA linear attention, 1M ctx |
 | | `gemma-4-12b`, `qwen3.8-9b-distill` | dense 12B / 9B | Q4_K_M | 7 / 6 GB | Small dense |
-| | `qwen3.8-27b`, `gemma-4-31b` | dense 27B / 31B | UD-Q4_K_XL | 18 / 19 GB | Strongest small models, ~3-4× slower than the MoEs |
+| | `qwen3.8-27b`, `gemma-4-31b` | dense 27B / 31B | UD-Q4_K_XL | 18 / 19 GB | Strongest small models; 7–9× the active params of the MoEs above, so expect a fraction of their speed |
 | **96 GB laptop / desktop** | `gpt-oss-120b` | 117B / 5.1B | UD-Q4_K_XL | 63 GB | Native MXFP4, fast |
 | | `qwen3.5-122b-a10b` | 122B / 10B | UD-IQ4_XS | 60 GB | |
 | | `nemotron-3-super-120b-a12b` | 120B / 12B | UD-IQ4_XS | 64 GB | 1M ctx |
@@ -52,7 +52,7 @@ Any model can drop a tier with a smaller quant: `litmoe install --model qwen3.5-
 
 - CUDA, HIP (AMD), Metal (Apple), Vulkan, SYCL, OpenCL, CANN — and plain CPU
 - 1–8-bit GGUF quantization; pre-quantized GGUFs from [Unsloth](https://huggingface.co/unsloth)
-- Every model in the catalog above has its architecture in `src/llama-arch.cpp` (gemma4, qwen35moe, qwen4exp, nemotron_h_moe, gpt-oss, kimi-k3, deepseek4, glm-dsa, minimax-m3, llama4, kimi-linear, …)
+- Every model in the catalog above has its architecture in `src/llama-arch.cpp` (`gemma4`, `qwen35moe`, `qwen35`, `qwen4exp`, `nemotron_h_moe`, `gpt-oss`, `kimi-k3`, `kimi-linear`, `deepseek2`, `deepseek4`, `glm-dsa`, `minimax-m2`, `minimax-m3`, `llama4`); `qwen4exp` (Qwen3.8-Flash-Next) needs a build from September 2026 or later
 - `--jinja` chat templates (tool calling) are on by default in current builds
 
 **Install:** `litmoe install --engine llamacpp` — downloads the matching release binary (`--llamacpp-variant cpu|cuda|cuda13|vulkan|rocm`, auto-selects CUDA when an NVIDIA GPU is visible) or builds from source when glibc < 2.34.

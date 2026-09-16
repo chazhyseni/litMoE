@@ -189,7 +189,7 @@ def install_llamacpp(prefix: Path, variant: str = "auto", tag: str | None = None
     """Install llama.cpp.
 
     macOS: release binaries (Metal built in), source build as fallback.
-    Linux: release binaries when glibc >= 2.35 (they are built on Ubuntu 22.04),
+    Linux: release binaries when glibc >= 2.34 (they link GLIBC_2.34 symbols),
     otherwise a source build.
     """
     variant = pick_llamacpp_variant(variant)
@@ -332,7 +332,7 @@ def _copy_homebrew_openssl(dest_dir: Path) -> None:
 
 
 def _install_llamacpp_source(prefix: Path) -> Path:
-    """Build llama.cpp from source (glibc < 2.35, or no usable release binary).
+    """Build llama.cpp from source (glibc < 2.34, or no usable release binary).
 
     Linux: CPU build with OpenBLAS (needs libopenblas-dev) and -march=native.
     macOS: Metal + Accelerate (the default BLAS on macOS), rpath baked in and

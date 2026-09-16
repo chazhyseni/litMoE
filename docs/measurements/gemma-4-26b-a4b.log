@@ -1,0 +1,249 @@
+
+===== litmoe session 2026-09-16 17:41:08 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 262144 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.006.126 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.016.313 W srv  llama_server: -----------------
+0.00.016.338 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.016.339 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.016.340 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.016.341 W srv  llama_server: -----------------
+0.00.021.149 I srv    load_model: loading model '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+0.02.635.565 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.636.681 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.655.810 W load: control-looking token:      1 '<eos>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.756.130 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.21.056.734 I cmn          init: llama threadpool init, n_threads = 24
+0.29.035.510 I srv    load_model: loaded multimodal model, '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf'
+0.30.700.478 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+0.30.718.677 I srv  llama_server: model loaded
+0.30.718.711 I srv  llama_server: listening on http://127.0.0.1:8081
+1.00.351.200 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+1.00.351.420 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+1.16.327.626 I slot print_timing: id  3 | task 0 | prompt eval time =    2213.34 ms /    30 tokens (   73.78 ms per token,    13.55 tokens per second)
+1.16.327.647 I slot print_timing: id  3 | task 0 |        eval time =   13762.13 ms /    60 tokens (  233.26 ms per token,     4.29 tokens per second)
+1.16.327.648 I slot print_timing: id  3 | task 0 |       total time =   15975.47 ms /    90 tokens
+1.16.327.649 I slot print_timing: id  3 | task 0 |    graphs reused =         59
+1.16.327.754 I slot      release: id  3 | task 0 | stop processing: n_tokens = 89, truncated = 0
+1.16.362.693 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.458 (> 0.100 thold), f_keep = 0.124
+1.16.392.313 I slot launch_slot_: id  3 | task 63 | processing task, is_child = 0
+1.35.988.967 I slot print_timing: id  3 | task 63 | prompt eval time =     974.73 ms /    17 tokens (   57.34 ms per token,    17.44 tokens per second)
+1.35.988.993 I slot print_timing: id  3 | task 63 |        eval time =   18621.20 ms /    30 tokens (  642.11 ms per token,     1.56 tokens per second)
+1.35.988.994 I slot print_timing: id  3 | task 63 |       total time =   19595.92 ms /    47 tokens
+1.35.988.996 I slot print_timing: id  3 | task 63 |    graphs reused =         87
+1.35.989.062 I slot      release: id  3 | task 63 | stop processing: n_tokens = 53, truncated = 0
+1.36.021.662 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.250 (> 0.100 thold), f_keep = 0.113
+1.36.045.997 I slot launch_slot_: id  3 | task 96 | processing task, is_child = 0
+1.57.731.060 I slot print_timing: id  3 | task 96 | prompt eval time =    3585.37 ms /    18 tokens (  199.19 ms per token,     5.02 tokens per second)
+1.57.731.082 I slot print_timing: id  3 | task 96 |        eval time =   18098.16 ms /    40 tokens (  464.06 ms per token,     2.15 tokens per second)
+1.57.731.083 I slot print_timing: id  3 | task 96 |       total time =   21683.52 ms /    58 tokens
+1.57.731.085 I slot print_timing: id  3 | task 96 |    graphs reused =        125
+1.57.731.512 I slot      release: id  3 | task 96 | stop processing: n_tokens = 63, truncated = 0
+1.57.794.671 I slot get_availabl: id  2 | task -1 | selected slot by LRU, t_last = -1
+1.57.795.429 I slot launch_slot_: id  2 | task 139 | processing task, is_child = 0
+2.12.855.464 I slot print_timing: id  2 | task 139 | prompt processing, n_tokens =     50, progress = 0.72, t =  15.02 s / 3.33 tokens per second
+2.14.717.066 I slot print_timing: id  2 | task 139 | prompt processing, n_tokens =     65, progress = 0.94, t =  16.88 s / 3.85 tokens per second
+2.54.699.595 I slot print_timing: id  2 | task 139 | prompt eval time =   17730.80 ms /    69 tokens (  256.97 ms per token,     3.89 tokens per second)
+2.54.699.612 I slot print_timing: id  2 | task 139 |        eval time =   39136.54 ms /    80 tokens (  495.40 ms per token,     2.02 tokens per second)
+2.54.699.614 I slot print_timing: id  2 | task 139 |       total time =   56867.35 ms /   149 tokens
+2.54.699.615 I slot print_timing: id  2 | task 139 |    graphs reused =        203
+2.54.700.032 I slot      release: id  2 | task 139 | stop processing: n_tokens = 148, truncated = 0
+2.54.733.536 I slot get_availabl: id  2 | task -1 | selected slot by LCP similarity, f_sim_best = 1.000 (> 0.100 thold), f_keep = 0.466
+2.54.793.265 I slot launch_slot_: id  2 | task 222 | processing task, is_child = 0
+3.09.498.096 I slot print_timing: id  2 | task 222 | prompt eval time =     563.14 ms /     5 tokens (  112.63 ms per token,     8.88 tokens per second)
+3.09.498.258 I slot print_timing: id  2 | task 222 |        eval time =   14140.71 ms /    80 tokens (  179.00 ms per token,     5.59 tokens per second)
+3.09.498.290 I slot print_timing: id  2 | task 222 |       total time =   14703.85 ms /    85 tokens
+3.09.498.320 I slot print_timing: id  2 | task 222 |    graphs reused =        281
+3.09.498.660 I slot      release: id  2 | task 222 | stop processing: n_tokens = 148, truncated = 0
+8.36.764.855 I slot get_availabl: id  1 | task -1 | selected slot by LRU, t_last = -1
+8.36.765.066 I slot launch_slot_: id  1 | task 304 | processing task, is_child = 0
+8.43.735.289 I slot print_timing: id  1 | task 304 | prompt eval time =    1365.32 ms /    27 tokens (   50.57 ms per token,    19.78 tokens per second)
+8.43.735.306 I slot print_timing: id  1 | task 304 |        eval time =    5537.35 ms /    51 tokens (  110.75 ms per token,     9.03 tokens per second)
+8.43.735.308 I slot print_timing: id  1 | task 304 |       total time =    6902.67 ms /    78 tokens
+8.43.735.309 I slot print_timing: id  1 | task 304 |    graphs reused =        330
+8.43.735.428 I slot      release: id  1 | task 304 | stop processing: n_tokens = 77, truncated = 0
+8.43.765.411 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+8.43.765.561 I slot launch_slot_: id  0 | task 358 | processing task, is_child = 0
+8.54.074.801 I slot print_timing: id  0 | task 358 | n_gen =    100, tg =  10.51 t/s, tg_3s =  10.61 t/s
+8.57.173.470 I slot print_timing: id  0 | task 358 | n_gen =    134, tg =  10.62 t/s, tg_3s =  10.97 t/s
+8.57.265.035 I slot print_timing: id  0 | task 358 | prompt eval time =     869.61 ms /    26 tokens (   33.45 ms per token,    29.90 tokens per second)
+8.57.265.051 I slot print_timing: id  0 | task 358 |        eval time =   12613.81 ms /   135 tokens (   94.13 ms per token,    10.62 tokens per second)
+8.57.265.053 I slot print_timing: id  0 | task 358 |       total time =   13483.42 ms /   161 tokens
+8.57.265.055 I slot print_timing: id  0 | task 358 |    graphs reused =        463
+8.57.265.142 I slot      release: id  0 | task 358 | stop processing: n_tokens = 160, truncated = 0
+13.49.240.021 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = 13987533381359
+13.49.240.424 I slot launch_slot_: id  3 | task 496 | processing task, is_child = 0
+14.06.248.817 I slot print_timing: id  3 | task 496 | prompt processing, n_tokens =    458, progress = 0.47, t =  16.98 s / 26.97 tokens per second
+14.21.824.172 I slot print_timing: id  3 | task 496 | prompt processing, n_tokens =    792, progress = 0.81, t =  32.56 s / 24.33 tokens per second
+14.35.868.038 I slot print_timing: id  3 | task 496 | prompt processing, n_tokens =    949, progress = 0.97, t =  46.60 s / 20.36 tokens per second
+14.36.673.451 I slot print_timing: id  3 | task 496 | prompt processing, n_tokens =    970, progress = 1.00, t =  47.41 s / 20.46 tokens per second
+14.37.511.546 I slot print_timing: id  3 | task 496 | prompt eval time =   47726.69 ms /   974 tokens (   49.00 ms per token,    20.41 tokens per second)
+14.37.511.563 I slot print_timing: id  3 | task 496 |        eval time =     516.45 ms /     7 tokens (   86.07 ms per token,    11.62 tokens per second)
+14.37.511.564 I slot print_timing: id  3 | task 496 |       total time =   48243.14 ms /   981 tokens
+14.37.511.565 I slot print_timing: id  3 | task 496 |    graphs reused =        468
+14.37.512.946 I slot      release: id  3 | task 496 | stop processing: n_tokens = 980, truncated = 0
+18.08.450.189 I srv    operator(): operator(): cleaning up before exit...
+
+===== litmoe session 2026-09-16 18:00:32 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 262144 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.004.926 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.005.478 W srv  llama_server: -----------------
+0.00.005.487 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.005.487 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.005.487 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.005.488 W srv  llama_server: -----------------
+0.00.006.948 I srv    load_model: loading model '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+0.01.727.466 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.728.744 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.745.488 W load: control-looking token:      1 '<eos>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.807.998 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.16.033.346 I cmn          init: llama threadpool init, n_threads = 24
+0.19.495.368 I srv    load_model: loaded multimodal model, '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf'
+0.20.341.178 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+0.20.350.001 I srv  llama_server: model loaded
+0.20.350.032 I srv  llama_server: listening on http://127.0.0.1:8081
+0.22.827.465 I srv    operator(): operator(): cleaning up before exit...
+
+===== litmoe session 2026-09-16 18:01:34 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 262144 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.005.131 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.005.709 W srv  llama_server: -----------------
+0.00.005.722 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.005.723 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.005.723 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.005.724 W srv  llama_server: -----------------
+0.00.007.249 I srv    load_model: loading model '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+0.01.672.080 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.673.048 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.685.332 W load: control-looking token:      1 '<eos>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.727.698 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.15.490.306 I cmn          init: llama threadpool init, n_threads = 24
+0.16.518.179 I srv    load_model: loaded multimodal model, '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf'
+0.16.952.495 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+0.16.961.089 I srv  llama_server: model loaded
+0.16.961.106 I srv  llama_server: listening on http://127.0.0.1:8081
+
+===== litmoe session 2026-09-16 18:02:42 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 262144 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.004.759 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.005.294 W srv  llama_server: -----------------
+0.00.005.302 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.005.303 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.005.303 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.005.304 W srv  llama_server: -----------------
+0.00.005.403 E srv         start: couldn't bind HTTP server socket, hostname: 127.0.0.1, port: 8081
+0.00.005.410 I srv    operator(): operator(): cleaning up before exit...
+0.00.005.502 E srv  llama_server: exiting due to HTTP server error
+3.36.109.325 I srv    operator(): operator(): cleaning up before exit...
+
+===== litmoe session 2026-09-16 18:05:26 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 262144 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.005.286 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.005.851 W srv  llama_server: -----------------
+0.00.005.860 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.005.861 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.005.861 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.005.861 W srv  llama_server: -----------------
+0.00.007.365 I srv    load_model: loading model '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+0.01.755.628 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.756.597 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.769.013 W load: control-looking token:      1 '<eos>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.812.317 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.15.645.752 I cmn          init: llama threadpool init, n_threads = 24
+0.16.657.957 I srv    load_model: loaded multimodal model, '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf'
+0.17.111.349 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+0.17.120.090 I srv  llama_server: model loaded
+0.17.120.111 I srv  llama_server: listening on http://127.0.0.1:8081
+2.05.154.784 I srv    operator(): operator(): cleaning up before exit...
+
+===== litmoe session 2026-09-16 18:17:44 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 262144 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.005.860 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.006.510 W srv  llama_server: -----------------
+0.00.006.522 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.006.523 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.006.524 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.006.524 W srv  llama_server: -----------------
+0.00.008.394 I srv    load_model: loading model '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+0.01.879.536 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.880.488 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.893.057 W load: control-looking token:      1 '<eos>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.940.462 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.16.584.807 I cmn          init: llama threadpool init, n_threads = 24
+0.17.719.897 I srv    load_model: loaded multimodal model, '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf'
+0.18.193.722 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+0.18.202.862 I srv  llama_server: model loaded
+0.18.202.889 I srv  llama_server: listening on http://127.0.0.1:8081
+2.38.735.661 I srv    operator(): operator(): cleaning up before exit...
+
+===== litmoe session 2026-09-16 18:22:12 +0000 — gemma-4-26b-a4b =====
+$ ~/.local/lib/llama.cpp/local/llama-server -m ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -ngl -1 -c 32768 -t 24 --host 127.0.0.1 --port 8081 --mmproj ~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf
+warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.005.007 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.005.548 W srv  llama_server: -----------------
+0.00.005.560 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.005.561 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.005.562 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.005.562 W srv  llama_server: -----------------
+0.00.007.112 I srv    load_model: loading model '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+0.01.959.375 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.960.406 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.973.594 W load: control-looking token:      1 '<eos>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.022.792 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.14.180.720 I cmn          init: llama threadpool init, n_threads = 24
+0.15.128.727 I srv    load_model: loaded multimodal model, '~/.litmoe/models/gemma-4-26b-a4b/UD-Q4_K_XL/mmproj-F16.gguf'
+0.15.356.886 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 32768, kv_unified = 'true'
+0.15.365.826 I srv  llama_server: model loaded
+0.15.365.848 I srv  llama_server: listening on http://127.0.0.1:8081
+2.37.572.073 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+2.37.572.217 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+2.40.655.942 I slot print_timing: id  3 | task 0 | prompt eval time =     698.96 ms /    24 tokens (   29.12 ms per token,    34.34 tokens per second)
+2.40.656.063 I slot print_timing: id  3 | task 0 |        eval time =    2384.59 ms /    12 tokens (  216.78 ms per token,     4.61 tokens per second)
+2.40.656.093 I slot print_timing: id  3 | task 0 |       total time =    3083.54 ms /    36 tokens
+2.40.656.122 I slot print_timing: id  3 | task 0 |    graphs reused =         11
+2.40.657.038 I slot      release: id  3 | task 0 | stop processing: n_tokens = 35, truncated = 0
+2.41.189.684 I slot get_availabl: id  2 | task -1 | selected slot by LRU, t_last = -1
+2.41.189.999 I slot launch_slot_: id  2 | task 15 | processing task, is_child = 0
+2.59.964.732 I slot print_timing: id  2 | task 15 | prompt processing, n_tokens =    454, progress = 0.47, t =  18.77 s / 24.19 tokens per second
+3.15.634.333 I slot print_timing: id  2 | task 15 | prompt processing, n_tokens =    793, progress = 0.82, t =  34.44 s / 23.03 tokens per second
+3.29.446.660 I slot print_timing: id  2 | task 15 | prompt processing, n_tokens =    945, progress = 0.97, t =  48.25 s / 19.59 tokens per second
+3.30.222.483 I slot print_timing: id  2 | task 15 | prompt processing, n_tokens =    966, progress = 1.00, t =  49.02 s / 19.70 tokens per second
+3.31.212.712 I slot print_timing: id  2 | task 15 | prompt eval time =   49426.97 ms /   970 tokens (   50.96 ms per token,    19.62 tokens per second)
+3.31.212.756 I slot print_timing: id  2 | task 15 |        eval time =     587.46 ms /     7 tokens (   97.91 ms per token,    10.21 tokens per second)
+3.31.212.758 I slot print_timing: id  2 | task 15 |       total time =   50014.43 ms /   977 tokens
+3.31.212.760 I slot print_timing: id  2 | task 15 |    graphs reused =         16
+3.31.213.608 I slot      release: id  2 | task 15 | stop processing: n_tokens = 976, truncated = 0
+3.36.861.464 I slot get_availabl: id  2 | task -1 | selected slot by LCP similarity, f_sim_best = 0.250 (> 0.100 thold), f_keep = 0.006
+3.37.811.082 I slot launch_slot_: id  2 | task 27 | processing task, is_child = 0
+3.39.076.797 I slot print_timing: id  2 | task 27 | prompt eval time =     217.47 ms /     5 tokens (   43.49 ms per token,    22.99 tokens per second)
+3.39.076.814 I slot print_timing: id  2 | task 27 |        eval time =    1048.05 ms /    12 tokens (   95.28 ms per token,    10.50 tokens per second)
+3.39.076.816 I slot print_timing: id  2 | task 27 |       total time =    1265.51 ms /    17 tokens
+3.39.076.818 I slot print_timing: id  2 | task 27 |    graphs reused =         26
+3.39.076.875 I slot      release: id  2 | task 27 | stop processing: n_tokens = 35, truncated = 0
+3.49.208.477 I slot get_availabl: id  2 | task -1 | selected slot by LCP similarity, f_sim_best = 1.000 (> 0.100 thold), f_keep = 0.686
+3.49.208.657 I slot launch_slot_: id  2 | task 41 | processing task, is_child = 0
+3.53.505.251 I slot print_timing: id  2 | task 41 | prompt eval time =     194.45 ms /     5 tokens (   38.89 ms per token,    25.71 tokens per second)
+3.53.505.273 I slot print_timing: id  2 | task 41 |        eval time =    4101.94 ms /    53 tokens (   78.88 ms per token,    12.68 tokens per second)
+3.53.505.288 I slot print_timing: id  2 | task 41 |       total time =    4296.39 ms /    58 tokens
+3.53.505.290 I slot print_timing: id  2 | task 41 |    graphs reused =         77
+3.53.505.339 I slot      release: id  2 | task 41 | stop processing: n_tokens = 76, truncated = 0
+3.53.665.855 I srv    operator(): operator(): cleaning up before exit...

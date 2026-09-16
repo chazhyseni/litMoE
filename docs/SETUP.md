@@ -117,33 +117,39 @@ parameters or ≤ 31 B dense — the ones that are actually fast on CPU/Metal.
 
 ## Speed: what to expect
 
-Throughput on CPU is bounded by memory bandwidth × active parameters. Rough
-rules from this project's measurements and community numbers:
+Throughput on CPU is bounded by memory bandwidth × active parameters, so a
+26B MoE with 4B active runs about as fast as a 9B dense model while being a
+much stronger model — that is the whole reason the default tier is
+small-active MoEs. Rough rules from community numbers (not measured here):
 
-- **3–5 B active MoE, Q4** (the 48 GB tier): 25–60 t/s on Apple M-series
-  Max/Ultra, 10–25 t/s on a modern desktop with DDR5, 3–8 t/s on an AVX2-only
-  DDR4 cloud VM. Interactive everywhere except the last case.
+- **3–5 B active MoE, Q4** (the 48 GB tier): tens of t/s on Apple M-series
+  Max/Ultra, 10–25 t/s on a DDR5 desktop, high single digits on an AVX2-only
+  DDR4 cloud VM.
 - **10–17 B active** (96 GB tier): roughly a third of the above.
 - **≥ 23 B active** (server tiers): needs a GPU for attention (sglang-kt) or a
   many-channel EPYC/Xeon to be interactive; otherwise batch-only.
 
-Measured in this project (all CPU-only, llama.cpp):
+Measured in this project — every number below is a `print_timing` line in a
+log shipped under [`docs/measurements/`](measurements/README.md). Machine: AMD
+EPYC 7B13, 24 physical cores, AVX2 only (no AVX-512), DDR4-3200, Google Cloud
+persistent disk (~400 MB/s), no GPU, llama.cpp CPU build.
 
-| Machine | Model | t/s (generation) |
-|---|---|---|
-| Mac M2 Max 96 GB (Metal) | Qwen3.8-9B dense Q4_K_M | 47 |
-| AMD EPYC 7B13 24c, AVX2, DDR4-3200, cloud disk | gemma-4-26b-a4b UD-Q4_K_XL, page cache warm | 9–11.6 (prompt 20–30) |
-| same, first requests after load (experts still paging from disk) | same | 1.6–4.3 |
-| same | Qwen3.8-9B dense Q4_K_M | 0.7 |
-| same | Kimi-K3 UD-IQ1_S (594 GB) | 0.85 |
-| same | DeepSeek-V4-Flash UD-IQ1_S (83 GB) | 0.33 |
+| Model | Quant / size | Threads | Generation t/s | Log |
+|---|---|---|---|---|
+| gemma-4-26b-a4b (MoE, 4B active) | UD-Q4_K_XL, 17 GB | 24 | 9.0–12.7 once weights are resident; 1.6–4.6 for the first requests after each (re)start | `gemma-4-26b-a4b.log`, 2026-09-16 |
+| Qwen3.8-9B-Distill (dense) | Q4_K_M, 6 GB | 8 | 8.3–8.5 | `qwen3.8-9b-distill.log`, 2026-09-01 |
+| Kimi-Linear-48B-A3B (MoE, 3B active) | Q4_K_M, 30 GB | 48 | 0.4–0.6 (0.03–0.05 on cold requests) — disk-bound | `kimi-linear-48b.log`, 2026-08-20 |
+| DeepSeek-V4-Flash | UD-IQ1_S, 83 GB | 48 | 0.32–0.34 (0.11 cold) — disk-bound | `deepseek-v4-flash.log`, 2026-08-20 |
 
-The gemma numbers are from this session's `logs/gemma-4-26b-a4b.log`
-(`print_timing` lines, 2026-09-16). The 9B-dense at 0.7 t/s vs 47 t/s on the
-Mac is the memory-bandwidth gap (DDR4 vs 400 GB/s unified); the two big MoEs
-were paging experts from a ~400 MB/s disk, a storage number rather than a model
-number. That a 4B-active MoE reaches double digits even on this slow box is
-why the default tier is small-active MoEs.
+Reading these: the two MoEs whose experts never became resident (Kimi-Linear
+at 30 GB on a box also holding other models, V4-Flash at 83 GB cold) were
+paging from a ~400 MB/s disk — those are storage numbers, not model numbers.
+Gemma hit double digits only after its 17 GB were paged in. The 9B dense and
+the 26B-A4B MoE land in the same ~8–13 t/s band, which is the memory-bandwidth
+argument in one row: same speed class, much stronger model. Earlier versions
+of this file quoted 0.69 t/s for the 9B model and 0.85 t/s for Kimi-K3 from
+Aug-2026 runs whose logs were overwritten before append-only logging existed;
+those figures are not reproducible from the repo and are no longer cited.
 
 ## Step 4: models.yaml
 

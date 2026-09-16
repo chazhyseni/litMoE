@@ -95,7 +95,7 @@
   <text x="520" y="633" text-anchor="middle" class="box-text">· AMX (Intel Sapphire+)</text>
   <text x="520" y="651" text-anchor="middle" class="box-text">· AVX-512 (Skylake+)</text>
   <text x="520" y="669" text-anchor="middle" class="box-text">· AVX2 (universal)</text>
-  <text x="520" y="687" text-anchor="middle" class="box-text-mono">9-11 t/s Gemma-4-26B-A4B on AVX2 CPU</text>
+  <text x="520" y="687" text-anchor="middle" class="box-text-mono">9-13 t/s Gemma-4-26B-A4B on a 24-core AVX2 CPU</text>
 
   <rect x="110" y="710" width="540" height="92" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="380" y="735" text-anchor="middle" class="box-title">pip install kt-kernel</text>
@@ -113,7 +113,7 @@
   <text x="870" y="633" text-anchor="middle" class="box-text">Vulkan · SYCL · CANN (Ascend)</text>
   <text x="870" y="651" text-anchor="middle" class="box-text">CPU+GPU hybrid offload</text>
   <text x="870" y="669" text-anchor="middle" class="box-text">--n-gpu-layers N (or 0 = CPU)</text>
-  <text x="870" y="687" text-anchor="middle" class="box-text-mono">5-60 t/s laptop tier</text>
+  <text x="870" y="687" text-anchor="middle" class="box-text-mono">~10 t/s on AVX2 DDR4, tens of t/s on Apple Silicon</text>
 
   <rect x="1030" y="570" width="280" height="120" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="1170" y="595" text-anchor="middle" class="box-title">Quantization</text>
@@ -121,7 +121,7 @@
   <text x="1170" y="633" text-anchor="middle" class="box-text">via GGUF format</text>
   <text x="1170" y="651" text-anchor="middle" class="box-text">ex: Gemma-4-26B-A4B UD-Q4_K_XL = 17 GB</text>
   <text x="1170" y="669" text-anchor="middle" class="box-text">ex: Kimi-K3 UD-IQ1_S = 594 GB</text>
-  <text x="1170" y="687" text-anchor="middle" class="box-text-mono">Fits 24 GB consumer GPUs</text>
+  <text x="1170" y="687" text-anchor="middle" class="box-text-mono">17 GB default fits a 24 GB GPU or a 48 GB laptop</text>
 
   <rect x="730" y="710" width="580" height="92" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="1020" y="735" text-anchor="middle" class="box-title">build from source or pre-built release</text>

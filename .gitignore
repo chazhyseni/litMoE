@@ -23,3 +23,6 @@ logs/
 .idea/
 *.swp
 *.swo
+
+# Measurement logs cited by docs/SETUP.md are shipped on purpose
+!docs/measurements/*.log
