@@ -309,6 +309,48 @@ def test_anthropic_translation_tool_choice_is_string():
     assert out["tools"][0]["function"]["parameters"] == {"type": "object"}
 
 
+def test_upstream_error_on_stream_is_a_real_http_error(monkeypatch):
+    """Observed: llama-server answered 400 'request (53758 tokens) exceeds the
+    available context size (32768 tokens)'; the gateway relayed those JSON bytes
+    inside a 200 text/event-stream, and Hermes reported 'empty/malformed SSE'
+    and retried nine times. The status and message must reach the client."""
+    from fastapi.testclient import TestClient
+
+    upstream = json.dumps({"error": {"code": 400, "message": "request (53758 tokens) exceeds the "
+                                     "available context size (32768 tokens), try increasing it",
+                                     "type": "exceed_context_size_error"}}).encode()
+
+    class _Resp:
+        status_code = 400
+        async def aread(self): return upstream
+        async def aclose(self): pass
+
+    class _Client:
+        async def aclose(self): pass
+
+    async def fake_connect(url, body, timeout, headers):
+        return _Client(), _Resp()
+    monkeypatch.setattr(S, "_connect_stream", fake_connect)
+
+    class _Eng:
+        model = ModelEntry(id="m", engine="llamacpp", model_path="/tmp/x.gguf", aliases=["claude-sonnet-4-5"])
+        base_url = "http://127.0.0.1:8081"
+        process = None
+    gw = S.Gateway(GatewayConfig(models=[_Eng.model]))
+    gw.engines = {"m": _Eng(), "claude-sonnet-4-5": _Eng()}
+    c = TestClient(gw.app)
+
+    r = c.post("/v1/chat/completions", json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]})
+    assert r.status_code == 400
+    assert r.headers["content-type"].startswith("application/json")
+    assert "exceeds the available context size" in r.json()["error"]["message"]
+
+    r = c.post("/v1/messages", json={"model": "claude-sonnet-4-5", "stream": True, "max_tokens": 10,
+                                     "messages": [{"role": "user", "content": "x"}]})
+    assert r.status_code == 400
+    assert r.json()["type"] == "error" and "exceeds the available context size" in r.json()["error"]["message"]
+
+
 def test_dead_engine_is_a_503_not_a_broken_200_stream():
     """Observed: `litmoe stop` under a live gateway killed the engines; the next
     streaming request got HTTP 200 and then 'Stream error'. A dead engine must

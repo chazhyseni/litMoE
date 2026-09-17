@@ -362,15 +362,32 @@ class Gateway:
         fwd_headers = {"content-type": "application/json"}
 
         if stream:
+            # Connect first. An upstream 4xx/5xx (e.g. "request exceeds the
+            # available context size") must reach the client as that status
+            # with its message — not as JSON bytes inside a 200 event-stream,
+            # which clients report as "empty/malformed SSE" and retry forever.
+            try:
+                client, r = await _connect_stream(target_url, send_body, timeout, fwd_headers)
+            except httpx.RequestError as e:
+                raise HTTPException(502, f"engine for {model.id} unreachable: {e}")
+            if r.status_code >= 400:
+                raw = await r.aread()
+                await r.aclose()
+                await client.aclose()
+                message = _upstream_error_message(raw)
+                logger.warning("%s: engine returned HTTP %d: %s", model.id, r.status_code, message)
+                if anthropic:
+                    return JSONResponse(status_code=r.status_code, content={
+                        "type": "error", "error": {"type": "api_error", "message": message}})
+                try:
+                    content = json.loads(raw)
+                except ValueError:
+                    content = {"error": {"message": message, "type": "upstream_error"}}
+                return JSONResponse(status_code=r.status_code, content=content)
             if anthropic:
-                return StreamingResponse(
-                    _stream_anthropic_response(target_url, send_body, timeout, fwd_headers, model_id),
-                    media_type="text/event-stream",
-                )
-            return StreamingResponse(
-                _stream_response(target_url, send_body, timeout, fwd_headers),
-                media_type="text/event-stream",
-            )
+                return StreamingResponse(_stream_anthropic_response(client, r, model_id),
+                                         media_type="text/event-stream")
+            return StreamingResponse(_stream_response(client, r), media_type="text/event-stream")
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -482,36 +499,57 @@ class Gateway:
                 logger.warning("stopping %s: %s", engine.model.id, e)
 
 
-async def _stream_response(url: str, body: bytes, timeout: httpx.Timeout, headers: dict | None = None):
-    """Stream SSE responses from upstream engine.
+async def _connect_stream(url: str, body: bytes, timeout: httpx.Timeout,
+                          headers: dict) -> tuple[httpx.AsyncClient, httpx.Response]:
+    """Open a streaming POST and return (client, response) with headers received.
 
-    Uses raw byte passthrough (aiter_bytes) to preserve the exact SSE format
-    from llama-server. This is critical — any line-based processing breaks
-    the chunked transfer encoding and causes "incomplete chunked read" errors
-    in clients like Hermes.
-
-    The async client is kept alive for the full duration of the stream by
-    managing it manually (not using async with, which would close it early).
+    The caller inspects the status before deciding whether to stream, and owns
+    closing both. Raises httpx.RequestError if the engine is unreachable.
     """
-    fwd_headers = headers or {"content-type": "application/json"}
     client = httpx.AsyncClient(timeout=timeout)
     try:
-        # Use stream() which keeps the connection open for the full response
-        async with client.stream("POST", url, content=body, headers=fwd_headers) as r:
-            # If the upstream returned an error, pass it through as JSON
-            if r.status_code >= 400:
-                error_body = await r.aread()
-                yield error_body
-                return
-            # Raw byte passthrough — do NOT process lines, just forward bytes
-            async for chunk in r.aiter_bytes():
-                yield chunk
+        req = client.build_request("POST", url, content=body, headers=headers)
+        r = await client.send(req, stream=True)
+    except httpx.RequestError:
+        await client.aclose()
+        raise
+    return client, r
+
+
+def _upstream_error_message(raw: bytes) -> str:
+    """Human-readable message from an engine error body (llama-server / sglang JSON, or raw text)."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw.decode(errors="replace")[:500] or "upstream error"
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str):
+            return err
+        if data.get("message"):
+            return str(data["message"])
+    return json.dumps(data)[:500]
+
+
+async def _stream_response(client: httpx.AsyncClient, r: httpx.Response):
+    """Relay an already-open upstream SSE response byte for byte.
+
+    Raw passthrough (aiter_bytes) preserves llama-server's exact SSE framing;
+    line-based processing breaks chunked transfer and clients report
+    "incomplete chunked read". The status was checked by the caller.
+    """
+    try:
+        async for chunk in r.aiter_bytes():
+            yield chunk
     except httpx.RequestError as e:
         logger.error("Stream error: %s", e)
         error_data = {"error": {"message": str(e), "type": "connection_error"}}
         yield f"data: {json.dumps(error_data)}\n\n".encode()
         yield b"data: [DONE]\n\n"
     finally:
+        await r.aclose()
         await client.aclose()
 
 
@@ -678,15 +716,14 @@ def _openai_to_anthropic(resp: dict, model: str) -> dict:
     }
 
 
-async def _stream_anthropic_response(url: str, body: bytes, timeout: httpx.Timeout,
-                                     headers: dict, model: str):
+async def _stream_anthropic_response(client: httpx.AsyncClient, r: httpx.Response, model: str):
     """Stream upstream OpenAI SSE chunks as Anthropic Messages SSE events.
 
     Translates each OpenAI chunk (delta.content / delta.tool_calls) into the
     message_start → content_block_* → message_delta → message_stop lifecycle
-    that Anthropic API clients (e.g. Claude Code) expect.
+    that Anthropic API clients (e.g. Claude Code) expect. `r` is an already
+    open upstream response whose status the caller has checked.
     """
-    client = httpx.AsyncClient(timeout=timeout)
 
     def ev(event: str, data: dict) -> bytes:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
@@ -708,12 +745,7 @@ async def _stream_anthropic_response(url: str, body: bytes, timeout: httpx.Timeo
         output_tokens = 0
         stop_reason = "end_turn"
         buf = b""
-        async with client.stream("POST", url, content=body, headers=headers) as r:
-            if r.status_code >= 400:
-                err = (await r.aread()).decode(errors="replace")[:500]
-                yield ev("error", {"type": "error",
-                                   "error": {"type": "api_error", "message": err}})
-                return
+        async with r:
             async for chunk in r.aiter_bytes():
                 buf += chunk
                 while b"\n" in buf:
