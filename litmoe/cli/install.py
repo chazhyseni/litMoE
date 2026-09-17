@@ -732,7 +732,8 @@ def choose_n_ctx(model_name: str, weights_gb: float | None, requested: int | Non
     total = get_total_memory_bytes()
     if total is None or weights_gb is None:
         return target
-    ctx, note = fit_context(info.get("kv_bytes_per_token", 65_536), weights_gb, total / 1e9, target)
+    ctx, note = fit_context(info.get("kv_bytes_per_token", 65_536), weights_gb, total / 1e9, target,
+                            macos=is_macos())
     if note:
         click.echo(f"  NOTE: {note}")
     return ctx

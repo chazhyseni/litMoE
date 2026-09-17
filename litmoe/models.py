@@ -367,27 +367,46 @@ def ram_needed_gb(model_id: str, quant: str | None = None, n_ctx: int = _FIT_CTX
     return size * _MODEL_OVERHEAD + kv_gb + _OS_HEADROOM_GB
 
 
-def fit_context(kv_bytes_per_token: int, weights_gb: float, total_ram_gb: float,
-                target_ctx: int, min_ctx: int = 8192) -> tuple[int, str | None]:
-    """Largest context <= target_ctx whose KV cache fits next to the weights in RAM.
+def memory_budgets_gb(total_ram_gb: float, macos: bool) -> tuple[float, float]:
+    """(gpu_budget, ram_limit) in GB for a machine.
 
-    Budget is 90% of RAM minus 3 GB. Returns (ctx, note); note is None when the
-    target fits unchanged, otherwise a human-readable reason. Contexts are
-    rounded down to a multiple of 4096 and never below min_ctx.
+    ram_limit: what weights + KV can occupy at all (90% of RAM minus 3 GB).
+    gpu_budget: what a fully offloaded model (weights + KV cache) may use on the
+    GPU. On macOS that is Metal's default share of unified memory, 75% of RAM;
+    elsewhere the GPU has its own memory and this equals ram_limit.
     """
-    avail_gb = total_ram_gb * 0.9 - 3
+    ram_limit = total_ram_gb * 0.9 - 3
+    gpu_budget = total_ram_gb * 0.75 if macos else ram_limit
+    return gpu_budget, ram_limit
+
+
+def fit_context(kv_bytes_per_token: int, weights_gb: float, total_ram_gb: float,
+                target_ctx: int, min_ctx: int = 8192, macos: bool = False) -> tuple[int, str | None]:
+    """Largest context <= target_ctx whose KV cache fits next to the weights.
+
+    Weights count with their runtime overhead (_MODEL_OVERHEAD). The budget is
+    the GPU budget from memory_budgets_gb(): with -ngl -1 the KV cache lives on
+    the GPU alongside the weights, so on macOS that is Metal's 75% share, not
+    all of RAM — sizing against RAM is how a 262K context ends in
+    kIOGPUCommandBufferCallbackErrorOutOfMemory. Returns (ctx, note); note is
+    None when the target fits unchanged. Contexts are rounded down to a
+    multiple of 4096 and never below min_ctx.
+    """
+    budget_gb, _ = memory_budgets_gb(total_ram_gb, macos)
+    where = "Metal's default GPU budget" if macos else "RAM"
+    weights_eff = weights_gb * _MODEL_OVERHEAD
     kv_gb = kv_bytes_per_token * target_ctx / 1e9
-    if weights_gb + kv_gb <= avail_gb:
+    if weights_eff + kv_gb <= budget_gb:
         return target_ctx, None
-    max_kv_gb = avail_gb - weights_gb - 1
+    max_kv_gb = budget_gb - weights_eff - 1
     if max_kv_gb <= 0:
         ctx = max(min(target_ctx, 32768), min_ctx)
-        return ctx, (f"weights ({weights_gb:.0f} GB) may not fit in {total_ram_gb:.0f} GB RAM; "
-                     f"context capped at {ctx}")
+        return ctx, (f"weights ({weights_gb:.0f} GB, ~{weights_eff:.0f} GB loaded) exceed {where} "
+                     f"(~{budget_gb:.0f} GB); context capped at {ctx}")
     ctx = int(max_kv_gb * 1e9 / kv_bytes_per_token)
     ctx = max((ctx // 4096) * 4096, min_ctx)
     return ctx, (f"reduced context from {target_ctx} to {ctx} to fit {weights_gb:.0f} GB weights + "
-                 f"KV cache in {total_ram_gb:.0f} GB RAM")
+                 f"KV cache in {where} (~{budget_gb:.0f} GB)")
 
 
 def tier_for(model_id: str, quant: str | None = None) -> int | None:

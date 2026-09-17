@@ -24,7 +24,7 @@ from litmoe.config import GatewayConfig, ModelEntry, expand_path, is_hf_repo_spe
 from litmoe.engines import make_engine, Engine
 from litmoe.engines.base import DEFAULT_ENGINE_PORT
 from litmoe.models import (_MODEL_OVERHEAD, _OS_HEADROOM_GB, fit_context, lookup as catalog_lookup,
-                           quant_size_gb)
+                           memory_budgets_gb, quant_size_gb)
 from litmoe.platform_utils import get_total_memory_bytes, is_macos
 
 logger = logging.getLogger(__name__)
@@ -87,11 +87,12 @@ def _catalog_items():
     return KNOWN_MODELS.items()
 
 
-def compute_memory_aware_ctx(model: ModelEntry, n_ctx: int) -> int:
-    """Context size for a model given total RAM.
+def compute_memory_aware_ctx(model: ModelEntry, n_ctx: int, quiet: bool = False) -> int:
+    """Context size for a model on this machine.
 
     Target = n_ctx if it is already sane (>= MIN_SANE_CTX), else the model's
-    native context. If weights + KV cache at the target exceed ~90% of RAM,
+    native context. If weights (with overhead) + KV cache at the target exceed
+    the GPU budget (Metal's 75% share on macOS; 90% of RAM - 3 GB elsewhere),
     shrink the context (multiple of 4096, minimum 8192).
     """
     info = catalog_lookup(model.id) or {}
@@ -107,8 +108,8 @@ def compute_memory_aware_ctx(model: ModelEntry, n_ctx: int) -> int:
     if model_size_gb is None:
         model_size_gb = quant_size_gb(model.id, None) or 0.0
 
-    ctx, note = fit_context(kv_rate, model_size_gb, total_mem / 1e9, target_ctx)
-    if note:
+    ctx, note = fit_context(kv_rate, model_size_gb, total_mem / 1e9, target_ctx, macos=is_macos())
+    if note and not quiet:
         logger.warning("Model %s: %s", model.id, note)
     return ctx
 
@@ -128,7 +129,8 @@ def estimate_ram_gb(model: ModelEntry) -> float | None:
         return None
     info = catalog_lookup(model.id) or {}
     kv_rate = info.get("kv_bytes_per_token", _FALLBACK_KV_BYTES_PER_TOKEN)
-    n_ctx = model.n_ctx if model.n_ctx and model.n_ctx >= MIN_SANE_CTX else compute_memory_aware_ctx(model, 0)
+    # The context serve will actually start with (_fix_context applies the same fit).
+    n_ctx = compute_memory_aware_ctx(model, model.n_ctx or 0, quiet=True)
     return size_gb * _MODEL_OVERHEAD + kv_rate * n_ctx / 1e9
 
 
@@ -166,9 +168,7 @@ def check_fits_together(models: list[ModelEntry]) -> FitVerdict | None:
     total_mem = get_total_memory_bytes()
     if total_mem is None:
         return None
-    ram_gb = total_mem / 1e9
-    ram_limit = ram_gb * 0.9 - 3
-    gpu_budget = ram_gb * 0.75 if is_macos() else ram_limit
+    gpu_budget, ram_limit = memory_budgets_gb(total_mem / 1e9, is_macos())
     per_model = [(m.id, need) for m in models if (need := estimate_ram_gb(m)) is not None]
     if not per_model:
         return None
@@ -412,19 +412,25 @@ class Gateway:
                 self.engines[alias] = engine
 
     def _fix_context(self, model: ModelEntry) -> None:
-        """Raise stale/zero n_ctx to a memory-aware value and persist it to models.yaml.
+        """Bring n_ctx to a memory-aware value and persist it to models.yaml.
 
-        Only for llama.cpp entries: sglang-kt sizes its own KV pool.
+        Zero/stale (< MIN_SANE_CTX) values are raised to the fitted native
+        context. Values the current machine cannot hold — e.g. a native 262K
+        written for a model whose weights already exceed the GPU budget — are
+        lowered, since starting them ends in an out-of-memory engine that still
+        reports healthy. Only for llama.cpp entries: sglang-kt sizes its own KV.
         """
         if model.engine != "llamacpp":
             return
-        if model.n_ctx and model.n_ctx >= MIN_SANE_CTX:
+        old = model.n_ctx or 0
+        new_ctx = compute_memory_aware_ctx(model, old)
+        if new_ctx == old:
             return
-        new_ctx = compute_memory_aware_ctx(model, model.n_ctx or 0)
-        if new_ctx == model.n_ctx:
-            return
-        logger.warning("Model %s: n_ctx=%d is below %d, using %d (memory-aware native context)",
-                       model.id, model.n_ctx, MIN_SANE_CTX, new_ctx)
+        if old < MIN_SANE_CTX:
+            logger.warning("Model %s: n_ctx=%d is below %d, using %d (memory-aware native context)",
+                           model.id, old, MIN_SANE_CTX, new_ctx)
+        else:
+            logger.warning("Model %s: n_ctx=%d does not fit this machine, using %d", model.id, old, new_ctx)
         model.n_ctx = new_ctx
         self._persist_ctx(model)
 

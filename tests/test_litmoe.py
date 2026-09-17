@@ -50,16 +50,31 @@ def test_largest_quant_that_fits():
 def test_legacy_alias_lookup():
     assert M.lookup("qwen3.8-2.4t") is M.KNOWN_MODELS["qwen3.8"]
 
-
 def test_fit_context_shrinks_and_caps():
-    # fits unchanged
+    # fits unchanged (20 GB weights -> 22 GB loaded, 17 GB KV, 83 GB budget)
     assert M.fit_context(65_536, 20.0, 96.0, 262144) == (262144, None)
-    # must shrink: 60 GB weights, 96 GB RAM -> budget 83.4, kv room 22.4 GB -> ~341K tokens @65KB... use big kv
+    # must shrink: 60 GB weights, huge KV rate
     ctx, note = M.fit_context(1_000_000, 60.0, 96.0, 262144)
     assert ctx < 262144 and ctx % 4096 == 0 and ctx >= 8192 and "reduced" in note
     # weights do not fit at all: capped, never below 8192
     ctx, note = M.fit_context(65_536, 600.0, 96.0, 1048576)
-    assert ctx == 32768 and "may not fit" in note
+    assert ctx == 32768 and "exceed" in note
+
+
+def test_fit_context_uses_gpu_budget_on_macos():
+    """Regression: a 73 GB model on a 103 GB Mac was written with its native 262K
+    context because the fit checked RAM (90 GB), not Metal's 77 GB; -ngl -1 puts
+    the KV cache on the GPU, so the engine OOMed on the first forward pass."""
+    kv, weights, ram, native = 46_000, 73.0, 103.1, 262144
+    linux_ctx, _ = M.fit_context(kv, weights, ram, native, macos=False)
+    mac_ctx, note = M.fit_context(kv, weights, ram, native, macos=True)
+    assert mac_ctx < linux_ctx
+    assert mac_ctx == 32768 and "Metal" in note            # 80 GB loaded > 77 GB budget: capped
+    # A model that fits the GPU budget with room keeps its native context on macOS too.
+    assert M.fit_context(40_960, 17.0, 103.1, 262144, macos=True) == (262144, None)
+    gpu, ram_limit = M.memory_budgets_gb(103.1, macos=True)
+    assert round(gpu) == 77 and round(ram_limit) == 90
+    assert M.memory_budgets_gb(103.1, macos=False) == (ram_limit, ram_limit)
 
 
 # ---------------------------------------------------------------------------
