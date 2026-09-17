@@ -47,8 +47,12 @@ class LlamaCppEngine(Engine):
         raw_prefix = os.environ.get("LITMOE_PREFIX", str(Path.home() / ".local"))
         prefix = Path(os.path.expanduser(os.path.expandvars(raw_prefix)))
 
-        # Source builds live in local/, prebuilt releases in prebuilt/llama-bNNNNN/.
-        for lib_subdir in ["lib/llama.cpp/local", "lib/llama.cpp/prebuilt"]:
+        # Prebuilt releases live in prebuilt/llama-bNNNNN/, source builds in local/.
+        # prebuilt/ first: `litmoe install` refreshes it and prunes older releases,
+        # so it reflects the newest install; local/ is the glibc-too-old fallback
+        # and would otherwise shadow every later install with a stale build
+        # (seen as "unknown model architecture" for models newer than that build).
+        for lib_subdir in ["lib/llama.cpp/prebuilt", "lib/llama.cpp/local"]:
             lib_dir = prefix / lib_subdir
             direct = lib_dir / "llama-server"
             if direct.is_file():

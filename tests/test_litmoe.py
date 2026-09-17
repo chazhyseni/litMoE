@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,32 @@ def test_llamacpp_user_threads_not_overridden(monkeypatch):
     monkeypatch.setattr(eng, "_resolve_binary", lambda: ("/bin/llama-server", None))
     cmd = eng.build_command()
     assert cmd.count("-t") == 1 and cmd[cmd.index("-t") + 1] == "4"
+
+def test_llamacpp_prefers_installed_prebuilt_over_stale_source_build(tmp_path, monkeypatch):
+    """A leftover local/ source build must not shadow the release `litmoe install` fetched.
+
+    Regression: an Aug-2026 source build in local/ was chosen over a Sep-2026
+    prebuilt, so a model whose architecture only the newer build knows failed
+    with 'unknown model architecture' even though install had just succeeded.
+    """
+    from litmoe.engines.llamacpp import LlamaCppEngine
+    monkeypatch.setenv("LITMOE_PREFIX", str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda *_: None)
+    local = tmp_path / "lib" / "llama.cpp" / "local"
+    prebuilt = tmp_path / "lib" / "llama.cpp" / "prebuilt" / "llama-b10964"
+    for d in (local, prebuilt):
+        d.mkdir(parents=True)
+        (d / "llama-server").write_text("#!/bin/sh\n")
+    eng = LlamaCppEngine(ModelEntry(id="x", engine="llamacpp", model_path="/tmp/x.gguf"))
+    binary, lib_dir = eng._resolve_binary()
+    assert Path(binary) == prebuilt / "llama-server"
+    assert lib_dir == prebuilt
+
+    # With no prebuilt, the source build is still found.
+    shutil.rmtree(prebuilt.parent)
+    binary, lib_dir = eng._resolve_binary()
+    assert Path(binary) == local / "llama-server"
+
 
 
 def test_ktransformers_command_sglang():
