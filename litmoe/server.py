@@ -23,8 +23,9 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from litmoe.config import GatewayConfig, ModelEntry, expand_path, is_hf_repo_spec
 from litmoe.engines import make_engine, Engine
 from litmoe.engines.base import DEFAULT_ENGINE_PORT
-from litmoe.models import lookup as catalog_lookup, quant_size_gb, fit_context
-from litmoe.platform_utils import get_total_memory_bytes
+from litmoe.models import (_MODEL_OVERHEAD, _OS_HEADROOM_GB, fit_context, lookup as catalog_lookup,
+                           quant_size_gb)
+from litmoe.platform_utils import get_total_memory_bytes, is_macos
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,45 @@ def compute_memory_aware_ctx(model: ModelEntry, n_ctx: int) -> int:
     if note:
         logger.warning("Model %s: %s", model.id, note)
     return ctx
+
+
+def estimate_ram_gb(model: ModelEntry) -> float | None:
+    """RAM one configured llama.cpp entry needs: actual weights + KV at its n_ctx.
+
+    Uses the file on disk (or the catalog size for an HF spec) and the model's
+    KV rate, at the context it will actually be started with. None if unknown.
+    """
+    if model.engine != "llamacpp":
+        return None
+    size_gb = weights_size_gb(model)
+    if size_gb is None:
+        size_gb = quant_size_gb(model.id, None)
+    if size_gb is None:
+        return None
+    info = catalog_lookup(model.id) or {}
+    kv_rate = info.get("kv_bytes_per_token", _FALLBACK_KV_BYTES_PER_TOKEN)
+    n_ctx = model.n_ctx if model.n_ctx and model.n_ctx >= MIN_SANE_CTX else compute_memory_aware_ctx(model, 0)
+    return size_gb * _MODEL_OVERHEAD + kv_rate * n_ctx / 1e9
+
+
+def check_fits_together(models: list[ModelEntry]) -> tuple[float, float, list[tuple[str, float]]] | None:
+    """(total needed GB, budget GB, per-model needs) when the set will not fit at once; None if fine/unknown.
+
+    The gateway starts every entry eagerly, so the sum must fit the RAM budget
+    (75% of RAM on macOS, where Metal shares unified memory). Models whose
+    size cannot be determined are skipped rather than guessed.
+    """
+    total_mem = get_total_memory_bytes()
+    if total_mem is None:
+        return None
+    budget = total_mem / 1e9 * (0.75 if is_macos() else 1.0)
+    per_model = [(m.id, need) for m in models if (need := estimate_ram_gb(m)) is not None]
+    if not per_model:
+        return None
+    total = sum(n for _, n in per_model) + _OS_HEADROOM_GB
+    if total <= budget:
+        return None
+    return total, budget, per_model
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:

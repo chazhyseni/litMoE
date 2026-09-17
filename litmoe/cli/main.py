@@ -15,8 +15,8 @@ from litmoe import __version__
 from litmoe.cli.install import install_cmd, print_model_table
 from litmoe.config import default_config_path, expand_path, load_config
 from litmoe.engines import kt_installed, llama_installed
-from litmoe.models import (CLAUDE_ALIASES, DEFAULT_MODEL, KNOWN_MODELS, quant_size_gb,
-                           recommended_for_ram, smallest_gguf_model)
+from litmoe.models import (_OS_HEADROOM_GB, CLAUDE_ALIASES, DEFAULT_MODEL, KNOWN_MODELS, fit_together,
+                           quant_size_gb, recommended_for_ram, smallest_gguf_model)
 from litmoe.platform_utils import (
     cpu_flags,
     get_numa_nodes,
@@ -151,11 +151,15 @@ def init(force):
     total = get_total_memory_bytes()
     ram_gb = total / 1e9 if total else None
     budget = ram_gb * (0.75 if is_macos() else 1.0) if ram_gb else None
+    also_fit: list[str] = []
     if budget:
         # recommended_for_ram already leads with DEFAULT_MODEL when it fits.
-        picks = recommended_for_ram(budget, max_models=3)
+        # The gateway loads every entry at once, so keep only what fits *together*.
+        candidates = recommended_for_ram(budget, max_models=3)
+        picks, also_fit = fit_together(candidates, budget)
         if not picks:
-            picks = [smallest_gguf_model()]
+            picks = [candidates[0] if candidates else smallest_gguf_model()]
+            also_fit = []
             click.echo(f"Warning: {ram_gb:.0f} GB RAM is below every catalog tier; "
                        f"picking the smallest model ({picks[0]}) — expect a reduced context.", err=True)
     else:
@@ -189,7 +193,10 @@ def init(force):
 
     click.echo(f"Created {cfg_path} with: {', '.join(picks)}")
     if ram_gb:
-        click.echo(f"  (chosen for {ram_gb:.0f} GB RAM — fastest models that fit; edit freely)")
+        click.echo(f"  (chosen for {ram_gb:.0f} GB RAM — fastest models that fit together; edit freely)")
+    if also_fit:
+        click.echo(f"  Also fit on their own, not alongside the above: {', '.join(also_fit)}")
+        click.echo(f"  Serve one instead with:  litmoe serve --model {also_fit[0]}")
     click.echo("Next: litmoe serve   (first start downloads the weights)")
     click.echo("Or pre-download:  litmoe install --model " + picks[0])
 
@@ -197,8 +204,16 @@ def init(force):
 @cli.command()
 @click.option("--config", "-c", type=click.Path(), default=None, help="Path to models.yaml")
 @click.option("--log-dir", default="logs", help="Directory for engine logs")
-def serve(config, log_dir):
-    """Start the gateway with all configured engines."""
+@click.option("--model", "-m", "only", multiple=True,
+              help="Serve only these model ids from models.yaml (repeatable). Default: all.")
+@click.option("--force", is_flag=True, help="Start even if the selected models will not fit in RAM together")
+def serve(config, log_dir, only, force):
+    """Start the gateway with the configured engines.
+
+    Every selected model is loaded at once, so together they must fit this
+    machine's RAM budget. If they do not, serve refuses and shows the numbers;
+    pick a subset with --model, or pass --force to start anyway.
+    """
     cfg_path = str(expand_path(config)) if config else str(default_config_path())
     if not Path(cfg_path).exists():
         click.echo(f"Error: config not found: {cfg_path}", err=True)
@@ -206,12 +221,41 @@ def serve(config, log_dir):
         sys.exit(1)
 
     cfg = load_config(cfg_path)
+    if only:
+        known = {m.id for m in cfg.models}
+        missing = [o for o in only if o not in known]
+        if missing:
+            click.echo(f"Error: not in {cfg_path}: {', '.join(missing)} "
+                       f"(configured: {', '.join(sorted(known))})", err=True)
+            sys.exit(1)
+        cfg.models = [m for m in cfg.models if m.id in set(only)]
+
+    from litmoe.server import check_fits_together, run as server_run
+    over = check_fits_together(cfg.models)
+    if over:
+        total, budget, per_model = over
+        click.echo(f"These {len(per_model)} models need ~{total:.0f} GB RAM loaded together; "
+                   f"this machine's budget is ~{budget:.0f} GB"
+                   + (" (75% of RAM: Metal shares unified memory)." if is_macos() else "."), err=True)
+        for mid, need in per_model:
+            click.echo(f"  {mid:32s} ~{need:.0f} GB", err=True)
+        click.echo("The gateway starts every model at once, so this would run out of memory "
+                   "(on Metal: kIOGPUCommandBufferCallbackErrorOutOfMemory, with the engines still 'running').", err=True)
+        if force:
+            click.echo("Continuing anyway (--force).", err=True)
+        else:
+            biggest_fit = max((p for p in per_model if p[1] + _OS_HEADROOM_GB <= budget),
+                              key=lambda p: p[1], default=None)
+            hint = biggest_fit[0] if biggest_fit else per_model[0][0]
+            click.echo(f"Pick a subset:   litmoe serve --model {hint}", err=True)
+            click.echo("Or edit models.yaml, or pass --force to start regardless.", err=True)
+            sys.exit(1)
+
     click.echo(f"litmoe v{__version__} starting gateway on {cfg.host}:{cfg.port}")
     click.echo(f"Models: {[m.id for m in cfg.models]}")
     click.echo(f"Log dir: {log_dir}")
     click.echo()
 
-    from litmoe.server import run as server_run
     server_run(cfg, log_dir=log_dir, config_path=cfg_path)
 
 

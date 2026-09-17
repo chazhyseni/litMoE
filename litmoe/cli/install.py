@@ -896,5 +896,18 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
                    "(kt_num_gpu_experts=0 keeps all experts on CPU).")
     if info.get("notes"):
         click.echo(f"  NOTE: {info['notes']}")
+
+    from litmoe.config import load_config
+    from litmoe.server import check_fits_together
+    try:
+        over = check_fits_together(load_config(config_path).models)
+    except Exception:  # unreadable/partial config: the serve-time check will catch it
+        over = None
     click.echo()
-    click.echo("Done. Next:  litmoe serve")
+    if over:
+        total, budget, per_model = over
+        click.echo(f"  NOTE: models.yaml now lists {len(per_model)} models needing ~{total:.0f} GB together; "
+                   f"this machine's budget is ~{budget:.0f} GB. `litmoe serve` loads all of them at once,")
+        click.echo(f"        so serve one at a time:  litmoe serve --model {model_name}")
+        click.echo()
+    click.echo("Done. Next:  litmoe serve" + (f" --model {model_name}" if over else ""))

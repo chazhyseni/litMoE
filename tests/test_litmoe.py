@@ -463,3 +463,65 @@ def test_init_picks_fast_defaults_per_ram(tmp_path, monkeypatch):
         assert list(cfg.models[0].aliases) == list(M.CLAUDE_ALIASES)
         for m in cfg.models:                                    # laptop tiers must be fast: small active params
             assert (M.KNOWN_MODELS[m.id].get("active_b") or 0) <= (12 if gb <= 96 else 1e9), (gb, m.id)
+
+
+def test_fit_together_is_a_joint_budget_not_per_model():
+    """Each of these fits a 103 GB Mac (77 GB budget) alone; loaded at once they OOM Metal."""
+    picks = ["gemma-4-26b-a4b", "gpt-oss-120b", "qwen3.5-122b-a10b"]
+    assert all(M.ram_needed_gb(m) <= 77 for m in picks)
+    kept, dropped = M.fit_together(picks, 77.0)
+    assert kept == ["gemma-4-26b-a4b"]
+    assert dropped == ["gpt-oss-120b", "qwen3.5-122b-a10b"]
+    # Order is preserved and a big budget keeps everything.
+    assert M.fit_together(picks, 768.0) == (picks, [])
+    # Headroom is counted once, not per model.
+    assert M.ram_needed_together_gb([10.0, 10.0]) == 20.0 - M._OS_HEADROOM_GB
+
+
+def test_init_writes_only_models_that_fit_together(tmp_path, monkeypatch):
+    """Regression: init wrote 140 GB of models for a 103 GB Mac; serve then OOMed on Metal."""
+    from click.testing import CliRunner
+    import litmoe.cli.main as CM
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(CM, "get_total_memory_bytes", lambda: int(103e9))
+    monkeypatch.setattr(CM, "is_macos", lambda: True)
+    r = CliRunner().invoke(CM.cli, ["init"])
+    assert r.exit_code == 0, r.output
+    ids = [m.id for m in load_config(tmp_path / "models.yaml").models]
+    kept, _ = M.fit_together(ids, 103 * 0.75)
+    assert kept == ids, (ids, r.output)          # everything written loads together
+    assert ids == ["gemma-4-26b-a4b"]
+    assert "serve --model" in r.output            # and the user is told how to run the others
+
+
+def test_serve_refuses_configs_that_do_not_fit_together(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    import litmoe.cli.main as CM
+
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        "port: 8080\nmodels:\n"
+        "  - {id: gemma-4-26b-a4b, engine: llamacpp, model_path: 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n"
+        "  - {id: gpt-oss-120b, engine: llamacpp, model_path: 'unsloth/gpt-oss-120b-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n"
+        "  - {id: qwen3.5-122b-a10b, engine: llamacpp, model_path: 'unsloth/Qwen3.5-122B-A10B-GGUF:UD-IQ4_XS', n_ctx: 32768}\n")
+    monkeypatch.setattr(S, "get_total_memory_bytes", lambda: int(103e9))
+    monkeypatch.setattr(S, "is_macos", lambda: True)
+    monkeypatch.setattr(CM, "is_macos", lambda: True)
+    started = []
+    monkeypatch.setattr(S, "run", lambda cfg, **kw: started.append([m.id for m in cfg.models]))
+
+    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg)])
+    assert r.exit_code == 1, r.output
+    assert "need ~" in r.output and "--model" in r.output and not started
+
+    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), "--model", "gpt-oss-120b"])
+    assert r.exit_code == 0, r.output
+    assert started == [["gpt-oss-120b"]]
+
+    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), "--model", "nope"])
+    assert r.exit_code == 1 and "not in" in r.output
+
+    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), "--force"])
+    assert r.exit_code == 0, r.output
+    assert started[-1] == ["gemma-4-26b-a4b", "gpt-oss-120b", "qwen3.5-122b-a10b"]

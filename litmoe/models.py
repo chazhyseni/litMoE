@@ -435,6 +435,36 @@ def recommended_for_ram(ram_gb: float, max_models: int = 4) -> list[str]:
     return ordered[:max_models]
 
 
+def ram_needed_together_gb(needs_gb: list[float]) -> float:
+    """RAM for several models loaded at once: their needs summed, OS headroom counted once."""
+    if not needs_gb:
+        return 0.0
+    return sum(needs_gb) - _OS_HEADROOM_GB * (len(needs_gb) - 1)
+
+
+def fit_together(model_ids: list[str], ram_gb: float) -> tuple[list[str], list[str]]:
+    """Split model_ids into (loadable together within ram_gb, the rest), preserving order.
+
+    The gateway starts every configured model at once, so a config is only
+    usable if the *sum* fits. Greedy in the given order: keeps adding models
+    while the running total (default quant, 32K context) stays within budget.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    needs: list[float] = []
+    for mid in model_ids:
+        need = ram_needed_gb(mid)
+        if need is None:
+            dropped.append(mid)
+            continue
+        if ram_needed_together_gb(needs + [need]) <= ram_gb:
+            kept.append(mid)
+            needs.append(need)
+        else:
+            dropped.append(mid)
+    return kept, dropped
+
+
 def validate_catalog() -> list[str]:
     """Return a list of internal-consistency problems (empty = OK). Used by tests."""
     problems: list[str] = []

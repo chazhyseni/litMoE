@@ -58,10 +58,16 @@ machine. `litmoe install --model <id>` downloads the default quant when it
 fits your RAM budget, otherwise the largest quant that does (`--quant <Q>`
 overrides), and adds it to `models.yaml` with a memory-aware context size.
 
-RAM column = weights × 1.08 (mmap + compute buffers) + KV cache at 32K tokens
-+ 4 GB headroom. macOS gets 75 % of physical RAM as its budget (unified memory
+RAM column = weights × 1.10 (mmap + compute buffers) + KV cache at 32K tokens
++ 6 GB headroom. macOS gets 75 % of physical RAM as its budget (unified memory
 shared with the OS/GPU). All laptop-tier models are MoEs with 3–5 B active
 parameters or ≤ 31 B dense — the ones that are actually fast on CPU/Metal.
+
+`litmoe serve` loads **every** entry in `models.yaml` at once, so the entries
+must fit *together*. `litmoe init` only writes a set that does; `litmoe install
+--model` warns when adding one breaks that; and `litmoe serve` refuses to start
+an over-budget set (it prints each model's need and the budget). Serve a subset
+with `litmoe serve --model <id> [--model <id2>]`, or `--force` to start anyway.
 
 ### 48 GB laptop — default tier
 
@@ -197,7 +203,8 @@ Field reference (see `litmoe/config.py`):
 ## Step 5: Run
 
 ```bash
-litmoe serve                            # gateway + engines; Ctrl-C stops everything
+litmoe serve                            # gateway + all engines; refuses if they will not fit RAM together
+litmoe serve --model gemma-4-26b-a4b    # only this entry (repeatable); --force overrides the fit check
 litmoe status                           # gateway health + per-engine state
 litmoe stop                             # stop engines litmoe started (PID files)
 curl http://127.0.0.1:8080/v1/models
