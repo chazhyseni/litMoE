@@ -309,6 +309,14 @@ class Gateway:
             raise HTTPException(404, f"model not loaded: {model_id} ({hint})")
         if not engine.base_url:
             raise HTTPException(503, f"engine for {model_id} not ready")
+        proc = engine.process
+        if proc is not None and (code := proc.poll()) is not None:
+            # Fail before committing to a 200 + broken stream. -15/-9 = killed
+            # (typically `litmoe stop` under a running gateway); anything else = crashed.
+            how = "was stopped" if code < 0 else f"exited with code {code}"
+            log = f" (see {engine._log_path})" if getattr(engine, "_log_path", None) else ""
+            raise HTTPException(503, f"engine for {engine.model.id} {how}{log}; "
+                                     f"restart the gateway: litmoe serve {engine.model.id}")
         return engine.model, engine
 
     async def _proxy(self, request: Request, endpoint: str, anthropic: bool = False):

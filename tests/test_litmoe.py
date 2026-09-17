@@ -275,6 +275,35 @@ def test_anthropic_translation_tool_choice_is_string():
     assert out["tools"][0]["function"]["parameters"] == {"type": "object"}
 
 
+def test_dead_engine_is_a_503_not_a_broken_200_stream():
+    """Observed: `litmoe stop` under a live gateway killed the engines; the next
+    streaming request got HTTP 200 and then 'Stream error'. A dead engine must
+    fail before the response is committed, with the reason and the log path."""
+    from fastapi import HTTPException
+
+    class _Proc:
+        def __init__(self, code): self._code = code
+        def poll(self): return self._code
+
+    class _Eng:
+        def __init__(self, mid, code):
+            self.model = ModelEntry(id=mid, engine="llamacpp", model_path="/tmp/x.gguf")
+            self.base_url = "http://127.0.0.1:8081"
+            self.process = _Proc(code)
+            self._log_path = Path("logs") / f"{mid}.log"
+
+    gw = S.Gateway(GatewayConfig(models=[]))
+    gw.engines = {"alive": _Eng("alive", None), "killed": _Eng("killed", -15), "crashed": _Eng("crashed", 1)}
+
+    assert gw._resolve("alive")[0].id == "alive"
+    with pytest.raises(HTTPException) as e:
+        gw._resolve("killed")
+    assert e.value.status_code == 503 and "was stopped" in e.value.detail and "logs/killed.log" in e.value.detail
+    with pytest.raises(HTTPException) as e:
+        gw._resolve("crashed")
+    assert e.value.status_code == 503 and "exited with code 1" in e.value.detail
+
+
 def test_openai_to_anthropic_response():
     resp = {"id": "chatcmpl-1", "choices": [{"finish_reason": "tool_calls", "message": {
         "content": "hello", "reasoning_content": "think",
