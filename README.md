@@ -139,8 +139,8 @@ litmoe doctor          # CPU/GPU/RAM, engines, recommended models
 litmoe models          # catalog by RAM tier with fits / does-not-fit for this machine
 litmoe init            # write models.yaml with fast defaults for this RAM
 litmoe install         # install engines and/or download a model (--model, --quant, --engine)
-litmoe serve           # start gateway + all configured engines (Ctrl-C stops both); refuses a set that will not fit RAM together
-litmoe serve --model X # serve only this entry (repeatable); --force skips the fit check
+litmoe serve           # start gateway + all configured engines (Ctrl-C stops both); refuses a set that will not fit in RAM
+litmoe serve X [Y…]    # serve only these entries; --force skips the fit check
 litmoe status          # gateway health and per-engine status
 litmoe stop            # stop the engines litmoe started (PID files); --all also matches by name
 ```

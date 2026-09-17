@@ -64,10 +64,13 @@ shared with the OS/GPU). All laptop-tier models are MoEs with 3–5 B active
 parameters or ≤ 31 B dense — the ones that are actually fast on CPU/Metal.
 
 `litmoe serve` loads **every** entry in `models.yaml` at once, so the entries
-must fit *together*. `litmoe init` only writes a set that does; `litmoe install
---model` warns when adding one breaks that; and `litmoe serve` refuses to start
-an over-budget set (it prints each model's need and the budget). Serve a subset
-with `litmoe serve --model <id> [--model <id2>]`, or `--force` to start anyway.
+must fit *together*. `litmoe init` only writes a set that does, and `litmoe
+install --model` warns when adding one breaks that. At start, `serve` sizes the
+selected set against two limits: the GPU budget (75 % of RAM on macOS) and
+usable RAM (90 % minus 3 GB). Over the first but under the second it starts
+with a warning — llama.cpp keeps the overflow on the CPU, so it is slower. Over
+RAM it refuses and names a model or quant that does fit. Serve a subset with
+`litmoe serve <id> [<id2>…]` (or `--model`), or `--force` to start regardless.
 
 ### 48 GB laptop — default tier
 
@@ -203,8 +206,8 @@ Field reference (see `litmoe/config.py`):
 ## Step 5: Run
 
 ```bash
-litmoe serve                            # gateway + all engines; refuses if they will not fit RAM together
-litmoe serve --model gemma-4-26b-a4b    # only this entry (repeatable); --force overrides the fit check
+litmoe serve                            # gateway + all engines; refuses a set that will not fit in RAM
+litmoe serve gemma-4-26b-a4b            # only this entry (several ids allowed); --force skips the fit check
 litmoe status                           # gateway health + per-engine state
 litmoe stop                             # stop engines litmoe started (PID files)
 curl http://127.0.0.1:8080/v1/models

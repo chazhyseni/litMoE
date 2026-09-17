@@ -495,7 +495,9 @@ def test_init_writes_only_models_that_fit_together(tmp_path, monkeypatch):
     assert "serve --model" in r.output            # and the user is told how to run the others
 
 
-def test_serve_refuses_configs_that_do_not_fit_together(tmp_path, monkeypatch):
+def test_serve_gate_two_thresholds(tmp_path, monkeypatch):
+    """Over the GPU budget but within RAM -> start with a warning (partial CPU offload).
+    Over RAM -> refuse with a useful hint, unless --force. Positional ids == --model."""
     from click.testing import CliRunner
     import litmoe.cli.main as CM
 
@@ -503,25 +505,38 @@ def test_serve_refuses_configs_that_do_not_fit_together(tmp_path, monkeypatch):
     cfg.write_text(
         "port: 8080\nmodels:\n"
         "  - {id: gemma-4-26b-a4b, engine: llamacpp, model_path: 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n"
-        "  - {id: gpt-oss-120b, engine: llamacpp, model_path: 'unsloth/gpt-oss-120b-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n"
-        "  - {id: qwen3.5-122b-a10b, engine: llamacpp, model_path: 'unsloth/Qwen3.5-122B-A10B-GGUF:UD-IQ4_XS', n_ctx: 32768}\n")
-    monkeypatch.setattr(S, "get_total_memory_bytes", lambda: int(103e9))
+        "  - {id: qwen3.5-122b-a10b, engine: llamacpp, model_path: 'unsloth/Qwen3.5-122B-A10B-GGUF:UD-IQ4_XS', n_ctx: 262144}\n"
+        "  - {id: qwen3.8-flash-next, engine: llamacpp, model_path: 'unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n")
+    # 103 GB Mac: GPU budget ~77 GB, RAM limit ~90 GB.
+    monkeypatch.setattr(S, "get_total_memory_bytes", lambda: int(103.1e9))
     monkeypatch.setattr(S, "is_macos", lambda: True)
     monkeypatch.setattr(CM, "is_macos", lambda: True)
     started = []
     monkeypatch.setattr(S, "run", lambda cfg, **kw: started.append([m.id for m in cfg.models]))
+    run = lambda *args: CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), *args])
 
-    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg)])
-    assert r.exit_code == 1, r.output
-    assert "need ~" in r.output and "--model" in r.output and not started
+    # All three: far over RAM -> refused, and the hint names one that fits, not the same set.
+    r = run()
+    assert r.exit_code == 1 and not started, r.output
+    assert "Serve one that fits:   litmoe serve gemma-4-26b-a4b" in r.output
 
-    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), "--model", "gpt-oss-120b"])
-    assert r.exit_code == 0, r.output
-    assert started == [["gpt-oss-120b"]]
+    # Fits the GPU budget -> silent start. Positional form.
+    r = run("gemma-4-26b-a4b")
+    assert r.exit_code == 0 and started == [["gemma-4-26b-a4b"]], r.output
+    assert "needs" not in r.output
 
-    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), "--model", "nope"])
+    # ~78 GB: over the 77 GB Metal budget, under the 90 GB RAM limit -> starts, warns about CPU offload.
+    r = run("--model", "qwen3.5-122b-a10b")
+    assert r.exit_code == 0 and started[-1] == ["qwen3.5-122b-a10b"], r.output
+    assert "part of it will run on the CPU" in r.output
+
+    # ~129 GB single model: over RAM -> refused; the hint is a smaller quant, never '--model <itself>'.
+    r = run("qwen3.8-flash-next")
+    assert r.exit_code == 1 and started[-1] != ["qwen3.8-flash-next"], r.output
+    assert "--quant" in r.output and "serve qwen3.8-flash-next" not in r.output
+
+    r = run("qwen3.8-flash-next", "--force")
+    assert r.exit_code == 0 and started[-1] == ["qwen3.8-flash-next"], r.output
+
+    r = run("nope")
     assert r.exit_code == 1 and "not in" in r.output
-
-    r = CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), "--force"])
-    assert r.exit_code == 0, r.output
-    assert started[-1] == ["gemma-4-26b-a4b", "gpt-oss-120b", "qwen3.5-122b-a10b"]

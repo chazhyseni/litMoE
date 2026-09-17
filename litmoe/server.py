@@ -132,24 +132,48 @@ def estimate_ram_gb(model: ModelEntry) -> float | None:
     return size_gb * _MODEL_OVERHEAD + kv_rate * n_ctx / 1e9
 
 
-def check_fits_together(models: list[ModelEntry]) -> tuple[float, float, list[tuple[str, float]]] | None:
-    """(total needed GB, budget GB, per-model needs) when the set will not fit at once; None if fine/unknown.
+class FitVerdict:
+    """How a set of models relates to this machine's memory when loaded at once."""
 
-    The gateway starts every entry eagerly, so the sum must fit the RAM budget
-    (75% of RAM on macOS, where Metal shares unified memory). Models whose
-    size cannot be determined are skipped rather than guessed.
+    __slots__ = ("total_gb", "gpu_budget_gb", "ram_limit_gb", "per_model", "level")
+
+    def __init__(self, total_gb: float, gpu_budget_gb: float, ram_limit_gb: float,
+                 per_model: list[tuple[str, float]]):
+        self.total_gb = total_gb
+        self.gpu_budget_gb = gpu_budget_gb
+        self.ram_limit_gb = ram_limit_gb
+        self.per_model = per_model
+        # "ok": fully in the fast budget. "slow": exceeds what the GPU can hold (macOS Metal
+        # default) but fits RAM, so llama.cpp keeps some layers on CPU. "no": exceeds RAM.
+        if total_gb > ram_limit_gb:
+            self.level = "no"
+        elif total_gb > gpu_budget_gb:
+            self.level = "slow"
+        else:
+            self.level = "ok"
+
+
+def check_fits_together(models: list[ModelEntry]) -> FitVerdict | None:
+    """Memory verdict for starting every model in `models` at once; None if RAM is unknown.
+
+    Two thresholds. The RAM limit (90% of RAM minus 3 GB, as fit_context uses) is
+    hard: above it the weights cannot be resident and the run pages from disk.
+    The GPU budget (75% of RAM on macOS, where Metal shares unified memory; equal
+    to the RAM limit elsewhere) is soft: between the two, llama.cpp auto-fits
+    what it can onto the GPU and runs the rest on CPU. Models whose size cannot
+    be determined are skipped rather than guessed.
     """
     total_mem = get_total_memory_bytes()
     if total_mem is None:
         return None
-    budget = total_mem / 1e9 * (0.75 if is_macos() else 1.0)
+    ram_gb = total_mem / 1e9
+    ram_limit = ram_gb * 0.9 - 3
+    gpu_budget = ram_gb * 0.75 if is_macos() else ram_limit
     per_model = [(m.id, need) for m in models if (need := estimate_ram_gb(m)) is not None]
     if not per_model:
         return None
     total = sum(n for _, n in per_model) + _OS_HEADROOM_GB
-    if total <= budget:
-        return None
-    return total, budget, per_model
+    return FitVerdict(total, gpu_budget, ram_limit, per_model)
 
 
 def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:

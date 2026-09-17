@@ -900,14 +900,14 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
     from litmoe.config import load_config
     from litmoe.server import check_fits_together
     try:
-        over = check_fits_together(load_config(config_path).models)
+        v = check_fits_together(load_config(config_path).models)
     except Exception:  # unreadable/partial config: the serve-time check will catch it
-        over = None
+        v = None
     click.echo()
-    if over:
-        total, budget, per_model = over
-        click.echo(f"  NOTE: models.yaml now lists {len(per_model)} models needing ~{total:.0f} GB together; "
-                   f"this machine's budget is ~{budget:.0f} GB. `litmoe serve` loads all of them at once,")
-        click.echo(f"        so serve one at a time:  litmoe serve --model {model_name}")
+    crowded = v is not None and v.level == "no" and len(v.per_model) > 1
+    if crowded:
+        click.echo(f"  NOTE: models.yaml now lists {len(v.per_model)} models needing ~{v.total_gb:.0f} GB together; "
+                   f"this machine has ~{v.ram_limit_gb:.0f} GB usable. `litmoe serve` loads all of them at once,")
+        click.echo(f"        so serve one at a time:  litmoe serve {model_name}")
         click.echo()
-    click.echo("Done. Next:  litmoe serve" + (f" --model {model_name}" if over else ""))
+    click.echo("Done. Next:  litmoe serve" + (f" {model_name}" if crowded else ""))
