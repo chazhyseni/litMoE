@@ -119,6 +119,18 @@ It runs `hermes chat --provider custom -m <model>` with
 `OPENAI_BASE_URL=http://127.0.0.1:8080/v1` and `OPENAI_API_KEY=litmoe` set
 only in that process. Your `config.yaml` is never written.
 
+**The first message takes a while — do not interrupt it.** Hermes sends its
+whole system prompt with every request: tool schemas plus the index of every
+installed skill. With a large skill library that is tens of thousands of tokens
+(a measured session: ~53K). On CPU/Metal the engine reads a new prefix at a few
+hundred tokens per second, so the first turn can take one to two minutes before
+the first word appears. llama-server caches that prefix (prompt caching is on by
+default, 8 GB `--cache-ram`), so every later turn — and every later session with
+the same skills — starts in seconds, as long as the gateway keeps running. The
+gateway logs `~N prompt tokens` for each request so you can see why it is
+quiet; `tail -f logs/<model>.log` shows the prefill progress. Ctrl-C in Hermes
+abandons the request and the cache warm-up with it.
+
 ### Persistent but separate: a Hermes profile
 
 ```bash

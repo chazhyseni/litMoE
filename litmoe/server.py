@@ -347,6 +347,16 @@ class Gateway:
         stream = bool(payload.get("stream", False))
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
 
+        # A 50K-token system prompt looks exactly like a hang from the client
+        # side; say what is being forwarded. ~4 chars/token, same estimate as
+        # /v1/messages/count_tokens.
+        approx_tokens = len(send_body) // 4
+        logger.info("%s: %s request, ~%s prompt tokens%s", model.id, endpoint,
+                    f"{approx_tokens:,}", " (stream)" if stream else "")
+        if approx_tokens >= 20_000:
+            logger.info("%s: large prompt — on CPU/Metal the first pass over a new prefix can take "
+                        "minutes; later turns reuse it from the prompt cache", model.id)
+
         # Strip Authorization header — the gateway handles auth, not the engine.
         # llama-server rejects Bearer tokens that don't match its own key.
         fwd_headers = {"content-type": "application/json"}
@@ -806,8 +816,25 @@ async def _stream_anthropic_response(url: str, body: bytes, timeout: httpx.Timeo
         await client.aclose()
 
 
+def _configure_logging() -> None:
+    """Show litmoe's own INFO lines on the console (engine loading, readiness, request sizes).
+
+    Python's default level is WARNING, which hid every logger.info() in this
+    package. Only the 'litmoe' logger is raised — httpx/uvicorn keep their own.
+    """
+    lg = logging.getLogger("litmoe")
+    if lg.handlers:
+        return
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(message)s"))
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+
+
 def run(config: GatewayConfig, log_dir: str | None = None, config_path: str | None = None) -> None:
     """Entry point: start gateway."""
+    _configure_logging()
     gateway = Gateway(config, config_path=config_path)
     gateway.load_engines(log_dir=log_dir)
     if not gateway.engines:

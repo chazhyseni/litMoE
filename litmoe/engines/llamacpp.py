@@ -22,6 +22,7 @@ from litmoe.platform_utils import (
 )
 
 _THREAD_FLAGS = {"-t", "--threads"}
+_SLOT_FLAGS = {"-np", "--parallel"}
 
 
 def _has_flag(args: list[str], flags: set[str]) -> bool:
@@ -105,6 +106,14 @@ class LlamaCppEngine(Engine):
         # SMT threads slow memory-bound decode; a low fixed cap starves big CPUs.
         if not _has_flag(m.extra_args, _THREAD_FLAGS):
             cmd.extend(["-t", str(get_physical_cores())])
+
+        # One slot unless the user asks for more. llama-server's auto picks 4,
+        # which lets a harness's side requests (title generation etc.) prefill
+        # concurrently with the main conversation and halve its speed; on a
+        # single-user gateway they should queue. The prompt cache (on by
+        # default) still keeps the main prefix warm across those side requests.
+        if not _has_flag(m.extra_args, _SLOT_FLAGS):
+            cmd.extend(["-np", "1"])
 
         cmd.extend(["--host", "127.0.0.1", "--port", str(self.default_port())])
         cmd.extend(m.extra_args)

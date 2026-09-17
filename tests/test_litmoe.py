@@ -136,6 +136,25 @@ def test_llamacpp_user_threads_not_overridden(monkeypatch):
     cmd = eng.build_command()
     assert cmd.count("-t") == 1 and cmd[cmd.index("-t") + 1] == "4"
 
+
+def test_llamacpp_single_slot_default_unless_user_sets_parallel(monkeypatch):
+    """One server slot by default: a harness's concurrent side requests (title
+    generation) otherwise prefill alongside the main conversation and halve
+    its speed. -np / --parallel in extra_args is respected."""
+    from litmoe.engines.llamacpp import LlamaCppEngine
+    eng = LlamaCppEngine(ModelEntry(id="g", engine="llamacpp", model_path="/tmp/x.gguf"))
+    monkeypatch.setattr(eng, "_resolve_binary", lambda: ("/bin/llama-server", None))
+    cmd = eng.build_command()
+    assert cmd[cmd.index("-np") + 1] == "1"
+
+    eng = LlamaCppEngine(ModelEntry(id="g", engine="llamacpp", model_path="/tmp/x.gguf",
+                                    extra_args=["--parallel", "4"]))
+    monkeypatch.setattr(eng, "_resolve_binary", lambda: ("/bin/llama-server", None))
+    cmd = eng.build_command()
+    assert "-np" not in cmd and cmd[cmd.index("--parallel") + 1] == "4"
+
+
+
 def test_llamacpp_prefers_installed_prebuilt_over_stale_source_build(tmp_path, monkeypatch):
     """A leftover local/ source build must not shadow the release `litmoe install` fetched.
 
