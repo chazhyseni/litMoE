@@ -391,6 +391,28 @@ def test_resolve_release_pinned_tag_and_cudart():
     assert I._asset_named({"assets": [{"name": "llama-b1-bin-ubuntu-vulkan-x64.tar.gz"}]}, "bin-ubuntu-x64") is None
 
 
+def test_choose_quant_downgrades_to_what_fits():
+    """`litmoe install --model X` must pick the best quant for THIS machine, not
+    blindly take the tier default. Observed: the 192 GB-tier default (111 GB)
+    was downloaded onto a 103 GB Mac after only a yes/no prompt."""
+    info = M.KNOWN_MODELS["qwen3.8-flash-next"]
+    # Plenty of RAM: the catalog default.
+    assert I.choose_quant("qwen3.8-flash-next", None, 192.0) == info["default_quant"]
+    # 103 GB Mac -> 77 GB Metal budget: nothing fits at 32K ctx, so the smallest quant.
+    assert I.choose_quant("qwen3.8-flash-next", None, 77.0) == "UD-IQ1_S"
+    # A budget where a mid quant fits: same answer `litmoe models` prints.
+    assert I.choose_quant("qwen3.8-flash-next", None, 100.0) == M.largest_quant_that_fits("qwen3.8-flash-next", 100.0)
+    # Explicit --quant always wins, even when it does not fit.
+    assert I.choose_quant("qwen3.8-flash-next", "UD-Q4_K_XL", 77.0) == "UD-Q4_K_XL"
+    # Unknown quant is rejected rather than silently substituted.
+    with pytest.raises(Exception):
+        I.choose_quant("qwen3.8-flash-next", "Q4_NOPE", 77.0)
+    # No RAM info: fall back to the default rather than guessing.
+    assert I.choose_quant("qwen3.8-flash-next", None, None) == info["default_quant"]
+    # ktransformers entries have no GGUF quant.
+    assert I.choose_quant("glm-5.3-flash", None, 512.0) is None
+
+
 def test_add_model_to_config_writes_kt_fields(tmp_path):
     cfg = tmp_path / "models.yaml"
     I.add_model_to_config("glm-5.3-flash", "ktransformers", tmp_path / "glm", 131072, cfg,

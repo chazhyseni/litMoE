@@ -40,7 +40,7 @@ Speed on CPU/Metal is governed by *active* parameters per token, so the default 
 
 ktransformers entries (Linux + NVIDIA GPU, native precision safetensors, no GGUF): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal — supported by ktransformers since 2026-08-26 and *not* by released llama.cpp), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), `deepseek-v3.2-kt` (FP8).
 
-Any model can drop a tier with a smaller quant: `litmoe install --model qwen3.5-122b-a10b --quant UD-IQ2_M` (39 GB). On Apple Silicon, Metal can use ~75% of RAM by default; `litmoe models` applies that budget.
+`litmoe install --model X` picks the quant for your machine: the default above when it fits, otherwise the largest one that does (e.g. `qwen3.5-122b-a10b` with 48 GB of RAM becomes UD-IQ2_XXS, 37 GB). `--quant` overrides. On Apple Silicon, Metal can use ~75% of RAM by default; `litmoe models` and `litmoe install` both apply that budget.
 
 ---
 

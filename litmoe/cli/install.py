@@ -690,6 +690,39 @@ def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: i
     click.echo(f"  models.yaml updated: {model_name} -> {engine} @ {model_path}")
 
 
+def choose_quant(model_name: str, requested: str | None, budget_gb: float | None) -> str | None:
+    """Quant to download: the user's choice, else the best that fits this machine.
+
+    Without --quant, the catalog default is used when it fits the RAM budget;
+    otherwise the largest quant that does fit (as `litmoe models` reports).
+    If nothing fits, the smallest quant is chosen so the caller can warn and
+    let the user decide. Non-GGUF models have no quant and return None.
+    """
+    info = lookup(model_name)
+    if not info or info["format"] != GGUF:
+        return None
+    if requested:
+        if requested not in info["quants"]:
+            raise click.BadParameter(
+                f"{model_name} quant must be one of: {', '.join(info['quants'])}")
+        return requested
+    default = info["default_quant"]
+    if budget_gb is None:
+        return default
+    need = ram_needed_gb(model_name, default)
+    if need is not None and need <= budget_gb:
+        return default
+    best = largest_quant_that_fits(model_name, budget_gb)
+    if best:
+        click.echo(f"  {default} needs ~{need:.0f} GB RAM, over this machine's ~{budget_gb:.0f} GB budget; "
+                   f"using {best} instead (override with --quant).")
+        return best
+    smallest = min(info["quants"], key=lambda q: info["quants"][q])
+    click.echo(f"  No {model_name} quant fits this machine's ~{budget_gb:.0f} GB budget; "
+               f"smallest is {smallest} ({info['quants'][smallest]:.0f} GB).")
+    return smallest
+
+
 def choose_n_ctx(model_name: str, weights_gb: float | None, requested: int | None) -> int:
     """Context to write: the user's value, else the memory-fitted native context."""
     if requested:
@@ -743,7 +776,7 @@ def print_model_table(ram_gb: float | None) -> None:
 @click.argument("targets", nargs=-1)
 @click.option("--model", "model_name", type=click.Choice(sorted(KNOWN_MODELS.keys())),
               default=None, help="Model to download (see `litmoe models`)")
-@click.option("--quant", default=None, help="Quantization (default: the model's default_quant)")
+@click.option("--quant", default=None, help="Quantization (default: the model's default_quant if it fits this machine's RAM, else the largest that does)")
 @click.option("--engine", type=click.Choice(["llamacpp", "ktransformers", "both", "none"]),
               default=None, help="Which engine(s) to install (default: the model's engine, else llamacpp)")
 @click.option("--llamacpp-variant", type=click.Choice(LLAMACPP_VARIANTS), default="auto",
@@ -823,19 +856,22 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
         return
 
     assert info is not None
-    quant_val = quant or info.get("default_quant")
+    total = get_total_memory_bytes()
+    budget_gb = (total / 1e9) * (0.75 if is_macos() else 1.0) if total else None
+    quant_val = choose_quant(model_name, quant, budget_gb)
     size_note = quant_size_gb(model_name, quant_val)
     if size_note and not yes:
         need = ram_needed_gb(model_name, quant_val)
-        total = get_total_memory_bytes()
         msg = f"  {model_name} {quant_val or ''} is ~{size_note:.0f} GB on disk"
         if need and total:
             msg += f"; needs ~{need:.0f} GB RAM at 32K context (this machine: {total / 1e9:.0f} GB)"
         click.echo(msg)
+        if need and budget_gb and need > budget_gb:
+            click.echo("  WARNING: this will not fit in RAM; expect it to page from disk (well under 1 token/s).")
         click.confirm("Proceed with download?", abort=True)
 
-    click.echo(f"Installing model: {model_name}")
-    path, mmproj = download_model(model_name, quant, models_dir, with_mmproj=not no_mmproj)
+    click.echo(f"Installing model: {model_name} [{quant_val}]" if quant_val else f"Installing model: {model_name}")
+    path, mmproj = download_model(model_name, quant_val, models_dir, with_mmproj=not no_mmproj)
     engine_for_model = info["engine"]
 
     if info["format"] == GGUF:

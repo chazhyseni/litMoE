@@ -54,8 +54,9 @@ upstream tutorials target SM90 (H100/H20) but SM80/SM86 work for most models.
 ## Step 3: Pick a model for your RAM
 
 `litmoe models` prints the catalog grouped by tier and marks what fits this
-machine. `litmoe install --model <id>` downloads the default quant (or
-`--quant <Q>`) and adds it to `models.yaml` with a memory-aware context size.
+machine. `litmoe install --model <id>` downloads the default quant when it
+fits your RAM budget, otherwise the largest quant that does (`--quant <Q>`
+overrides), and adds it to `models.yaml` with a memory-aware context size.
 
 RAM column = weights × 1.08 (mmap + compute buffers) + KV cache at 32K tokens
 + 4 GB headroom. macOS gets 75 % of physical RAM as its budget (unified memory
