@@ -29,50 +29,42 @@ process supervision. Every component earns its place.
    │   ENGINE SUPERVISOR                                                            │
    │   - one subprocess per model, own session/pgid, PID file in ~/.litmoe/run      │
    │   - ports 8081+ skipping the gateway port and anything already bound           │
-   │   - memory-aware n_ctx: native ctx unless weights+KV exceed RAM budget         │
+   │   - catalog n_ctx is memory-aware; WARP 0 keeps its container default          │
    │   - SIGTERM/SIGINT/SIGHUP to the gateway stops every engine (no orphans)       │
-   └────────────┬───────────────────────────────────────┬───────────────────────────┘
-                │ http://127.0.0.1:8082                 │ http://127.0.0.1:8081
-                ▼                                       ▼
-   ┌─────────────────────────────┐    ┌────────────────────────────────┐
-   │   KTRANSFORMERS ENGINE      │    │   LLAMA.CPP ENGINE             │
-   │   engines/ktransformers.py  │    │   engines/llamacpp.py          │
-   │                             │    │                                │
-   │   spawns:                   │    │   spawns: llama-server         │
-   │   python -m sglang.launch_  │    │     -m <gguf> | -hf repo:QUANT │
-   │     server --kt-method …    │    │     -c <ctx> -t <phys cores>   │
-   │                             │    │     -ngl … --mmproj …          │
-   │   attention on GPU (CUDA)   │    │                                │
-   │   routed experts on CPU     │    │   CUDA / HIP / Metal / Vulkan  │
-   │   kt-kernel: AMX / AVX-512  │    │   / SYCL / CPU                 │
-   │   / AVX2, INT4/INT8/FP8/    │    │   GGUF 1–8 bit (Unsloth UD-*)  │
-   │   RAWINT4 experts           │    │                                │
-   │                             │    │   models: every tier           │
-   │   models: 192 GB+ tiers     │    │                                │
-   │   (GLM-5.3-Flash, DeepSeek  │    │                                │
-   │   V4-Flash/V3.2, Kimi-K2.x, │    │                                │
-   │   MiniMax-M2.7/M3)          │    │                                │
-   └─────────────────────────────┘    └────────────────────────────────┘
-                │                                       │
-                └─────────────────┬─────────────────────┘
-                                  ▼
-                   ┌──────────────────────────────────────┐
-                   │  models.yaml  (pydantic: config.py)  │
-                   │  host / port / api_key               │
-                   │  models:                             │
-                   │    - id, engine, model_path          │
-                   │      n_ctx, n_gpu_layers, extra_args │
-                   │      env, aliases, kt_* fields       │
-                   └──────────────────────────────────────┘
-                                  ▲
-                   ┌──────────────┴───────────────────────┐
-                   │  litmoe/models.py — catalog           │
-                   │  tiers 48 / 96 / 192 / 512 / 768 GB   │
-                   │  hf_repo, quants+sizes, native ctx,   │
-                   │  KV bytes/token, engine, kt flags     │
-                   │  → `litmoe models`, `install`, `init` │
-                   └──────────────────────────────────────┘
-```
+   └───────────────┬──────────────────────┬───────────────────────┬────────────────┘
+                   │ :8081                │ :8082                 │ :8083
+                   ▼                      ▼                       ▼
+   ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+   │ LLAMA.CPP ENGINE       │  │ KTRANSFORMERS ENGINE   │  │ WARP ENGINE            │
+   │ engines/llamacpp.py    │  │ ktransformers.py       │  │ engines/warp.py        │
+   │                        │  │                        │  │                        │
+   │ spawns llama-server    │  │ spawns python -m       │  │ spawns upstream        │
+   │ -m <gguf> or           │  │ sglang.launch_server   │  │ serve/__main__.py      │
+   │ -hf repo:QUANT         │  │ --kt-method …          │  │ <local .waste>         │
+   │                        │  │                        │  │                        │
+   │ CUDA / HIP / Metal /   │  │ CUDA attention; CPU   │  │ mmap + local storage   │
+   │ Vulkan / SYCL / CPU    │  │ experts via AMX /     │  │ paging; container      │
+   │ GGUF 1–8 bit           │  │ AVX-512 / AVX2        │  │ owns its defaults      │
+   └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+                   │                      │                       │
+                   └──────────────────────┴───────────┬───────────┘
+                                                      ▼
+                                  ┌──────────────────────────────────────┐
+                                  │ models.yaml  (pydantic: config.py)  │
+                                  │ host / port / api_key               │
+                                  │ models:                             │
+                                  │   - id, engine, model_path          │
+                                  │     n_ctx, n_gpu_layers, extra_args │
+                                  │     env, aliases, kt_* fields       │
+                                  └──────────────────────────────────────┘
+                                                      ▲
+                                  ┌───────────────────┴──────────────────┐
+                                  │ litmoe/models.py — downloadable      │
+                                  │ llama.cpp/ktransformers catalog      │
+                                  │ tiers, quants, sizes, ctx, kt flags  │
+                                  │ → `litmoe models`, `install`, `init` │
+                                  │ WARP containers remain local-only    │
+                                  └──────────────────────────────────────┘
 
 ## Data flow
 
@@ -80,18 +72,21 @@ process supervision. Every component earns its place.
    `model: gemma-4-26b-a4b` — or an alias such as `claude-sonnet-4-5`.
 2. Gateway resolves the id to an engine and forwards the body to that engine's
    loopback port. For `/v1/messages` it first translates Anthropic → OpenAI.
-3. The engine runs the forward pass (CPU, GPU, or CPU experts + GPU attention).
+3. The selected local engine runs the forward pass (CPU, GPU, CPU experts +
+   GPU attention, or WARP over a local `.waste` container).
 4. Gateway relays the response; streaming responses are passed through byte
    for byte (OpenAI) or re-framed as Anthropic SSE events.
 
 The gateway never touches the forward pass; it adds a few milliseconds and no
-compute.
+compute. WARP's upstream server is a local subprocess, not a remote inference
+API.
 
 ## Engine lifecycle
 
-- `litmoe serve` reads `models.yaml`, fixes any stale `n_ctx` (memory-aware,
-  written back to the file), starts each engine in its own process group,
-  writes `~/.litmoe/run/<id>.pid`, waits for readiness, then serves.
+- `litmoe serve` reads `models.yaml`, applies memory-aware context sizing to
+  catalogued models, and preserves a WARP container's default when `n_ctx: 0`.
+  It starts each engine in its own process group, writes
+  `~/.litmoe/run/<id>.pid`, waits for readiness, then serves.
 - Engine stdout/stderr append to `logs/<id>.log` with a per-start header.
 - Ctrl-C / SIGTERM / SIGHUP to the gateway stops all engines. (uvicorn
   re-raises the signal after its own graceful exit; litmoe installs a handler
@@ -109,9 +104,11 @@ compute.
 | Docker gateway | 127.0.0.1:8000 (host) | `deploy/docker-compose.yml` |
 | Open WebUI (Docker) | 8080 | `deploy/docker-compose.yml` |
 
-litmoe reads only `LITMOE_*` environment variables and writes only under
-`~/.litmoe/` and `models.yaml`. It never sets `ANTHROPIC_*`/`OPENAI_*` or
-edits harness configuration; see [HARNESSES.md](HARNESSES.md).
+At runtime litmoe reads only `LITMOE_*` environment variables and writes only
+under `~/.litmoe/` and `models.yaml`; engine installers also write to
+`$LITMOE_PREFIX` (default `~/.local`). It never sets
+`ANTHROPIC_*`/`OPENAI_*` or edits harness configuration; see
+[HARNESSES.md](HARNESSES.md).
 
 ## Source map
 
@@ -124,10 +121,11 @@ litmoe/
 ├── engines/
 │   ├── base.py        Engine ABC: start/stop/health, PID files, log headers
 │   ├── llamacpp.py    llama-server adapter (binary discovery, -hf, mmproj, threads)
-│   └── ktransformers.py  sglang-kt adapter (kt-method, GPU experts, cpuinfer)
+│   ├── ktransformers.py  sglang-kt adapter (kt-method, GPU experts, cpuinfer)
+│   └── warp.py        upstream WARP server adapter for local .waste containers
 └── cli/
     ├── main.py        doctor · init · models · serve · status · stop
-    └── install.py     engine install (release asset / build / kt wheels) + model download
+    └── install.py     engine install (release/source/kt wheels/pinned WARP) + catalog model download
 scripts/claude-local   Claude Code against the gateway, per-process env only
 scripts/hermes-local   Hermes Agent against the gateway, per-process env only
 tests/test_litmoe.py   catalog, config, ctx math, port allocation, Anthropic translation, stop safety

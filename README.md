@@ -2,15 +2,15 @@
 
 **lit + MoE** — a light gateway for Mixture-of-Experts models.
 
-OpenAI- and Anthropic-compatible gateway for [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ktransformers](https://github.com/kvcache-ai/ktransformers). One `models.yaml`, one port, every model reachable by name — from a 4B-active MoE that chats interactively on a 48 GB laptop to trillion-parameter models on a server.
+OpenAI- and Anthropic-compatible gateway for [llama.cpp](https://github.com/ggml-org/llama.cpp), [ktransformers](https://github.com/kvcache-ai/ktransformers), and [WARP](https://github.com/sqliteai/warp). One `models.yaml`, one port, every model reachable by name — from a 4B-active MoE that chats interactively on a 48 GB laptop to trillion-parameter models on a server.
 
-litmoe is not an inference engine — the forward pass runs in llama.cpp or ktransformers. What litmoe adds:
+litmoe is not an inference engine — the forward pass runs in llama.cpp, ktransformers, or WARP. What litmoe adds:
 
-- **One API for multiple engines.** Mix llama.cpp and ktransformers in the same `models.yaml`. Clients see one flat model list at one endpoint.
+- **One API for multiple engines.** Mix llama.cpp, ktransformers, and WARP in the same `models.yaml`. Clients see one flat model list at one endpoint.
 - **Anthropic Messages API.** `/v1/messages` (and `/v1/messages/count_tokens`) are translated to OpenAI chat completions, so Claude Code, Hermes Agent, and other Anthropic-format tools work unchanged. Model aliases (`claude-sonnet-4-5` → your local model) are built in, and `scripts/claude-local` / `scripts/hermes-local` run a harness against the gateway **without touching its normal configuration** — plain `claude` keeps using your Anthropic account.
-- **A curated, RAM-tiered model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` downloads exactly the right GGUF files (root or per-quant repo layouts, sharded or not, plus the vision projector for multimodal models) and writes the config entry.
-- **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. Context size is set to the model's native window and reduced only when weights + KV cache would not fit the GPU budget (Metal's share of unified memory on macOS, RAM elsewhere); an oversized value already in `models.yaml` is lowered at start.
-- **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual llama-server.
+- **A curated, RAM-tiered model catalog.** `litmoe models` shows what fits your machine; for catalogued llama.cpp and ktransformers models, `litmoe install --model X` downloads the listed weights and writes the config entry. WARP `.waste` containers are deliberately outside this catalog and must be created or acquired with upstream WARP tooling.
+- **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. For catalogued models, context size is set to the native window and reduced only when weights + KV cache would not fit the GPU budget (Metal's share of unified memory on macOS, RAM elsewhere). For WARP, `n_ctx: 0` preserves the local container's default so WARP can size its own memory budget.
+- **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual engine process.
 - **Streaming.** Raw SSE passthrough for OpenAI requests; event-by-event translation for Anthropic requests (text, thinking, tool_use).
 
 ---
@@ -67,6 +67,36 @@ Since v0.4 the serving stack is **SGLang + kt-kernel** (`python -m sglang.launch
 - **CPU expert backends (`kt_method`):** FP8, FP8_PERCHANNEL, BF16, RAWINT4, MXFP4, MXFP8 need **AVX-512**; AMXINT4/AMXINT8 need Intel AMX; LLAMAFILE (GGUF weights) runs on AVX2.
 - **Models:** registry entries (DeepSeek-V3.x/V4-Flash, Kimi-K2-Thinking, MiniMax-M2.x/M3) plus tutorial-launched models (GLM-5.3-Flash, Kimi-K2.5/K2.6, Qwen3-Next). 2026 additions upstream: GLM-5.3-Flash native FP8 (Aug 26), LoRA fine-tuning on AVX-512 CPUs incl. AMD (Aug 17), Kimi K2.5/K2.6 RAWINT4 fine-tuning (Sep 13), DeepSeek-V4-Flash on Ascend NPU (Aug 16) — fine-tuning and NPU paths are outside litmoe's scope.
 
+### WARP
+
+**Repo:** https://github.com/sqliteai/warp
+
+WARP serves local `.waste` containers by memory-mapping expert weights and
+paging them from local storage. litmoe starts WARP's upstream OpenAI-compatible
+server as a loopback subprocess; litmoe remains the gateway/supervisor and WARP
+remains the inference runtime. No remote inference API is involved.
+
+**Install:** `litmoe install --engine warp` — clones commit
+`09fcff352ca55223b08ee222d15054b90546c6a9`, builds it, runs upstream
+`make check`, and installs the source tree under `$LITMOE_PREFIX/lib/warp`
+(default `~/.local/lib/warp`). It does **not** download or convert model
+weights. WARP configurations accept local `.waste` paths only; create or
+acquire those containers with upstream WARP tooling, not
+`litmoe install --model`.
+
+Upstream WARP reports the following measurements. They are not litmoe
+benchmarks or performance guarantees:
+
+| Container | Upstream container size | Upstream resident floor | Upstream throughput |
+|---|---:|---:|---:|
+| GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s (short) and 3.86 tok/s (long) on WARP's 64 GB M5 Pro |
+| DeepSeek-V4.1-Flash | 299 GB | 4.86 GB | about 3.7 tok/s |
+
+Those published throughput figures assume fast internal NVMe. This
+repository's current persistent disk is not equivalent. Creating the GLM
+container also needs 306 GiB for source-weight staging plus 112 GB for the
+output container.
+
 ---
 
 ## Quick start
@@ -83,6 +113,10 @@ litmoe serve
 
 curl http://127.0.0.1:8080/v1/models
 ```
+
+To serve an existing WARP container instead, install only the runtime with
+`litmoe install --engine warp`, add a local `.waste` entry to `models.yaml`,
+then run `litmoe serve`. The engine installer never downloads a WARP model.
 
 Or skip the pre-download: `litmoe init` writes a `models.yaml` whose `model_path` entries are HuggingFace specs (`owner/repo:QUANT`); llama-server fetches them on first start.
 
@@ -126,9 +160,21 @@ models:
     kt_num_gpu_experts: 0                  # experts kept on GPU (0 = all on CPU)
     n_ctx: 262144
     extra_args: ["--tool-call-parser", "glm47", "--reasoning-parser", "glm45"]
+
+  # WARP serves an existing local .waste container; it never fetches this path.
+  - id: glm-5.3-flash-warp
+    engine: warp
+    model_path: ~/models/glm53.waste
+    n_ctx: 0                             # preserve container default; WARP sizes its memory budget
+    extra_args: ["--no-thinking"]
+
+  - id: deepseek-v4.1-flash-warp
+    engine: warp
+    model_path: ~/models/deepseek-v4.1-flash.waste
+    n_ctx: 0
 ```
 
-Per-model fields: `id`, `engine` (`llamacpp` | `ktransformers`), `model_path` (GGUF file, HF spec `owner/repo[:quant]`, URL, or safetensors directory), `gguf_path`, `n_gpu_layers`, `n_ctx`, `aliases`, `extra_args`, `env`; ktransformers only: `kt_method`, `kt_num_gpu_experts`, `kt_cpuinfer` (default: physical cores), `kt_threadpool_count` (default: NUMA nodes). llama-server gets `-t <physical cores>` unless `extra_args` sets `-t`. When the gateway raises a too-small `n_ctx` it writes the resolved value back into `models.yaml` (comments in the file are not preserved by that rewrite).
+Per-model fields: `id`, `engine` (`llamacpp` | `ktransformers` | `warp`), `model_path`, `n_ctx`, `aliases`, `extra_args`, and `env`; llama.cpp also uses `n_gpu_layers`, while ktransformers uses `gguf_path`, `kt_method`, `kt_num_gpu_experts`, `kt_cpuinfer` (default: physical cores), and `kt_threadpool_count` (default: NUMA nodes). For WARP, `model_path` must be a local `.waste` container and `n_ctx: 0` omits `--ctx`, preserving the container default while WARP sizes its memory budget. WARP `extra_args` are passed upstream verbatim and may include `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`. llama-server gets `-t <physical cores>` unless `extra_args` sets `-t`. When the gateway raises a too-small llama.cpp context it writes the resolved value back into `models.yaml` (comments in the file are not preserved by that rewrite).
 
 ---
 
@@ -139,7 +185,7 @@ litmoe doctor          # CPU/GPU/RAM, engines, recommended models
 litmoe models          # catalog by RAM tier with fits / does-not-fit for this machine
 litmoe init            # write models.yaml with fast defaults for this RAM
 litmoe install         # install engines and/or download a model (--model, --quant, --engine)
-litmoe serve           # start gateway + all configured engines (Ctrl-C stops both); refuses a set that will not fit in RAM
+litmoe serve           # start gateway + all configured engines (Ctrl-C stops them); refuses a set that will not fit in RAM
 litmoe serve X [Y…]    # serve only these entries; --force skips the fit check
 litmoe status          # gateway health and per-engine status
 litmoe stop            # stop the engines litmoe started (PID files); --all also matches by name
@@ -159,10 +205,10 @@ litmoe stop            # stop the engines litmoe started (PID files); --all also
         │  read `model` → resolve alias → engine from models.yaml
         │  Anthropic /v1/messages ⇄ OpenAI chat completions
         ▼
-   engine subprocess                      engine subprocess
-   llama-server :8081                     python -m sglang.launch_server :8082
-   CPU / CUDA / Metal / Vulkan            GPU attention + kt-kernel CPU experts
-```
+   engine subprocess             engine subprocess                    engine subprocess
+   llama-server :8081            sglang-kt :8082                      WARP serve :8083
+   CPU/CUDA/Metal/Vulkan         GPU attention + CPU experts          local .waste container
+                                                                      mmap + local paging
 
 Engine ports are assigned in `models.yaml` order starting at 8081, skipping the gateway's own port and any port another process already holds. The gateway never touches the forward pass.
 
@@ -223,9 +269,9 @@ Services: **litmoe-gateway** on port **8000** (`http://127.0.0.1:8000/v1`, loopb
 
 ## What litmoe does NOT do
 
-- No inference code, weights, kernels, or quantization — the engines do all compute.
+- No inference code, weights, kernels, or quantization — llama.cpp, ktransformers, or WARP does all compute locally; no remote inference API is involved.
 - No multi-node distribution. Single node.
-- No model conversion. Use `llama-quantize`, Unsloth, or pre-quantized GGUFs.
+- No model conversion. Use `llama-quantize`, Unsloth, or upstream WARP tooling. WARP containers are not in the litmoe catalog and cannot be downloaded with `litmoe install --model`.
 - No fine-tuning. For LoRA on MoE experts see the ktransformers × LlamaFactory cookbook upstream.
 
 ---

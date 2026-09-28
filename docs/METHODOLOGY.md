@@ -1,24 +1,29 @@
 # Methodology
 
-This document explains why litmoe is structured the way it is: a thin
-Python dispatcher over ktransformers and llama.cpp, with no custom inference code.
+This document explains why litmoe is structured the way it is: a thin Python
+dispatcher over llama.cpp, ktransformers, and WARP, with no custom inference
+code.
 
 ## The problem
 
-Open MoE models span 17 GB (Gemma-4-26B-A4B) to 600 GB+ (Kimi-K3). Two
-engines cover all of them well, on different hardware:
+Open MoE deployments span 17 GB GGUFs through 600 GB+ checkpoints and
+storage-paged `.waste` containers. Three engines cover different hardware and
+storage tradeoffs:
 
 1. **llama.cpp** — GGUF, every quant from 1.5 to 8 bit, CUDA/HIP/Metal/Vulkan/
    SYCL/CPU. The right tool from a 48 GB laptop up to a many-core server.
 2. **ktransformers (sglang-kt + kt-kernel)** — attention on one GPU, routed
    experts on the CPU with AMX/AVX-512 kernels. The right tool for the
    200 GB–1 TB models on a single-GPU box with lots of RAM.
+3. **WARP** — local `.waste` containers whose expert weights are memory-mapped
+   and paged from fast local storage. The right tool when resident RAM is much
+   smaller than the container and internal NVMe can sustain the paging load.
 
-Neither engine needs help with inference. What users lack is one endpoint,
-one config, sane defaults for their RAM, and a way to point their agent
-harnesses at it without breaking those harnesses.
+None of these engines needs help with inference. What users lack is one
+endpoint, one config, sane defaults, and a way to point their agent harnesses
+at it without breaking those harnesses.
 
-The previous version of litmoe tried to be a third engine: a custom
+The previous version of litmoe tried to be its own inference engine: a custom
 CPU-only C99 forward pass. It was 0.019 t/s on a 24-core EPYC. The math:
 
 - 67 prompt tokens × 92 MoE layers × 16 experts = 98,496 expert lookups
@@ -26,50 +31,57 @@ CPU-only C99 forward pass. It was 0.019 t/s on a 24-core EPYC. The math:
 - At 379 MB/s disk: 38 minutes minimum
 - 24 cores × ~50 ms per expert compute: 82 minutes compute floor
 
-No software optimization closes a 1000x gap to ktransformers and llama.cpp.
+No software optimization closes a 1000x gap to mature inference runtimes.
 We tried AVX2 matmul, mmap, cross-layer prefetch, 2-bit quantization — all
 shipped but all irrelevant. The bandwidth doesn't exist.
 
 ## What the dispatcher does instead
 
-The dispatcher acknowledges that other people have spent years building inference
-engines and uses them. Two open-source projects cover everything:
+The dispatcher acknowledges that other people have spent years building
+inference engines and uses them. Three open-source projects cover distinct
+deployment shapes:
 
-| Engine | Hardware | Strength |
+| Engine | Hardware / storage | Strength |
 |---|---|---|
+| **llama.cpp** | CUDA + HIP + Metal + Vulkan + SYCL + CPU | Mature cross-platform runtime, every quant format, every model tier |
 | **ktransformers** (Tsinghua MADSys Lab, SOSP 2025) — served via sglang-kt | CUDA GPU + AMX / AVX-512 / AVX2 CPU | Heterogeneous CPU+GPU MoE, expert offloading, INT4/INT8/FP8/RAWINT4 experts |
-| **llama.cpp** | CUDA + HIP + Metal + Vulkan + SYCL + CPU | Mature cross-platform, every quant format, every model tier |
+| **WARP** | Supported local host with fast internal NVMe | `.waste` containers, low resident floor, storage-paged expert weights |
 
 litmoe is the front door: a Python package that:
 
 1. Reads a `models.yaml` config; ships a catalog (`litmoe/models.py`) tiered
    by RAM so `litmoe init` picks something that is fast on *this* machine.
-2. Starts the chosen engine as a subprocess (`python -m sglang.launch_server`
-   or `llama-server`), supervises it, and stops it cleanly.
+2. Starts the chosen engine as a subprocess (`llama-server`,
+   `python -m sglang.launch_server`, or WARP's upstream `serve/__main__.py`),
+   supervises it, and stops it cleanly.
 3. Exposes a single OpenAI + Anthropic-compatible API on 127.0.0.1:8080.
 4. Routes requests to the right engine by model name or alias.
 5. Connects agent harnesses (Claude Code, Hermes) **per process**, never by
    rewriting their global configuration.
 
-That's it. No custom forward pass. No CUDA kernels. No safetensors parsing.
+That's it. No custom forward pass. No CUDA kernels. No safetensors or `.waste` parsing.
 
 ## Why a dispatcher is the right shape
 
 **Inference engines are mature.** ktransformers hit SOSP 2025 with a
 heterogeneous-expert scheduler; llama.cpp ships 1.5-bit to 8-bit quantization
-across every GPU vendor. The optimization space is enormous and competition
-between these engines is healthy. Reimplementing kernels loses to both.
+across every GPU vendor; WARP pages expert weights from local containers.
+The optimization space is enormous and competition between these engines is
+healthy. Reimplementing kernels or storage scheduling loses to them.
 
-**Engines already speak HTTP.** Both `sglang.launch_server` (the ktransformers
-serving stack since v0.4) and `llama-server` ship OpenAI-compatible servers.
-The gateway is a pass-through plus an Anthropic translation layer.
+**Engines already speak HTTP.** `llama-server`, `sglang.launch_server` (the
+ktransformers serving stack since v0.4), and WARP's upstream server expose
+OpenAI-compatible loopback services. The litmoe gateway is a pass-through plus
+an Anthropic translation layer; WARP is a local subprocess, not a remote
+inference API.
 
 **Configuration is the hard part.** Users don't care which engine is running;
 they care which model responds, and that it is fast enough on the hardware
-they have. The dispatcher lets a single `models.yaml` mix engines:
-gemma-4-26b-a4b → llama.cpp on a laptop, glm-5.3-flash → sglang-kt on a
-GPU server. The catalog encodes what fits where so the default is never a
-594 GB download on a 96 GB machine.
+they have. The dispatcher lets one `models.yaml` mix engines:
+gemma-4-26b-a4b → llama.cpp on a laptop, glm-5.3-flash → sglang-kt on a GPU
+server, or glm-5.3-flash-warp → a local `.waste` container. The downloadable
+catalog encodes what fits where so the default is never a 594 GB download on a
+96 GB machine; WARP containers remain explicitly outside that catalog.
 
 **Defaults must be fast, not just fit.** A 9B dense model and a 26B MoE with
 4B active both ran at 8–13 t/s on an AVX2 DDR4 box — same speed class, but
@@ -98,6 +110,22 @@ sequential read). Raw logs: [`docs/measurements/`](measurements/README.md).
 | llama.cpp | DeepSeek-V4-Flash UD-IQ1_S (83 GB) | 48 | 0.11–0.34 | disk-bound, `deepseek-v4-flash.log` |
 | ktransformers sglang-kt | large MoEs, GPU attention + CPU experts | — | 5–50 typical | upstream tutorials; needs a CUDA GPU, not measured here |
 
+
+### Upstream WARP measurements
+
+WARP upstream reports the figures below. They were not measured by litmoe and
+are not litmoe performance guarantees:
+
+| Container | Upstream container size | Upstream resident floor | Upstream throughput |
+|---|---:|---:|---:|
+| GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
+| DeepSeek-V4.1-Flash | 299 GB | 4.86 GB | about 3.7 tok/s |
+
+WARP's published throughput assumes internal NVMe. This repository's current
+persistent disk is not equivalent. Building the GLM container with upstream
+tooling needs 306 GiB for source-weight staging plus a 112 GB output. litmoe
+installs and supervises WARP but does not download or convert its containers.
+
 The C engine was ~45x slower than llama.cpp on the same Kimi-K3 weights
 (0.019 vs the 0.85 t/s llama.cpp reached in Aug 2026, recorded in commit
 `cd9e97e`/`21819c5`; that llama.cpp log was later overwritten, so the K3
@@ -113,20 +141,26 @@ interactive inference on this VM.
   Qwen3.8-Flash-Next at Q4.
 - **Server with a CUDA GPU and 512 GB+:** sglang-kt with CPU expert offload
   for GLM-5.3-Flash, Kimi-K2.x, DeepSeek-V3.2, MiniMax-M3.
+- **Fast-internal-NVMe host with an existing `.waste` container:** WARP can
+  trade storage capacity for a low resident floor. Use upstream container
+  creation tooling and treat upstream throughput as hardware-specific.
 - **Server, CPU only, 768 GB+:** llama.cpp with Kimi-K3 / Qwen3.8-2.4T at
   IQ1 — batch use, not chat, unless the CPU has many memory channels.
 
-Pick the engine per model in `models.yaml`. Both engines speak OpenAI HTTP.
-The dispatcher adds latency in the single-digit-millisecond range and never
-touches the forward pass.
+Pick the engine per model in `models.yaml`. All three engines expose local
+OpenAI HTTP services. The dispatcher adds latency in the
+single-digit-millisecond range and never touches the forward pass.
 
 ## What litmoe does NOT do
 
 - It is not an inference engine. There are no model weights in this repo and
-  no forward-pass code. The actual inference is done by subprocesses.
+  no forward-pass code. The actual inference is done by local subprocesses.
+- It does not call a remote inference API.
 - It does not optimize for specific hardware. That's the engines' job.
-- It does not quantize models. That's `kt quant`, `llama-quantize`, or
-  third-party tools (Unsloth, MLX, etc.).
+- It does not quantize or convert models. That's `kt quant`,
+  `llama-quantize`, upstream WARP tooling, or third-party tooling (Unsloth,
+  MLX, etc.). WARP containers are not downloadable through
+  `litmoe install --model`.
 - It does not parallelize across machines. Single-node only.
 
 ## What's in this repo
@@ -142,10 +176,11 @@ litmoe/
 │   ├── engines/
 │   │   ├── base.py         # Engine abstract base, PID files, log headers
 │   │   ├── ktransformers.py  # sglang-kt subprocess adapter
-│   │   └── llamacpp.py     # llama-server subprocess adapter
+│   │   ├── llamacpp.py       # llama-server subprocess adapter
+│   │   └── warp.py           # upstream WARP server adapter for local .waste containers
 │   └── cli/
-│       ├── main.py         # litmoe doctor|init|models|install|serve|status|stop
-│       └── install.py      # one-command engine + model installer
+│       ├── main.py           # litmoe doctor|init|models|install|serve|status|stop
+│       └── install.py        # engine installers + catalog model downloader
 ├── scripts/
 │   ├── claude-local        # Claude Code → gateway, per-process env only
 │   └── hermes-local        # Hermes Agent → gateway, per-process env only
@@ -165,8 +200,8 @@ litmoe/
 
 Engineering lessons from building the previous C engine (kept for honesty, not for re-use):
 
-1. **Don't compete with mature engines.** ktransformers and llama.cpp have
-   teams of PhDs. Your CPU forward pass is not a viable alternative.
+1. **Don't compete with mature engines.** llama.cpp, ktransformers, and WARP
+   already specialize in compute kernels and storage-aware inference.
 2. **Hardware bottlenecks don't yield to software.** A 50x compute gap to
    llama.cpp on identical hardware means your optimization is wrong, not
    the hardware.

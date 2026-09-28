@@ -1,13 +1,14 @@
 """litmoe install - one-command engine + model installation.
 
-Installs an inference engine (llama.cpp release binaries or a source build;
-ktransformers via PyPI wheels or the upstream install.sh) and downloads model
-weights, then writes the model entry into models.yaml.
+Installs an inference engine (llama.cpp release binaries or a source build,
+ktransformers via PyPI wheels or the upstream install.sh, or WARP from pinned
+source) and downloads model weights, then writes the model entry into models.yaml.
 
 The model catalog lives in litmoe.models (single source of truth).
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -46,6 +47,9 @@ from litmoe.platform_utils import (
 )
 
 LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+WARP_REPO = "https://github.com/sqliteai/warp.git"
+WARP_COMMIT = "09fcff352ca55223b08ee222d15054b90546c6a9"
+
 # Curated "stable" pointer maintained by llama.cpp CI: the latest release
 # (tagged vX.Y.Z) carries only this file; binaries live in the bNNNNN prereleases.
 LLAMA_NIGHTLY_POINTER = "nightly-tag.txt"
@@ -184,6 +188,162 @@ def pick_llamacpp_variant(variant: str) -> str:
 # ---------------------------------------------------------------------------
 # Engine installers
 # ---------------------------------------------------------------------------
+
+def _run_warp_command(
+    args: list[str], *, cwd: Path | None, label: str, timeout: int
+) -> None:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{label} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        suffix = f": {detail[:500]}" if detail else ""
+        raise RuntimeError(f"{label} failed (exit {result.returncode}){suffix}")
+
+
+def _warp_library_name() -> str:
+    if sys.platform == "darwin":
+        return "libwaste.dylib"
+    if sys.platform == "win32":
+        return "libwaste.dll"
+    return "libwaste.so"
+
+
+def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
+    """Build and install an exact WARP source revision."""
+    for tool in ("git", "make"):
+        if not shutil.which(tool):
+            raise RuntimeError(
+                f"'{tool}' is required to build WARP from source "
+                f"(apt install {tool} / brew install {tool})"
+            )
+
+    lib_dir = prefix / "lib"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir = lib_dir / "warp"
+
+    with contextlib.ExitStack() as stage_cleanup:
+        stage_dir = Path(tempfile.mkdtemp(prefix=".warp-install-", dir=lib_dir))
+        stage_cleanup.callback(shutil.rmtree, stage_dir, ignore_errors=True)
+        checkout = stage_dir / "checkout"
+
+        click.echo(f"  Cloning WARP source ({ref})...")
+        _run_warp_command(
+            ["git", "clone", "--no-checkout", WARP_REPO, str(checkout)],
+            cwd=None,
+            label="git clone",
+            timeout=300,
+        )
+        _run_warp_command(
+            ["git", "fetch", "--depth", "1", "origin", ref],
+            cwd=checkout,
+            label=f"git fetch {ref}",
+            timeout=300,
+        )
+        _run_warp_command(
+            ["git", "checkout", "--detach", "FETCH_HEAD"],
+            cwd=checkout,
+            label=f"git checkout {ref}",
+            timeout=300,
+        )
+
+        click.echo("  Building WARP...")
+        _run_warp_command(
+            ["make"],
+            cwd=checkout,
+            label="WARP build",
+            timeout=3600,
+        )
+        click.echo("  Running WARP checks...")
+        _run_warp_command(
+            ["make", "check"],
+            cwd=checkout,
+            label="WARP checks",
+            timeout=3600,
+        )
+
+        cli_name = "waste.exe" if sys.platform == "win32" else "waste"
+        required = [
+            checkout / cli_name,
+            checkout / "serve" / "__main__.py",
+            checkout / _warp_library_name(),
+        ]
+        missing = [str(path.relative_to(checkout)) for path in required if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                "WARP build incomplete; missing required artifact(s): "
+                + ", ".join(missing)
+            )
+
+        bin_dir = prefix / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        wrapper = bin_dir / cli_name
+        if wrapper.exists() and wrapper.is_dir() and not wrapper.is_symlink():
+            raise RuntimeError(f"cannot install WARP CLI: {wrapper} is a directory")
+
+        with tempfile.TemporaryDirectory(
+            prefix=".warp-launcher-", dir=bin_dir
+        ) as launcher_tmpdir:
+            staged_launcher = Path(launcher_tmpdir) / "waste-link"
+            if sys.platform == "win32":
+                shutil.copy2(checkout / cli_name, staged_launcher)
+            else:
+                staged_launcher.symlink_to((dest_dir / cli_name).absolute())
+
+            backup = stage_dir / "previous"
+            had_previous = dest_dir.exists() or dest_dir.is_symlink()
+            if had_previous:
+                os.replace(dest_dir, backup)
+            try:
+                os.replace(checkout, dest_dir)
+            except OSError as exc:
+                rollback_error = None
+                if had_previous:
+                    try:
+                        os.replace(backup, dest_dir)
+                    except OSError as rollback_exc:
+                        rollback_error = rollback_exc
+
+                message = f"could not replace WARP installation: {exc}"
+                if rollback_error is not None:
+                    stage_cleanup.pop_all()
+                    message += (
+                        f"; rollback also failed: {rollback_error}; "
+                        f"recovery files retained at {stage_dir}"
+                    )
+                raise RuntimeError(message) from exc
+
+            try:
+                os.replace(staged_launcher, wrapper)
+            except OSError as exc:
+                rollback_error = None
+                failed_install = stage_dir / "failed-install"
+                try:
+                    os.replace(dest_dir, failed_install)
+                    if had_previous:
+                        os.replace(backup, dest_dir)
+                except OSError as rollback_exc:
+                    rollback_error = rollback_exc
+
+                message = f"could not install WARP CLI launcher: {exc}"
+                if rollback_error is not None:
+                    stage_cleanup.pop_all()
+                    message += (
+                        f"; rollback also failed: {rollback_error}; "
+                        f"recovery files retained at {stage_dir}"
+                    )
+                raise RuntimeError(message) from exc
+
+    click.echo(f"  WARP installed: {dest_dir}")
+    return dest_dir
+
 
 def install_llamacpp(prefix: Path, variant: str = "auto", tag: str | None = None) -> Path:
     """Install llama.cpp.
@@ -778,7 +938,7 @@ def print_model_table(ram_gb: float | None) -> None:
 @click.option("--model", "model_name", type=click.Choice(sorted(KNOWN_MODELS.keys())),
               default=None, help="Model to download (see `litmoe models`)")
 @click.option("--quant", default=None, help="Quantization (default: the model's default_quant if it fits this machine's RAM, else the largest that does)")
-@click.option("--engine", type=click.Choice(["llamacpp", "ktransformers", "both", "none"]),
+@click.option("--engine", type=click.Choice(["llamacpp", "ktransformers", "warp", "both", "none"]),
               default=None, help="Which engine(s) to install (default: the model's engine, else llamacpp)")
 @click.option("--llamacpp-variant", type=click.Choice(LLAMACPP_VARIANTS), default="auto",
               help="llama.cpp release binary variant (auto = cuda if an NVIDIA GPU is visible, else cpu)")
@@ -807,13 +967,14 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
       litmoe install --model kimi-k3                # 594 GB MoE, 768 GB server
       litmoe install --model glm-5.3-flash          # ktransformers (Linux + NVIDIA GPU)
       litmoe install --engine llamacpp --llamacpp-variant cuda
+      litmoe install warp                           # pinned WARP source build
     """
     models_dir = expand_path(models_dir) if models_dir else _default_models_dir()
     prefix = expand_path(prefix) if prefix else _default_prefix()
     config_path = expand_path(config) if config else default_config_path()
 
     for t in targets:
-        if t in ("llamacpp", "ktransformers", "both"):
+        if t in ("llamacpp", "ktransformers", "warp", "both"):
             engine = t if engine is None else engine
         elif lookup(t):
             model_name = t if model_name is None else model_name
@@ -839,6 +1000,14 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
         except Exception as e:
             click.echo(f"  ktransformers install failed: {e}", err=True)
             sys.exit(1)
+    if engine == "warp":
+        click.echo("Installing WARP...")
+        try:
+            install_warp(prefix)
+        except Exception as e:
+            click.echo(f"  WARP install failed: {e}", err=True)
+            sys.exit(1)
+
 
     # 2. Model download
     if not model_name:

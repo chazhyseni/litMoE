@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1100" font-family="-apple-system, system-ui, 'Segoe UI', Roboto, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1330" font-family="-apple-system, system-ui, 'Segoe UI', Roboto, sans-serif">
   <style>
     .title { font-size: 32px; font-weight: 700; fill: #e6edf3; }
     .subtitle { font-size: 16px; fill: #9da7b3; }
@@ -14,11 +14,11 @@
   </style>
 
   <!-- Background -->
-  <rect width="1400" height="1100" fill="#0d1117"/>
+  <rect width="1400" height="1330" fill="#0d1117"/>
 
   <!-- Title -->
   <text x="700" y="50" text-anchor="middle" class="title">litmoe Architecture</text>
-  <text x="700" y="75" text-anchor="middle" class="subtitle">OpenAI-compatible gateway for ktransformers and llama.cpp · no inference code in this repo</text>
+  <text x="700" y="75" text-anchor="middle" class="subtitle">OpenAI-compatible gateway for ktransformers, llama.cpp, and WARP · no inference code in this repo</text>
 
   <!-- CLIENTS layer -->
   <rect x="80" y="120" width="1240" height="80" rx="12" fill="#0d2818" stroke="#2ea043" stroke-width="2"/>
@@ -64,103 +64,127 @@
   <text x="1180" y="388" text-anchor="middle" class="box-text-mono">pass-through</text>
 
   <!-- Note box inside gateway -->
-  <rect x="350" y="430" width="940" height="0" fill="none"/>
-  <text x="900" y="430" text-anchor="middle" class="box-text">request body forwarded to engine.base_url/v1/...  ·  latency added: ~1-5 ms</text>
+  <text x="900" y="420" text-anchor="middle" class="box-text">request body forwarded to engine.base_url/v1/...  ·  latency added: ~1-5 ms</text>
 
-  <!-- Vertical arrows to engines -->
-  <line x1="900" y1="430" x2="350" y2="490" class="arrow"/>
-  <line x1="900" y1="430" x2="1050" y2="490" class="arrow"/>
-  <polygon points="345,488 355,488 350,498" fill="#6e7681"/>
-  <polygon points="1045,488 1055,488 1050,498" fill="#6e7681"/>
-  <text x="220" y="465" class="arrow-text">model: glm-5.3-flash</text>
-  <text x="900" y="465" class="arrow-text">model: gemma-4-26b-a4b</text>
+  <!-- Direct gateway routes to all three engines -->
+  <line x1="700" y1="430" x2="700" y2="455" class="arrow"/>
+  <line x1="260" y1="455" x2="1140" y2="455" class="arrow"/>
+  <line x1="260" y1="455" x2="260" y2="492" class="arrow"/>
+  <line x1="700" y1="455" x2="700" y2="492" class="arrow"/>
+  <line x1="1140" y1="455" x2="1140" y2="492" class="arrow"/>
+  <polygon points="255,490 265,490 260,500" fill="#6e7681"/>
+  <polygon points="695,490 705,490 700,500" fill="#6e7681"/>
+  <polygon points="1135,490 1145,490 1140,500" fill="#6e7681"/>
+  <text x="70" y="482" class="arrow-text">model: glm-5.3-flash</text>
+  <text x="510" y="482" class="arrow-text">model: gemma-4-26b-a4b</text>
+  <text x="950" y="482" class="arrow-text">model: glm-5.3-flash-warp</text>
 
-  <!-- ENGINES layer -->
-  <rect x="80" y="500" width="600" height="320" rx="12" fill="#1a0d1d" stroke="#a371f7" stroke-width="2"/>
-  <text x="380" y="530" text-anchor="middle" class="section-title">ktransformers engine</text>
-  <text x="380" y="548" text-anchor="middle" class="box-text-mono">spawned by: sglang.launch_server · port from gateway (8082+)</text>
+  <!-- ENGINES layer: three first-class peers -->
+  <rect x="50" y="500" width="420" height="450" rx="12" fill="#1a0d1d" stroke="#a371f7" stroke-width="2"/>
+  <text x="260" y="532" text-anchor="middle" class="section-title">ktransformers engine</text>
+  <text x="260" y="552" text-anchor="middle" class="box-text-mono">sglang.launch_server · gateway-assigned port</text>
 
-  <!-- ktransformers inner -->
-  <rect x="110" y="570" width="260" height="120" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="240" y="595" text-anchor="middle" class="box-title">GPU backend (sglang-kt)</text>
-  <text x="240" y="615" text-anchor="middle" class="box-text">hot experts → VRAM</text>
-  <text x="240" y="633" text-anchor="middle" class="box-text">cold experts → CPU</text>
-  <text x="240" y="651" text-anchor="middle" class="box-text">async offload scheduler</text>
-  <text x="240" y="669" text-anchor="middle" class="box-text">3-layer (GPU-CPU-Disk)</text>
-  <text x="240" y="687" text-anchor="middle" class="box-text-mono">5-50 t/s typical</text>
+  <rect x="70" y="570" width="380" height="160" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="260" y="595" text-anchor="middle" class="box-title">GPU + CPU expert backends</text>
+  <text x="90" y="615" class="box-text">GPU (sglang-kt): hot experts → VRAM</text>
+  <text x="90" y="635" class="box-text">cold experts → CPU · async offload scheduler</text>
+  <text x="90" y="655" class="box-text">3-layer GPU / CPU / disk scheduling</text>
+  <text x="90" y="675" class="box-text">CPU (kt-kernel): AMX · AVX-512 · AVX2</text>
+  <text x="90" y="695" class="box-text-mono">5–50 t/s typical with GPU attention</text>
+  <text x="90" y="715" class="box-text-mono">9–13 t/s: Gemma-4-26B-A4B / 24-core AVX2</text>
 
-  <rect x="390" y="570" width="260" height="120" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="520" y="595" text-anchor="middle" class="box-title">CPU backend (kt-kernel)</text>
-  <text x="520" y="615" text-anchor="middle" class="box-text">auto-detects:</text>
-  <text x="520" y="633" text-anchor="middle" class="box-text">· AMX (Intel Sapphire+)</text>
-  <text x="520" y="651" text-anchor="middle" class="box-text">· AVX-512 (Skylake+)</text>
-  <text x="520" y="669" text-anchor="middle" class="box-text">· AVX2 (universal)</text>
-  <text x="520" y="687" text-anchor="middle" class="box-text-mono">9-13 t/s Gemma-4-26B-A4B on a 24-core AVX2 CPU</text>
+  <rect x="70" y="745" width="380" height="185" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="260" y="770" text-anchor="middle" class="box-title">Install + upstream</text>
+  <text x="90" y="792" class="box-text-mono">CPU: pip install kt-kernel</text>
+  <text x="90" y="812" class="box-text-mono">GPU: pip install kt-kernel sglang-kt</text>
+  <text x="90" y="834" class="box-text">github.com/kvcache-ai/ktransformers · Apache 2.0</text>
+  <text x="90" y="854" class="box-text">MADSys Lab / Approaching.AI · SOSP 2025</text>
+  <text x="90" y="876" class="box-text">GLM-5.3-Flash native support (Aug 2026)</text>
+  <text x="90" y="896" class="box-text">Kimi-K2.5 / K2.6 RAWINT4 (Sep 2026)</text>
 
-  <rect x="110" y="710" width="540" height="92" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="380" y="735" text-anchor="middle" class="box-title">pip install kt-kernel</text>
-  <text x="380" y="755" text-anchor="middle" class="box-text-mono">CPU: one line · GPU: pip install kt-kernel sglang-kt</text>
-  <text x="380" y="773" text-anchor="middle" class="box-text">repo: github.com/kvcache-ai/ktransformers (MADSys Lab / Approaching.AI, SOSP 2025)</text>
-  <text x="380" y="791" text-anchor="middle" class="box-text">GLM-5.3-Flash native (Aug 2026) · Kimi-K2.5/K2.6 RAWINT4 (Sep 2026)</text>
+  <rect x="490" y="500" width="420" height="450" rx="12" fill="#1a0d12" stroke="#db61a2" stroke-width="2"/>
+  <text x="700" y="532" text-anchor="middle" class="section-title">llama.cpp engine</text>
+  <text x="700" y="552" text-anchor="middle" class="box-text-mono">llama-server · gateway-assigned port</text>
 
-  <rect x="700" y="500" width="620" height="320" rx="12" fill="#1a0d12" stroke="#db61a2" stroke-width="2"/>
-  <text x="1010" y="530" text-anchor="middle" class="section-title">llama.cpp engine</text>
-  <text x="1010" y="548" text-anchor="middle" class="box-text-mono">spawned by: llama-server · default port :8081</text>
+  <rect x="510" y="570" width="380" height="160" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="700" y="595" text-anchor="middle" class="box-title">Backends</text>
+  <text x="530" y="615" class="box-text">CUDA · HIP (AMD) · Metal (Apple)</text>
+  <text x="530" y="635" class="box-text">Vulkan · SYCL · CANN (Ascend)</text>
+  <text x="530" y="655" class="box-text">CPU+GPU hybrid offload</text>
+  <text x="530" y="675" class="box-text-mono">--n-gpu-layers N (0 = CPU)</text>
+  <text x="530" y="695" class="box-text-mono">~10 t/s on AVX2 DDR4</text>
+  <text x="530" y="715" class="box-text-mono">tens of t/s on Apple Silicon</text>
 
-  <rect x="730" y="570" width="280" height="120" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="870" y="595" text-anchor="middle" class="box-title">Backends</text>
-  <text x="870" y="615" text-anchor="middle" class="box-text">CUDA · HIP (AMD) · Metal (Apple)</text>
-  <text x="870" y="633" text-anchor="middle" class="box-text">Vulkan · SYCL · CANN (Ascend)</text>
-  <text x="870" y="651" text-anchor="middle" class="box-text">CPU+GPU hybrid offload</text>
-  <text x="870" y="669" text-anchor="middle" class="box-text">--n-gpu-layers N (or 0 = CPU)</text>
-  <text x="870" y="687" text-anchor="middle" class="box-text-mono">~10 t/s on AVX2 DDR4, tens of t/s on Apple Silicon</text>
+  <rect x="510" y="740" width="380" height="195" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="700" y="765" text-anchor="middle" class="box-title">Quantization + install</text>
+  <text x="530" y="787" class="box-text">GGUF · 1.5 / 2 / 3 / 4 / 5 / 6 / 8-bit</text>
+  <text x="530" y="806" class="box-text">Gemma-4-26B-A4B UD-Q4_K_XL = 17 GB</text>
+  <text x="530" y="825" class="box-text">Kimi-K3 UD-IQ1_S = 594 GB</text>
+  <text x="530" y="844" class="box-text">17 GB default fits a 24 GB GPU or 48 GB laptop</text>
+  <text x="530" y="863" class="box-text-mono">cmake -B build -DGGML_CUDA=ON</text>
+  <text x="530" y="882" class="box-text-mono">cmake --build build</text>
+  <text x="530" y="901" class="box-text">github.com/ggml-org/llama.cpp · MIT</text>
+  <text x="530" y="920" class="box-text">Most mature cross-platform local LLM server</text>
 
-  <rect x="1030" y="570" width="280" height="120" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="1170" y="595" text-anchor="middle" class="box-title">Quantization</text>
-  <text x="1170" y="615" text-anchor="middle" class="box-text">1.5 / 2 / 3 / 4 / 5 / 6 / 8-bit</text>
-  <text x="1170" y="633" text-anchor="middle" class="box-text">via GGUF format</text>
-  <text x="1170" y="651" text-anchor="middle" class="box-text">ex: Gemma-4-26B-A4B UD-Q4_K_XL = 17 GB</text>
-  <text x="1170" y="669" text-anchor="middle" class="box-text">ex: Kimi-K3 UD-IQ1_S = 594 GB</text>
-  <text x="1170" y="687" text-anchor="middle" class="box-text-mono">17 GB default fits a 24 GB GPU or a 48 GB laptop</text>
+  <rect x="930" y="500" width="420" height="450" rx="12" fill="#0d1f24" stroke="#39c5cf" stroke-width="2"/>
+  <text x="1140" y="532" text-anchor="middle" class="section-title">WARP engine</text>
+  <text x="1140" y="552" text-anchor="middle" class="box-text-mono">serve/__main__.py · gateway-assigned loopback port</text>
 
-  <rect x="730" y="710" width="580" height="92" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="1020" y="735" text-anchor="middle" class="box-title">build from source or pre-built release</text>
-  <text x="1020" y="755" text-anchor="middle" class="box-text-mono">cmake -B build -DGGML_CUDA=ON · cmake --build build</text>
-  <text x="1020" y="773" text-anchor="middle" class="box-text">repo: github.com/ggml-org/llama.cpp (ggml-org community, MIT)</text>
-  <text x="1020" y="791" text-anchor="middle" class="box-text">Most mature cross-platform LLM server</text>
+  <rect x="950" y="570" width="380" height="160" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="1140" y="595" text-anchor="middle" class="box-title">Local storage-paged runtime</text>
+  <text x="970" y="615" class="box-text-mono">existing local .waste container</text>
+  <text x="970" y="635" class="box-text">binds 127.0.0.1 on the assigned port</text>
+  <text x="970" y="655" class="box-text">memory-mapped expert weights</text>
+  <text x="970" y="675" class="box-text">paging from fast local storage</text>
+  <text x="970" y="695" class="box-text">low resident floor · internal NVMe preferred</text>
+  <text x="970" y="715" class="box-text">WARP owns the forward pass and storage policy</text>
+
+  <rect x="950" y="745" width="380" height="185" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="1140" y="770" text-anchor="middle" class="box-title">Pinned source install</text>
+  <text x="970" y="792" class="box-text-mono">litmoe install --engine warp</text>
+  <text x="970" y="812" class="box-text">clones an exact upstream source revision</text>
+  <text x="970" y="832" class="box-text">builds with make · verifies with make check</text>
+  <text x="970" y="852" class="box-text">installs source + server + shared library</text>
+  <text x="970" y="872" class="box-text-mono">libwaste.so · libwaste.dylib · libwaste.dll</text>
+  <text x="970" y="892" class="box-text">No automatic model download or conversion</text>
+  <text x="970" y="912" class="box-text">Create or acquire containers with upstream tools</text>
 
   <!-- Bottom: models.yaml and CLI -->
-  <line x1="700" y1="820" x2="700" y2="860" class="arrow"/>
-  <polygon points="695,858 705,858 700,868" fill="#6e7681"/>
+  <line x1="700" y1="950" x2="700" y2="980" class="arrow"/>
+  <polygon points="695,980 705,980 700,990" fill="#6e7681"/>
 
-  <rect x="80" y="870" width="620" height="200" rx="12" fill="#1c2128" stroke="#30363d" stroke-width="2"/>
-  <text x="110" y="900" class="section-title">models.yaml</text>
-  <text x="110" y="922" class="box-text">read once at startup; drives engine selection</text>
+  <rect x="80" y="995" width="620" height="270" rx="12" fill="#1c2128" stroke="#30363d" stroke-width="2"/>
+  <text x="110" y="1025" class="section-title">models.yaml</text>
+  <text x="110" y="1047" class="box-text">read once at startup; drives engine selection and assigned ports</text>
 
   <g font-family="SF Mono, Monaco, Consolas, monospace" font-size="13" fill="#c9d1d9">
-    <text x="110" y="950">host: 127.0.0.1</text>
-    <text x="110" y="970">port: 8080</text>
-    <text x="110" y="990">models:</text>
-    <text x="130" y="1010">- id: glm-5.3-flash</text>
-    <text x="160" y="1030">engine: ktransformers</text>
-    <text x="160" y="1050">model_path: /data/ds3</text>
+    <text x="110" y="1075">host: 127.0.0.1</text>
+    <text x="110" y="1096">port: 8080</text>
+    <text x="110" y="1117">models:</text>
+    <text x="130" y="1138">- id: glm-5.3-flash-warp</text>
+    <text x="160" y="1159">engine: warp</text>
+    <text x="160" y="1180">model_path: ~/models/glm53.waste</text>
+    <text x="160" y="1201">n_ctx: 0  # preserve container default</text>
+    <text x="160" y="1222">extra_args: ["--no-thinking"]</text>
   </g>
 
-  <rect x="720" y="870" width="600" height="200" rx="12" fill="#0a1420" stroke="#58a6ff" stroke-width="2"/>
-  <text x="750" y="900" class="section-title">litmoe CLI</text>
-  <text x="750" y="920" class="box-text-mono">litmoe/cli/main.py · Click</text>
+  <rect x="720" y="995" width="600" height="270" rx="12" fill="#0a1420" stroke="#58a6ff" stroke-width="2"/>
+  <text x="750" y="1025" class="section-title">litmoe CLI</text>
+  <text x="750" y="1047" class="box-text-mono">litmoe/cli/main.py · Click · three-engine lifecycle</text>
 
   <g font-family="SF Mono, Monaco, Consolas, monospace" font-size="13" fill="#c9d1d9">
-    <text x="750" y="950">litmoe doctor         # CPU/GPU/RAM + engine check</text>
-    <text x="750" y="972">litmoe init           # models.yaml, fast default for this RAM</text>
-    <text x="750" y="994">litmoe install        # install engines + download models</text>
-    <text x="750" y="1016">litmoe serve          # start gateway + engines</text>
-    <text x="750" y="1038">litmoe status         # poll /health</text>
-    <text x="750" y="1060">litmoe stop           # stop engines litmoe started</text>
-    <text x="750" y="1082">litmoe models         # catalog by RAM tier</text>
+    <text x="750" y="1075">litmoe doctor              # hardware + all engines</text>
+    <text x="750" y="1096">litmoe init                # config + catalog default</text>
+    <text x="750" y="1117">litmoe install --engine warp  # pinned runtime only</text>
+    <text x="750" y="1138">litmoe install --model ID  # llama.cpp / ktransformers catalog</text>
+    <text x="750" y="1159">litmoe serve               # gateway + configured engines</text>
+    <text x="750" y="1180">litmoe status              # poll /health</text>
+    <text x="750" y="1201">litmoe stop                # stop litmoe-started engines</text>
+    <text x="750" y="1222">litmoe models              # catalog; WARP remains local-only</text>
   </g>
 
   <!-- Legend -->
-  <text x="80" y="1075" class="box-text" fill="#8b949e">ktransformers: github.com/kvcache-ai/ktransformers · MADSys Lab (Tsinghua) / Approaching.AI · SOSP 2025 · Apache 2.0 · litmoe: no inference code</text>
+  <text x="80" y="1292" class="box-text" fill="#8b949e">Inference engines: ktransformers · llama.cpp · WARP  |  litmoe: routing, translation, configuration, and lifecycle; no forward-pass code.</text>
+  <text x="80" y="1314" class="box-text" fill="#8b949e">WARP: existing local .waste containers · pinned source runtime · no automatic model download or conversion.</text>
 
 </svg>

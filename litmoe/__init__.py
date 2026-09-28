@@ -1,4 +1,4 @@
-"""litmoe - OpenAI-compatible gateway for llama.cpp and ktransformers.
+"""litmoe - OpenAI- and Anthropic-compatible gateway for local inference.
 
 This is a thin orchestration layer. It does NOT contain inference code.
 For inference, it dispatches to:
@@ -7,6 +7,8 @@ For inference, it dispatches to:
 - ktransformers (https://github.com/kvcache-ai/ktransformers) - sglang-kt with
   kt-kernel CPU expert offload for native FP8/INT4 MoE checkpoints
   (Linux + NVIDIA GPU)
+- WARP (https://github.com/sqliteai/warp) - the upstream local runtime for
+  existing .waste containers; litmoe only supervises its loopback server
 """
 
 __version__ = "0.2.0"

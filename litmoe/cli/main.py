@@ -14,7 +14,7 @@ import yaml
 from litmoe import __version__
 from litmoe.cli.install import install_cmd, print_model_table
 from litmoe.config import default_config_path, expand_path, load_config
-from litmoe.engines import kt_installed, llama_installed
+from litmoe.engines import kt_installed, llama_installed, warp_installed
 from litmoe.models import (_OS_HEADROOM_GB, CLAUDE_ALIASES, DEFAULT_MODEL, KNOWN_MODELS, fit_together,
                            largest_quant_that_fits, quant_size_gb, recommended_for_ram, smallest_gguf_model)
 from litmoe.platform_utils import (
@@ -32,7 +32,7 @@ from litmoe.platform_utils import (
 @click.group()
 @click.version_option(version=__version__, prog_name="litmoe")
 def cli():
-    """litmoe - OpenAI-compatible gateway for llama.cpp and ktransformers"""
+    """litmoe - OpenAI-compatible gateway for llama.cpp, ktransformers, and WARP"""
     pass
 
 
@@ -105,6 +105,10 @@ def doctor():
         from litmoe.engines.ktransformers import missing_components
         click.echo(f"  ktransformers: NOT installed — missing {', '.join(missing_components())} "
                    f"(litmoe install --engine ktransformers)")
+    if warp_installed():
+        click.echo("  WARP: installed (serves local .waste containers)")
+    else:
+        click.echo("  WARP: NOT installed (litmoe install --engine warp)")
 
     click.echo()
     click.echo("=== Recommendation ===")
@@ -313,12 +317,13 @@ def status(config):
 
 @cli.command()
 @click.option("--all", "kill_all", is_flag=True,
-              help="Also SIGTERM any llama-server / sglang process not started by litmoe")
+              help="Also SIGTERM any llama-server, sglang, ktransformers, or WARP process not started by litmoe")
 def stop(kill_all):
     """Stop the engines litmoe started (from ~/.litmoe/run/*.pid).
 
-    Only litmoe's own engine processes are touched, so an Ollama, LM Studio or
-    manually launched llama-server keeps running. Use --all to override.
+    Only litmoe's own engine processes are touched, so manually launched engine
+    servers keep running. Use --all to include llama.cpp, sglang, ktransformers,
+    and WARP processes.
     """
     from litmoe.engines.base import pid_dir
 
@@ -342,7 +347,12 @@ def stop(kill_all):
         pidfile.unlink(missing_ok=True)
 
     if kill_all:
-        patterns = ["llama-server", "sglang.launch_server", "kt run"]
+        patterns = [
+            "llama-server",
+            "sglang.launch_server",
+            "kt run",
+            r"warp/serve/__main__[.]py",
+        ]
         for pattern in patterns:
             result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
             for pid in result.stdout.split():

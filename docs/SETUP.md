@@ -1,15 +1,15 @@
 # Setup Guide
 
 Installing an engine, picking a model that fits your machine, and connecting
-your tools. Model sizes and quant lists come from `litmoe/models.py`, which
-was checked against the HuggingFace API on 2026-09-16; run `litmoe models`
-for the live version of every table below.
+your tools. Catalog model sizes and quant lists come from `litmoe/models.py`,
+which was checked against the HuggingFace API on 2026-09-16; run
+`litmoe models` for the live version of the catalog tables below.
 
 ## Prerequisites
 
 - Python 3.10+
 - Linux or macOS (Apple Silicon: Metal). Windows via WSL2.
-- Disk: 20–70 GB for a laptop-tier model; hundreds of GB for server tiers.
+- Disk: 20–70 GB for a laptop-tier catalog model; hundreds of GB for server tiers or WARP containers.
 
 > **macOS with several Pythons (Homebrew + conda):** install and run litmoe
 > with the *same* interpreter, or the entry point may start under a Python
@@ -51,26 +51,63 @@ litmoe install --engine ktransformers     # PyPI wheels for kt-kernel + sglang-k
 Not available on macOS (triton/CUDA dependency). Requires a CUDA GPU; the
 upstream tutorials target SM90 (H100/H20) but SM80/SM86 work for most models.
 
+### WARP (local `.waste` containers)
+
+WARP memory-maps local containers and pages expert weights from storage. litmoe
+starts its upstream OpenAI-compatible server on a loopback port and supervises
+the process; WARP performs inference locally. There is no remote inference API.
+
+```bash
+litmoe install --engine warp
+```
+
+The installer clones the upstream WARP repository at commit
+`09fcff352ca55223b08ee222d15054b90546c6a9`, runs `make` and `make check`, and
+installs it under `$LITMOE_PREFIX/lib/warp` (default
+`~/.local/lib/warp`). The build needs `git` and `make`. The installed shared
+library is `libwaste.so` on Linux, `libwaste.dylib` on macOS, or
+`libwaste.dll` on Windows.
+
+This command installs only the runtime. It deliberately does not download or
+convert weights. WARP entries must point to an existing local `.waste`
+container created or acquired with upstream WARP tooling; these containers are
+not in litmoe's catalog and `litmoe install --model` cannot fetch them.
+
+Upstream WARP reports these figures; they are not litmoe measurements or
+guarantees:
+
+| Container | Upstream size | Upstream resident floor | Upstream throughput |
+|---|---:|---:|---:|
+| GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
+| DeepSeek-V4.1-Flash | 299 GB | 4.86 GB | about 3.7 tok/s |
+
+The published throughput assumes internal NVMe; this repository's current
+persistent disk is not equivalent. Converting GLM-5.3-Flash also requires
+306 GiB for source-weight staging plus 112 GB for the output container.
+
 ## Step 3: Pick a model for your RAM
 
-`litmoe models` prints the catalog grouped by tier and marks what fits this
-machine. `litmoe install --model <id>` downloads the default quant when it
-fits your RAM budget, otherwise the largest quant that does (`--quant <Q>`
-overrides), and adds it to `models.yaml` with a memory-aware context size.
+`litmoe models` prints the llama.cpp and ktransformers catalog grouped by tier
+and marks what fits this machine. `litmoe install --model <id>` downloads the
+default quant when it fits your RAM budget, otherwise the largest quant that
+does (`--quant <Q>` overrides), and adds it to `models.yaml` with a
+memory-aware context size. WARP containers are local-only and are not included.
 
 RAM column = weights × 1.10 (mmap + compute buffers) + KV cache at 32K tokens
 + 6 GB headroom. macOS gets 75 % of physical RAM as its budget (unified memory
 shared with the OS/GPU). All laptop-tier models are MoEs with 3–5 B active
 parameters or ≤ 31 B dense — the ones that are actually fast on CPU/Metal.
 
-`litmoe serve` loads **every** entry in `models.yaml` at once, so the entries
-must fit *together*. `litmoe init` only writes a set that does, and `litmoe
-install --model` warns when adding one breaks that. At start, `serve` sizes the
-selected set against two limits: the GPU budget (75 % of RAM on macOS) and
-usable RAM (90 % minus 3 GB). Over the first but under the second it starts
-with a warning — llama.cpp keeps the overflow on the CPU, so it is slower. Over
-RAM it refuses and names a model or quant that does fit. Serve a subset with
-`litmoe serve <id> [<id2>…]` (or `--model`), or `--force` to start regardless.
+`litmoe serve` loads **every** entry in `models.yaml` at once. For catalogued
+models, entries must fit together: `litmoe init` only writes a set that does,
+and `litmoe install --model` warns when adding one breaks that. At start,
+`serve` checks two limits: the GPU budget (75 % of RAM on macOS) and usable
+RAM (90 % minus 3 GB). Over the first but under the second it starts with a
+warning — llama.cpp keeps the overflow on the CPU, so it is slower. Over RAM
+it refuses and names a catalog model or quant that does fit. A WARP entry with
+`n_ctx: 0` instead preserves its container default and lets WARP size its
+memory budget. Serve a subset with `litmoe serve <id> [<id2>…]` (or
+`--model`), or `--force` to start regardless.
 
 ### 48 GB laptop — default tier
 
@@ -163,8 +200,10 @@ those figures are not reproducible from the repo and are no longer cited.
 
 ## Step 4: models.yaml
 
-`litmoe install --model` writes entries like these; `litmoe init` creates the
-file with the default model and Claude-name aliases.
+`litmoe install --model` writes catalog entries like the first two below;
+WARP entries are added manually with an existing local `.waste` path.
+`litmoe init` creates the file with the default catalog model and Claude-name
+aliases.
 
 ```yaml
 host: 127.0.0.1
@@ -187,21 +226,35 @@ models:
     kt_num_gpu_experts: 8
     kt_cpuinfer: 48
     extra_args: ["--tool-call-parser", "glm47", "--reasoning-parser", "glm45"]
+
+  - id: glm-5.3-flash-warp
+    engine: warp
+    model_path: ~/models/glm53.waste
+    n_ctx: 0                   # preserve the container default; WARP sizes its memory budget
+    extra_args: ["--no-thinking"]
+
+  - id: deepseek-v4.1-flash-warp
+    engine: warp
+    model_path: ~/models/deepseek-v4.1-flash.waste
+    n_ctx: 0
 ```
 
 Field reference (see `litmoe/config.py`):
 
 | Field | Engine | Meaning |
 |---|---|---|
-| `model_path` | both | GGUF file/dir, `repo:QUANT` HF spec, or safetensors dir |
+| `model_path` | llama.cpp | local GGUF file/dir or `repo:QUANT` HuggingFace spec |
+| `model_path` | ktransformers | local safetensors directory or HuggingFace repo id |
+| `model_path` | WARP | existing local `.waste` container; never downloaded by litmoe |
 | `n_ctx` | llama.cpp | context; `0` = memory-aware native |
+| `n_ctx` | WARP | `0` omits `--ctx`, preserving the container default so WARP sizes its memory budget; positive values pass `--ctx N` |
 | `n_gpu_layers` | llama.cpp | `-ngl` |
-| `extra_args` | both | passed through verbatim to `llama-server` / `sglang.launch_server` (`-t N` overrides the physical-core thread default) |
-| `env` | both | extra environment for the engine process only |
-| `kt_method` | kt | CPU expert backend: `FP8`, `FP8_PERCHANNEL`, `BF16`, `RAWINT4`, `MXFP4`, `MXFP8` (AVX-512); `AMXINT4`, `AMXINT8` (Intel AMX); `LLAMAFILE` (AVX2, GGUF experts via `gguf_path`) |
-| `kt_num_gpu_experts` | kt | experts pinned on GPU |
-| `kt_cpuinfer` / `kt_threadpool_count` | kt | CPU threads for expert compute (default physical cores) / thread pools (default NUMA nodes) |
-| `aliases` | both | additional model ids that route here |
+| `extra_args` | all | passed through verbatim to the selected engine; WARP accepts upstream flags including `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify` |
+| `env` | all | extra environment for the engine process only |
+| `kt_method` | ktransformers | CPU expert backend: `FP8`, `FP8_PERCHANNEL`, `BF16`, `RAWINT4`, `MXFP4`, `MXFP8` (AVX-512); `AMXINT4`, `AMXINT8` (Intel AMX); `LLAMAFILE` (AVX2, GGUF experts via `gguf_path`) |
+| `kt_num_gpu_experts` | ktransformers | experts pinned on GPU |
+| `kt_cpuinfer` / `kt_threadpool_count` | ktransformers | CPU threads for expert compute (default physical cores) / thread pools (default NUMA nodes) |
+| `aliases` | all | additional model ids that route here |
 
 ## Step 5: Run
 
@@ -220,8 +273,9 @@ per start.
 
 Environment variables litmoe reads (all optional, all `LITMOE_*` — it never
 reads or sets `ANTHROPIC_*` / `OPENAI_*`): `LITMOE_CONFIG` (models.yaml path),
-`LITMOE_MODELS_DIR`, `LITMOE_PREFIX` (engine install prefix), `LITMOE_RUN_DIR`
-(PID files), `LITMOE_READY_TIMEOUT`, `LITMOE_LLAMACPP_TAG` (pin a release).
+`LITMOE_MODELS_DIR`, `LITMOE_PREFIX` (engine install prefix),
+`LITMOE_WARP_DIR` (override the WARP source root), `LITMOE_RUN_DIR` (PID
+files), `LITMOE_READY_TIMEOUT`, and `LITMOE_LLAMACPP_TAG` (pin a release).
 
 ## Step 6: Connect Claude Code / Hermes / Open WebUI
 

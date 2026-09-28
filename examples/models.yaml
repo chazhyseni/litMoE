@@ -2,8 +2,9 @@
 # Copy to models.yaml (or run `litmoe init`) and uncomment what fits your machine.
 # `litmoe models` shows the full catalog with what fits THIS host.
 #
-# Every entry starts with the model's native context; litmoe lowers n_ctx at
-# start-up if RAM cannot hold weights + KV cache for it.
+# Catalog entries start with the model's native context; litmoe lowers n_ctx
+# at start-up if RAM cannot hold weights + KV cache. WARP uses different
+# semantics: n_ctx: 0 preserves the .waste container default.
 
 host: 127.0.0.1
 port: 8080
@@ -50,6 +51,29 @@ models:
   #   model_path: unsloth/Qwen3.5-122B-A10B-GGUF:UD-IQ4_XS
   #   n_gpu_layers: -1
   #   n_ctx: 262144
+
+  # ── WARP local containers (not in the litmoe model catalog) ─────────────────
+  # Install the runtime with `litmoe install --engine warp`, then create or
+  # acquire these .waste containers with upstream WARP tooling. The published
+  # throughput requires internal NVMe; network/persistent disks are not equal.
+  #
+  # GLM-5.3-Flash — upstream: 112 GB container, 5.14 GB resident floor,
+  # 3.32 tok/s short / 3.86 tok/s long on a 64 GB M5 Pro.
+  # - id: glm-5.3-flash-warp
+  #   engine: warp
+  #   model_path: ~/models/glm53.waste
+  #   n_ctx: 0                    # preserve container default; WARP sizes its memory budget
+  #   extra_args: ["--no-thinking"]
+  #
+  # DeepSeek-V4.1-Flash — upstream: 299 GB container, 4.86 GB resident floor,
+  # about 3.7 tok/s.
+  # - id: deepseek-v4.1-flash-warp
+  #   engine: warp
+  #   model_path: ~/models/deepseek-v4.1-flash.waste
+  #   n_ctx: 0
+  #
+  # WARP extra_args are passed through verbatim; upstream flags include
+  # --budget, --threads, --cpus, --cache, --vision, and --verify.
 
   # ── 192 GB workstation ────────────────────────────────────────────────────
   # DeepSeek-V4-Flash — MoE (MLA), 1M ctx. 155 GB → ~179 GB.

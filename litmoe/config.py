@@ -59,9 +59,10 @@ def expand_model_paths(entry_dict: dict) -> dict:
 class ModelEntry(BaseModel):
     """A model exposed via the OpenAI API."""
     id: str  # OpenAI model id (e.g. "kimi-k3")
-    engine: Literal["ktransformers", "llamacpp"]
+    engine: Literal["ktransformers", "llamacpp", "warp"]
     # llamacpp: local GGUF path, HF repo spec (owner/repo[:quant]) or URL.
     # ktransformers: local safetensors directory or HF repo id (owner/repo).
+    # warp: local .waste container.
     model_path: str
     # ktransformers only: GGUF directory for the LLAMAFILE CPU backend (--kt-weight-path).
     gguf_path: str | None = None

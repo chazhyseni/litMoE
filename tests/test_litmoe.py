@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -228,6 +229,191 @@ def test_ktransformers_llamafile_needs_gguf_and_bad_method_rejected():
         none.build_command()
 
 
+def _fake_warp_root(tmp_path: Path) -> Path:
+    root = tmp_path / "warp"
+    (root / "serve").mkdir(parents=True)
+    (root / "serve" / "__main__.py").write_text("")
+    library = "libwaste.dylib" if sys.platform == "darwin" else (
+        "libwaste.dll" if sys.platform == "win32" else "libwaste.so"
+    )
+    (root / library).write_bytes(b"library")
+    return root
+
+
+def test_warp_command_uses_local_container_and_upstream_server(tmp_path, monkeypatch):
+    from litmoe.engines import make_engine
+    from litmoe.engines.warp import WarpEngine
+
+    root = _fake_warp_root(tmp_path)
+    model_path = tmp_path / "models" / "glm53.waste"
+    model_path.mkdir(parents=True)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+
+    model = ModelEntry(
+        id="glm-5.3-flash-warp",
+        engine="warp",
+        model_path=str(model_path),
+        n_ctx=0,
+        extra_args=["--threads", "8", "--no-thinking"],
+    )
+    eng = make_engine(model)
+    assert isinstance(eng, WarpEngine)
+    eng.set_port(8087)
+    assert eng.build_command() == [
+        sys.executable,
+        str(root / "serve" / "__main__.py"),
+        str(model_path),
+        "--host", "127.0.0.1",
+        "--port", "8087",
+        "--model-id", "glm-5.3-flash-warp",
+        "--threads", "8",
+        "--no-thinking",
+    ]
+    assert eng.health_url() == "http://127.0.0.1:8087/health"
+
+
+def test_warp_command_passes_explicit_context(tmp_path, monkeypatch):
+    from litmoe.engines.warp import WarpEngine
+
+    root = _fake_warp_root(tmp_path)
+    model_path = tmp_path / "models" / "ds41.waste"
+    model_path.mkdir(parents=True)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+
+    eng = WarpEngine(ModelEntry(
+        id="deepseek-v4.1-flash-warp",
+        engine="warp",
+        model_path=str(model_path),
+        n_ctx=32768,
+    ))
+    cmd = eng.build_command()
+    assert cmd[cmd.index("--ctx") + 1] == "32768"
+
+
+def test_warp_reports_missing_installation_and_container(tmp_path, monkeypatch):
+    from litmoe.engines.warp import WarpEngine, is_installed
+
+    missing_root = tmp_path / "missing-warp"
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(missing_root))
+    monkeypatch.setattr(shutil, "which", lambda *_: None)
+    model = ModelEntry(id="glm-warp", engine="warp", model_path=str(tmp_path / "glm53.waste"))
+    with pytest.raises(FileNotFoundError, match="litmoe install --engine warp"):
+        WarpEngine(model).build_command()
+    assert not is_installed()
+
+    root = _fake_warp_root(tmp_path)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    with pytest.raises(FileNotFoundError, match="WARP container not found"):
+        WarpEngine(model).build_command()
+
+
+def test_warp_requires_shared_library(tmp_path, monkeypatch):
+    from litmoe.engines.warp import WarpEngine
+
+    root = tmp_path / "warp"
+    (root / "serve").mkdir(parents=True)
+    (root / "serve" / "__main__.py").write_text("")
+    model_path = tmp_path / "glm53.waste"
+    model_path.mkdir()
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+
+    with pytest.raises(FileNotFoundError, match="libwaste"):
+        WarpEngine(ModelEntry(
+            id="glm-warp", engine="warp", model_path=str(model_path)
+        )).build_command()
+
+
+def test_warp_invalid_override_falls_back_to_prefix(tmp_path, monkeypatch):
+    from litmoe.engines.warp import WarpEngine
+
+    prefix = tmp_path / "prefix"
+    root = _fake_warp_root(prefix / "lib")
+    stale = tmp_path / "stale"
+    (stale / "serve").mkdir(parents=True)
+    (stale / "serve" / "__main__.py").write_text("")
+    model_path = tmp_path / "glm53.waste"
+    model_path.mkdir()
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(stale))
+    monkeypatch.setenv("LITMOE_PREFIX", str(prefix))
+    monkeypatch.setattr(shutil, "which", lambda *_: None)
+
+    cmd = WarpEngine(ModelEntry(
+        id="glm-warp", engine="warp", model_path=str(model_path), n_ctx=0
+    )).build_command()
+    assert cmd[1] == str(root / "serve" / "__main__.py")
+
+def test_warp_path_launcher_discovers_sibling_prefix_install(tmp_path, monkeypatch):
+    import litmoe.engines.warp as warp
+
+    prefix = tmp_path / "prefix"
+    root = _fake_warp_root(prefix / "lib")
+    launcher = prefix / "bin" / "waste.exe"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes(b"executable")
+    model_path = tmp_path / "glm53.waste"
+    model_path.mkdir()
+    monkeypatch.delenv("LITMOE_WARP_DIR", raising=False)
+    monkeypatch.delenv("LITMOE_PREFIX", raising=False)
+    monkeypatch.setattr(warp.shutil, "which", lambda *_: str(launcher))
+
+    command = warp.WarpEngine(ModelEntry(
+        id="glm-warp", engine="warp", model_path=str(model_path), n_ctx=0
+    )).build_command()
+
+    assert command[1] == str(root / "serve" / "__main__.py")
+
+
+
+
+def test_warp_installation_probe_never_raises(monkeypatch):
+    from litmoe.engines.warp import is_installed
+
+    monkeypatch.delenv("LITMOE_WARP_DIR", raising=False)
+    monkeypatch.delenv("LITMOE_PREFIX", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda *_: None)
+
+    def no_home():
+        raise RuntimeError("home is unavailable")
+
+    monkeypatch.setattr(Path, "home", no_home)
+    assert not is_installed()
+
+
+
+def test_warp_uses_upstream_windows_library_name(monkeypatch):
+    import litmoe.engines.warp as warp
+
+    monkeypatch.setattr(warp.sys, "platform", "win32")
+    assert warp._library_name() == "libwaste.dll"
+
+def test_warp_child_environment_uses_validated_library_without_upstream_auth(
+    tmp_path, monkeypatch,
+):
+    from litmoe.engines.warp import WarpEngine, _library_name
+
+    root = _fake_warp_root(tmp_path)
+    model_path = tmp_path / "glm53.waste"
+    model_path.mkdir()
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    monkeypatch.setenv("WASTE_API_KEY", "ambient-secret")
+    monkeypatch.setenv("WASTE_LIB", "/tmp/ambient-libwaste.so")
+
+    engine = WarpEngine(ModelEntry(
+        id="glm-warp",
+        engine="warp",
+        model_path=str(model_path),
+        env={
+            "WASTE_API_KEY": "model-secret",
+            "WASTE_LIB": "/tmp/model-libwaste.so",
+        },
+    ))
+    environment = engine.build_environment()
+
+    assert "WASTE_API_KEY" not in environment
+    assert environment["WASTE_LIB"] == str(root / _library_name())
+
+
+
 # ---------------------------------------------------------------------------
 # server
 # ---------------------------------------------------------------------------
@@ -269,6 +455,29 @@ def test_gateway_never_kills_processes_it_did_not_start(tmp_path, monkeypatch):
     finally:
         bystander.kill()
         bystander.wait()
+
+def test_stop_all_matches_manual_warp_server(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from litmoe.cli.main import cli
+    import subprocess
+
+    monkeypatch.setenv("LITMOE_RUN_DIR", str(tmp_path))
+    server = subprocess.Popen([
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        "/tmp/warp/serve/__main__.py",
+        "/tmp/tiny.waste",
+    ])
+    try:
+        result = CliRunner().invoke(cli, ["stop", "--all"])
+        assert result.exit_code == 0, result.output
+        server.wait(timeout=5)
+        assert "warp/serve/__main__" in result.output
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
 
 
 def test_weights_size_from_shards(tmp_path):
@@ -396,6 +605,170 @@ def test_openai_to_anthropic_response():
 # ---------------------------------------------------------------------------
 # installer helpers
 # ---------------------------------------------------------------------------
+
+def _fake_warp_source(tmp_path):
+    import subprocess
+
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True)
+    (source / "serve").mkdir()
+    (source / "serve" / "__main__.py").write_text("")
+    (source / "Makefile").write_text(
+        "all:\n"
+        "\tprintf '#!/bin/sh\\nexit 0\\n' > waste\n"
+        "\tchmod +x waste\n"
+        "\tcp waste waste.exe\n"
+        "\ttouch libwaste.so libwaste.dylib libwaste.dll\n"
+        "check: all\n"
+        "\ttouch check-ran\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=source, check=True)
+    ref = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return source, ref
+
+
+def test_install_warp_builds_and_verifies_pinned_source(tmp_path, monkeypatch):
+    source, ref = _fake_warp_source(tmp_path)
+    prefix = tmp_path / "prefix"
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    root = I.install_warp(prefix, ref=ref)
+
+    assert root == prefix / "lib" / "warp"
+    assert (root / "serve" / "__main__.py").is_file()
+    assert (root / "check-ran").is_file()
+    assert (prefix / "bin" / "waste").resolve() == root / "waste"
+
+
+def test_install_warp_copies_discoverable_windows_launcher(tmp_path, monkeypatch):
+    source, ref = _fake_warp_source(tmp_path)
+    prefix = tmp_path / "prefix"
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(I.sys, "platform", "win32")
+
+    root = I.install_warp(prefix, ref=ref)
+
+    launcher = prefix / "bin" / "waste.exe"
+    assert launcher.is_file()
+    assert not launcher.is_symlink()
+    assert launcher.read_bytes() == (root / "waste.exe").read_bytes()
+
+
+def test_install_warp_restores_previous_tree_when_launcher_install_fails(tmp_path, monkeypatch):
+    source, ref = _fake_warp_source(tmp_path)
+    prefix = tmp_path / "prefix"
+    previous = prefix / "lib" / "warp"
+    previous.mkdir(parents=True)
+    (previous / "marker").write_text("working")
+    wrapper = prefix / "bin" / "waste"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("old launcher")
+
+    real_replace = I.os.replace
+
+    def fail_launcher_replace(source_path, destination_path):
+        if Path(source_path).name == "waste-link":
+            raise OSError("simulated launcher failure")
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I.os, "replace", fail_launcher_replace)
+
+    with pytest.raises(RuntimeError, match="could not install WARP CLI"):
+        I.install_warp(prefix, ref=ref)
+
+    assert (previous / "marker").read_text() == "working"
+    assert wrapper.read_text() == "old launcher"
+
+def test_install_warp_preserves_recovery_tree_when_rollback_fails(tmp_path, monkeypatch):
+    source, ref = _fake_warp_source(tmp_path)
+    prefix = tmp_path / "prefix"
+    previous = prefix / "lib" / "warp"
+    previous.mkdir(parents=True)
+    (previous / "marker").write_text("working")
+    wrapper = prefix / "bin" / "waste"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("old launcher")
+
+    real_replace = I.os.replace
+
+    def fail_launcher_and_restore(source_path, destination_path):
+        source_name = Path(source_path).name
+        if source_name == "waste-link":
+            raise OSError("simulated launcher failure")
+        if source_name == "previous":
+            raise OSError("simulated restore failure")
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I.os, "replace", fail_launcher_and_restore)
+
+    with pytest.raises(RuntimeError, match="rollback also failed") as exc_info:
+        I.install_warp(prefix, ref=ref)
+
+    recovery_markers = list(
+        (prefix / "lib").glob(".warp-install-*/previous/marker")
+    )
+    assert len(recovery_markers) == 1
+    assert recovery_markers[0].read_text() == "working"
+    assert str(recovery_markers[0].parents[1]) in str(exc_info.value)
+
+
+
+def test_install_help_accepts_warp():
+    from click.testing import CliRunner
+
+    result = CliRunner().invoke(I.install_cmd, ["--help"])
+    assert result.exit_code == 0, result.output
+    assert "llamacpp|ktransformers|warp|both|none" in result.output
+
+
+def test_install_cli_selects_warp_without_downloading_model(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    installed = []
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("WARP-only installation called an unrelated installer or downloader")
+
+    monkeypatch.setattr(I, "install_warp", lambda prefix, **_: installed.append(prefix))
+    monkeypatch.setattr(I, "install_llamacpp", unexpected_call)
+    monkeypatch.setattr(I, "install_ktransformers", unexpected_call)
+    monkeypatch.setattr(I, "download_model", unexpected_call)
+    monkeypatch.setattr(I, "get_total_memory_bytes", lambda: None)
+
+    result = CliRunner().invoke(
+        I.install_cmd,
+        ["warp", "--prefix", str(tmp_path / "prefix"), "--yes"],
+    )
+    assert result.exit_code == 0, result.output
+    assert installed == [tmp_path / "prefix"]
+    assert "Installing WARP" in result.output
+
+
+def test_doctor_reports_warp_engine(monkeypatch):
+    from click.testing import CliRunner
+    import litmoe.cli.main as CM
+
+    monkeypatch.setattr(CM, "llama_installed", lambda: False)
+    monkeypatch.setattr(CM, "kt_installed", lambda: False)
+    monkeypatch.setattr(CM, "warp_installed", lambda: True)
+    result = CliRunner().invoke(CM.cli, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "WARP: installed" in result.output
+    assert "local .waste containers" in result.output
+
+    monkeypatch.setattr(CM, "warp_installed", lambda: False)
+    result = CliRunner().invoke(CM.cli, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "WARP: NOT installed (litmoe install --engine warp)" in result.output
 
 GEMMA_31B_FILES = [
     "gemma-4-31B-it-Q4_K_M.gguf", "gemma-4-31B-it-UD-Q4_K_M.gguf", "gemma-4-31B-it-UD-Q4_K_XL.gguf",

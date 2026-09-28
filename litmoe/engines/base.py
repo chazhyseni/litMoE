@@ -59,6 +59,12 @@ class Engine(abc.ABC):
         """Port this engine listens on (gateway-assigned, else DEFAULT_ENGINE_PORT)."""
         return self._assigned_port if self._assigned_port is not None else DEFAULT_ENGINE_PORT
 
+    def build_environment(self) -> dict[str, str]:
+        """Build the environment passed to the engine subprocess."""
+        environment = os.environ.copy()
+        environment.update(self.model.env)
+        return environment
+
     def _open_log(self, log_dir: Path | None, cmd: list[str]) -> IO[str]:
         """Open the per-model engine log in append mode and write a session header.
 
@@ -94,8 +100,7 @@ class Engine(abc.ABC):
     def start(self, log_dir: Path | None = None) -> None:
         """Start the engine as a subprocess."""
         cmd = self.build_command()
-        env = os.environ.copy()
-        env.update(self.model.env)
+        env = self.build_environment()
 
         with self._open_log(log_dir, cmd) as logf:
             self.process = subprocess.Popen(
