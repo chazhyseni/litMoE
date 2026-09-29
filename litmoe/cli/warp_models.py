@@ -440,6 +440,7 @@ def install_model(
         "REPO": str(info["hf_repo"]),
         "REVISION": str(info["hf_revision"]),
         "SRC": str(plan.source),
+        "DEST": str(plan.source),
         "OUT": str(plan.output),
         "JOBS": str(jobs),
         "RECLAIM": "on" if reclaim_source else "off",
@@ -448,23 +449,12 @@ def install_model(
     }
 
     with _pipeline_environment() as (environment, hf_token):
+        environment.update(common)
         plan.source.mkdir(parents=True, exist_ok=True)
         plan.output.parent.mkdir(parents=True, exist_ok=True)
         if not reclaimed:
             _run_stage(
-                [
-                    executables["bash"],
-                    str(fetch_script),
-                    "--repo",
-                    str(info["hf_repo"]),
-                    "--revision",
-                    str(info["hf_revision"]),
-                    "--dest",
-                    str(plan.source),
-                    "--jobs",
-                    str(jobs),
-                    "--dry-run",
-                ],
+                [executables["bash"], str(fetch_script), "--dry-run"],
                 cwd=warp_root,
                 env=environment,
                 stage="fetch preflight",
@@ -475,7 +465,6 @@ def install_model(
                 hf_token=hf_token,
             )
 
-        environment.update(common)
         _run_stage(
             [executables["bash"], str(pipeline_script)],
             cwd=warp_root,

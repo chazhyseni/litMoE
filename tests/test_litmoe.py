@@ -1472,10 +1472,11 @@ def test_install_warp_model_uses_deterministic_paths_and_pinned_pipeline_environ
     info = M.KNOWN_MODELS[model_id]
     assert Path(dry_run[0]).name == "bash"
     assert Path(dry_run[1]) == root / "tools" / "fetch_weights.sh"
-    assert dry_run[dry_run.index("--repo") + 1] == info["hf_repo"]
-    assert dry_run[dry_run.index("--revision") + 1] == info["hf_revision"]
-    assert Path(dry_run[dry_run.index("--dest") + 1]) == expected_source
-    assert dry_run[dry_run.index("--jobs") + 1] == "5"
+    assert dry_run[2:] == ["--dry-run"]
+    assert dry_env["REPO"] == info["hf_repo"]
+    assert dry_env["REVISION"] == info["hf_revision"]
+    assert Path(dry_env["DEST"]) == expected_source
+    assert dry_env["JOBS"] == "5"
     assert "--dry-run" in dry_run
     assert Path(dry_cwd) == root
 
