@@ -8,8 +8,8 @@
 # This wrapper instead uses per-invocation flags, which Hermes honours above
 # the config file and does not persist:
 #
-#   hermes chat --provider custom -m <model>     with OPENAI_BASE_URL/OPENAI_API_KEY
-#                                                set only in this process's environment
+#   hermes chat --provider custom -m <model>     with CUSTOM_BASE_URL,
+#     OPENAI_BASE_URL and OPENAI_API_KEY set only in this process's environment
 #
 # Usage:
 #   hermes-local [--gateway URL] [--model ID] [--key KEY] [hermes chat args...]
@@ -53,6 +53,7 @@ if [[ -z "$MODEL" ]]; then
 fi
 
 exec env \
+  CUSTOM_BASE_URL="$GATEWAY/v1" \
   OPENAI_BASE_URL="$GATEWAY/v1" \
   OPENAI_API_KEY="$KEY" \
   hermes chat --provider custom -m "$MODEL" "$@"

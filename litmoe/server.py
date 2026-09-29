@@ -750,96 +750,95 @@ async def _stream_anthropic_response(client: httpx.AsyncClient, r: httpx.Respons
         output_tokens = 0
         stop_reason = "end_turn"
         buf = b""
-        async with r:
-            async for chunk in r.aiter_bytes():
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == b"[DONE]":
-                        continue
-                    try:
-                        payload = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    usage = payload.get("usage") or {}
-                    if usage:
-                        input_tokens = usage.get("prompt_tokens", input_tokens)
-                        output_tokens = usage.get("completion_tokens", output_tokens)
-                    choice = (payload.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    thinking = delta.get("reasoning_content")
-                    if thinking:
-                        if not block_open or block_type != "thinking":
-                            if block_open:
-                                yield ev("content_block_stop",
-                                         {"type": "content_block_stop", "index": block_index})
-                            block_index += 1
-                            block_type = "thinking"
-                            block_open = True
-                            yield ev("content_block_start",
-                                     {"type": "content_block_start", "index": block_index,
-                                      "content_block": {"type": "thinking", "thinking": "",
-                                                        "signature": ""}})
+        async for chunk in r.aiter_bytes():
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    continue
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                usage = payload.get("usage") or {}
+                if usage:
+                    input_tokens = usage.get("prompt_tokens", input_tokens)
+                    output_tokens = usage.get("completion_tokens", output_tokens)
+                choice = (payload.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                thinking = delta.get("reasoning_content")
+                if thinking:
+                    if not block_open or block_type != "thinking":
+                        if block_open:
+                            yield ev("content_block_stop",
+                                     {"type": "content_block_stop", "index": block_index})
+                        block_index += 1
+                        block_type = "thinking"
+                        block_open = True
+                        yield ev("content_block_start",
+                                 {"type": "content_block_start", "index": block_index,
+                                  "content_block": {"type": "thinking", "thinking": "",
+                                                    "signature": ""}})
+                    yield ev("content_block_delta",
+                             {"type": "content_block_delta", "index": block_index,
+                              "delta": {"type": "thinking_delta", "thinking": thinking}})
+                text = delta.get("content")
+                if text:
+                    if not block_open or block_type != "text":
+                        if block_open:
+                            if block_type == "thinking":
+                                yield ev("content_block_delta",
+                                         {"type": "content_block_delta", "index": block_index,
+                                          "delta": {"type": "signature_delta",
+                                                    "signature": "litmoe"}})
+                            yield ev("content_block_stop",
+                                     {"type": "content_block_stop", "index": block_index})
+                        block_index += 1
+                        block_type = "text"
+                        block_open = True
+                        yield ev("content_block_start",
+                                 {"type": "content_block_start", "index": block_index,
+                                  "content_block": {"type": "text", "text": ""}})
+                    output_tokens += 1  # refined by final usage chunk if present
+                    yield ev("content_block_delta",
+                             {"type": "content_block_delta", "index": block_index,
+                              "delta": {"type": "text_delta", "text": text}})
+                # llama.cpp streams tool calls sequentially per index
+                for tc in delta.get("tool_calls") or []:
+                    oai_idx = tc.get("index", 0)
+                    fn = tc.get("function") or {}
+                    if oai_idx not in tool_blocks:
+                        if block_open:
+                            if block_type == "thinking":
+                                yield ev("content_block_delta",
+                                         {"type": "content_block_delta", "index": block_index,
+                                          "delta": {"type": "signature_delta",
+                                                    "signature": "litmoe"}})
+                            yield ev("content_block_stop",
+                                     {"type": "content_block_stop", "index": block_index})
+                        block_index += 1
+                        tool_blocks[oai_idx] = block_index
+                        block_type = "tool_use"
+                        block_open = True
+                        yield ev("content_block_start",
+                                 {"type": "content_block_start", "index": block_index,
+                                  "content_block": {
+                                      "type": "tool_use",
+                                      "id": tc.get("id") or f"toolu_litmoe_{oai_idx}",
+                                      "name": fn.get("name") or "", "input": {}}})
+                    args = fn.get("arguments")
+                    if args:
                         yield ev("content_block_delta",
-                                 {"type": "content_block_delta", "index": block_index,
-                                  "delta": {"type": "thinking_delta", "thinking": thinking}})
-                    text = delta.get("content")
-                    if text:
-                        if not block_open or block_type != "text":
-                            if block_open:
-                                if block_type == "thinking":
-                                    yield ev("content_block_delta",
-                                             {"type": "content_block_delta", "index": block_index,
-                                              "delta": {"type": "signature_delta",
-                                                        "signature": "litmoe"}})
-                                yield ev("content_block_stop",
-                                         {"type": "content_block_stop", "index": block_index})
-                            block_index += 1
-                            block_type = "text"
-                            block_open = True
-                            yield ev("content_block_start",
-                                     {"type": "content_block_start", "index": block_index,
-                                      "content_block": {"type": "text", "text": ""}})
-                        output_tokens += 1  # refined by final usage chunk if present
-                        yield ev("content_block_delta",
-                                 {"type": "content_block_delta", "index": block_index,
-                                  "delta": {"type": "text_delta", "text": text}})
-                    # llama.cpp streams tool calls sequentially per index
-                    for tc in delta.get("tool_calls") or []:
-                        oai_idx = tc.get("index", 0)
-                        fn = tc.get("function") or {}
-                        if oai_idx not in tool_blocks:
-                            if block_open:
-                                if block_type == "thinking":
-                                    yield ev("content_block_delta",
-                                             {"type": "content_block_delta", "index": block_index,
-                                              "delta": {"type": "signature_delta",
-                                                        "signature": "litmoe"}})
-                                yield ev("content_block_stop",
-                                         {"type": "content_block_stop", "index": block_index})
-                            block_index += 1
-                            tool_blocks[oai_idx] = block_index
-                            block_type = "tool_use"
-                            block_open = True
-                            yield ev("content_block_start",
-                                     {"type": "content_block_start", "index": block_index,
-                                      "content_block": {
-                                          "type": "tool_use",
-                                          "id": tc.get("id") or f"toolu_litmoe_{oai_idx}",
-                                          "name": fn.get("name") or "", "input": {}}})
-                        args = fn.get("arguments")
-                        if args:
-                            yield ev("content_block_delta",
-                                     {"type": "content_block_delta", "index": tool_blocks[oai_idx],
-                                      "delta": {"type": "input_json_delta",
-                                                "partial_json": args}})
-                    finish = choice.get("finish_reason")
-                    if finish:
-                        stop_reason = _STOP_REASON_MAP.get(finish, "end_turn")
+                                 {"type": "content_block_delta", "index": tool_blocks[oai_idx],
+                                  "delta": {"type": "input_json_delta",
+                                            "partial_json": args}})
+                finish = choice.get("finish_reason")
+                if finish:
+                    stop_reason = _STOP_REASON_MAP.get(finish, "end_turn")
         if block_open:
             if block_type == "thinking":
                 yield ev("content_block_delta",
@@ -856,6 +855,7 @@ async def _stream_anthropic_response(client: httpx.AsyncClient, r: httpx.Respons
         yield ev("error", {"type": "error",
                            "error": {"type": "api_error", "message": str(e)}})
     finally:
+        await r.aclose()
         await client.aclose()
 
 

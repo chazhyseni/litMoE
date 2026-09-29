@@ -575,6 +575,70 @@ def test_upstream_error_on_stream_is_a_real_http_error(monkeypatch):
     assert r.json()["type"] == "error" and "exceeds the available context size" in r.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("ending", ["complete", "consumer_close", "read_error"])
+def test_anthropic_stream_real_httpx_response_lifecycle(ending):
+    import asyncio
+    import httpx
+
+    class EngineStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            # Split an SSE record across transport chunks.
+            yield b'da'
+            yield b'ta: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}\n\n'
+            if ending == "read_error":
+                raise httpx.ReadError("upstream disconnected")
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1}}\n\n'
+            yield b'data: [DONE]\n\n'
+
+        async def aclose(self):
+            self.closed = True
+
+    async def run():
+        stream = EngineStream()
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream),
+        ))
+        response = await client.send(client.build_request("POST", "http://engine/v1/chat/completions"),
+                                     stream=True)
+        events = S._stream_anthropic_response(client, response, "glm-5.3-flash-warp")
+
+        def parse(event):
+            return json.loads(event.split(b"data: ", 1)[1])
+
+        try:
+            first = parse(await anext(events))
+            assert first["type"] == "message_start"
+            if ending == "consumer_close":
+                await events.aclose()
+            else:
+                messages = [parse(event) async for event in events]
+                text = "".join(m["delta"]["text"] for m in messages
+                               if m["type"] == "content_block_delta")
+                assert text == "Hi"
+                if ending == "read_error":
+                    assert messages[-1]["type"] == "error"
+                    assert "upstream disconnected" in messages[-1]["error"]["message"]
+                    assert not any(m["type"] == "message_stop" for m in messages)
+                else:
+                    assert [m["type"] for m in messages] == [
+                        "content_block_start", "content_block_delta", "content_block_stop",
+                        "message_delta", "message_stop",
+                    ]
+                    assert messages[-2]["delta"]["stop_reason"] == "end_turn"
+                    assert messages[-2]["usage"] == {"input_tokens": 7, "output_tokens": 1}
+            assert response.is_closed
+            assert stream.closed
+            assert client.is_closed
+        finally:
+            await events.aclose()
+            await response.aclose()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_dead_engine_is_a_503_not_a_broken_200_stream():
     """Observed: `litmoe stop` under a live gateway killed the engines; the next
     streaming request got HTTP 200 and then 'Stream error'. A dead engine must

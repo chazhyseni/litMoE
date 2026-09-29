@@ -116,20 +116,19 @@ hermes                                    # normal Hermes, config untouched
 ```
 
 It runs `hermes chat --provider custom -m <model>` with
-`OPENAI_BASE_URL=http://127.0.0.1:8090/v1` and `OPENAI_API_KEY=litmoe` set
-only in that process. Your `config.yaml` is never written.
+`CUSTOM_BASE_URL=http://127.0.0.1:8090/v1`,
+`OPENAI_BASE_URL=http://127.0.0.1:8090/v1`, and `OPENAI_API_KEY=litmoe` set
+only in that process. The wrapper never writes your `config.yaml`.
+Current Hermes uses `CUSTOM_BASE_URL` for the custom provider; setting only
+`OPENAI_BASE_URL` can leave requests pointed at a saved endpoint instead.
 
-**The first message takes a while — do not interrupt it.** Hermes sends its
-whole system prompt with every request: tool schemas plus the index of every
-installed skill. With a large skill library that is tens of thousands of tokens
-(a measured session: ~53K). On CPU/Metal the engine reads a new prefix at a few
-hundred tokens per second, so the first turn can take one to two minutes before
-the first word appears. llama-server caches that prefix (prompt caching is on by
-default, 8 GB `--cache-ram`), so every later turn — and every later session with
-the same skills — starts in seconds, as long as the gateway keeps running. The
-gateway logs `~N prompt tokens` for each request so you can see why it is
-quiet; `tail -f logs/<model>.log` shows the prefill progress. Ctrl-C in Hermes
-abandons the request and the cache warm-up with it.
+Even a short message includes the harness's system prompt and tool definitions.
+Use the gateway's approximate prompt-token log and the engine log to distinguish
+prefill from a failed request. A retry banner or `APIConnectionError` is not proof
+of slow prefill: check the gateway traceback and the endpoint Hermes resolved.
+Do not assume the next turn will be faster. The pinned WARP server resets its
+inference state for each HTTP request; llama.cpp has different cache behavior.
+Native context capacity is not a latency guarantee.
 
 ### Persistent but separate: a Hermes profile
 
@@ -176,6 +175,19 @@ replacing the existing one; Open WebUI lists models from all connections.
 For SDK code, pass `base_url=` to the client constructor instead of exporting
 `OPENAI_BASE_URL` — an exported variable redirects every OpenAI client in the
 shell, including tools you did not intend to touch.
+
+## Streaming correctness
+
+Claude Code uses the Anthropic Messages stream; Hermes's custom provider uses
+OpenAI chat completions. Verify both paths, not only non-streaming responses.
+The gateway consumes the already-open `httpx.Response` directly and closes the
+response and client on completion, read failure, or consumer closure. An
+`httpx.Response` is not an asynchronous context manager: using `async with` on
+it aborts the Anthropic stream immediately after `message_start`.
+
+Protocol smoke checks with small synthetic model weights establish transport
+correctness only. They do not establish responsiveness with real model weights,
+long harness prompts, or the user's hardware.
 
 ## Checklist before you say "it's broken"
 
