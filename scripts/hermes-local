@@ -25,7 +25,7 @@
 # inside that profile; your default profile stays untouched.
 set -euo pipefail
 
-GATEWAY="${LITMOE_GATEWAY:-http://127.0.0.1:8080}"
+GATEWAY="${LITMOE_GATEWAY:-http://127.0.0.1:8090}"
 MODEL="${LITMOE_MODEL:-}"
 KEY="${LITMOE_API_KEY:-litmoe}"
 

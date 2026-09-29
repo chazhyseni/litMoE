@@ -7,7 +7,7 @@
 # semantics: n_ctx: 0 preserves the .waste container default.
 
 host: 127.0.0.1
-port: 8080
+port: 8090
 api_key: null              # or a string → clients must send "Authorization: Bearer <it>"
 
 models:

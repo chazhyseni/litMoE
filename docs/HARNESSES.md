@@ -14,7 +14,7 @@ what litmoe touches (nothing global), and how to verify.
   shell rc files, or any harness config.
 - Never exports environment variables into your shell. `litmoe serve` sets
   variables only for the engine subprocesses it spawns.
-- Never binds a port a harness uses by default: the gateway is `127.0.0.1:8080`
+- Never binds a port a harness uses by default: the gateway is `127.0.0.1:8090`
   (or whatever `port:` you set); engines take 8081+, skipping the gateway port
   and any port another process already listens on. Anthropic's real API is
   HTTPS on api.anthropic.com — no overlap.
@@ -40,7 +40,7 @@ That is what makes clean isolation possible: set them **only** for the one
 ### The safe way: `scripts/claude-local`
 
 ```bash
-litmoe serve                                   # gateway on :8080
+litmoe serve                                   # gateway on :8090
 ./scripts/claude-local                         # Claude Code -> local model, isolated
 ./scripts/claude-local --model qwen3.6-35b-a3b -p "explain this repo"
 claude                                         # normal Claude Code, untouched
@@ -116,7 +116,7 @@ hermes                                    # normal Hermes, config untouched
 ```
 
 It runs `hermes chat --provider custom -m <model>` with
-`OPENAI_BASE_URL=http://127.0.0.1:8080/v1` and `OPENAI_API_KEY=litmoe` set
+`OPENAI_BASE_URL=http://127.0.0.1:8090/v1` and `OPENAI_API_KEY=litmoe` set
 only in that process. Your `config.yaml` is never written.
 
 **The first message takes a while — do not interrupt it.** Hermes sends its
@@ -135,7 +135,7 @@ abandons the request and the cache warm-up with it.
 
 ```bash
 hermes profile create litmoe --clone      # copies your config/skills, separate identity
-hermes -p litmoe model                    # pick "Custom endpoint", URL http://127.0.0.1:8080/v1, model id
+hermes -p litmoe model                    # pick "Custom endpoint", URL http://127.0.0.1:8090/v1, model id
 hermes -p litmoe                          # talks to the local model
 hermes                                    # default profile, unchanged
 ```
@@ -152,7 +152,7 @@ model_aliases:
   local:
     model: gemma-4-26b-a4b
     provider: custom
-    base_url: "http://127.0.0.1:8080/v1"
+    base_url: "http://127.0.0.1:8090/v1"
     api_key: litmoe          # required: without it Hermes would send your DEFAULT provider's key to this host
 ```
 
@@ -170,7 +170,7 @@ of the three options above instead.
 
 ## Open WebUI / other OpenAI-SDK clients
 
-Add `http://127.0.0.1:8080/v1` as an **additional** connection rather than
+Add `http://127.0.0.1:8090/v1` as an **additional** connection rather than
 replacing the existing one; Open WebUI lists models from all connections.
 
 For SDK code, pass `base_url=` to the client constructor instead of exporting

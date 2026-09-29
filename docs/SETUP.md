@@ -290,7 +290,7 @@ aliases.
 
 ```yaml
 host: 127.0.0.1
-port: 8080
+port: 8090
 api_key: null              # or a string → Bearer auth required
 
 models:
@@ -346,7 +346,7 @@ litmoe serve                            # gateway + all engines; refuses a set t
 litmoe serve gemma-4-26b-a4b            # only this entry (several ids allowed); --force skips the fit check
 litmoe status                           # gateway health + per-engine state
 litmoe stop                             # stop engines litmoe started (PID files)
-curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:8090/v1/models
 ```
 
 Engines get ports counting up from 8081, skipping the gateway port and any

@@ -187,7 +187,7 @@ def init(force):
             entry["aliases"] = list(CLAUDE_ALIASES)
         models.append(entry)
 
-    cfg = {"host": "127.0.0.1", "port": 8080, "api_key": None, "models": models}
+    cfg = {"host": "127.0.0.1", "port": 8090, "api_key": None, "models": models}
     with open(cfg_path, "w") as f:
         f.write("# litmoe gateway config. Docs: https://github.com/chazhyseni/litMoE\n")
         f.write("# model_path may be a local GGUF, a HuggingFace spec owner/repo:QUANT, or a URL.\n")

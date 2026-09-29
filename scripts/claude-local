@@ -23,12 +23,12 @@
 #
 #   claude-local                                  # interactive, first model in gateway
 #   claude-local --model qwen3.6-35b-a3b -p "..." # print mode against a specific model
-#   LITMOE_GATEWAY=http://192.168.1.10:8080 claude-local
+#   LITMOE_GATEWAY=http://192.168.1.10:8090 claude-local
 #
 # Reverting to normal Claude: just run `claude`. Nothing to undo.
 set -euo pipefail
 
-GATEWAY="${LITMOE_GATEWAY:-http://127.0.0.1:8080}"
+GATEWAY="${LITMOE_GATEWAY:-http://127.0.0.1:8090}"
 MODEL="${LITMOE_MODEL:-}"
 KEY="${LITMOE_API_KEY:-litmoe}"          # any non-empty string when api_key: null
 CONFIG_DIR="${LITMOE_CLAUDE_CONFIG_DIR:-$HOME/.litmoe/claude-config}"

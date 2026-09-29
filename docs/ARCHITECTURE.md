@@ -9,7 +9,7 @@ process supervision. Every component earns its place.
    │   Claude Code (scripts/claude-local) · Hermes Agent (scripts/hermes-local)     │
    │   Open WebUI · aider · curl · any OpenAI / Anthropic SDK                       │
    └─────────────────────────────────┬──────────────────────────────────────────────┘
-                                     │ HTTP, 127.0.0.1:8080
+                                     │ HTTP, 127.0.0.1:8090
                                      │ POST /v1/chat/completions   (OpenAI)
                                      │ POST /v1/completions        (OpenAI)
                                      │ POST /v1/messages           (Anthropic)
@@ -130,7 +130,7 @@ containers remain valid alternatives.
 
 | Service | Default | Configurable |
 |---|---|---|
-| Gateway | 127.0.0.1:8080 | `host`/`port` in models.yaml |
+| Gateway | 127.0.0.1:8090 | `host`/`port` in models.yaml |
 | Engines | 8081, 8082, … (skips gateway port and busy ports) | `DEFAULT_ENGINE_PORT` |
 | Docker gateway | 127.0.0.1:8000 (host) | `deploy/docker-compose.yml` |
 | Open WebUI (Docker) | 8080 | `deploy/docker-compose.yml` |

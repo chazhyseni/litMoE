@@ -171,7 +171,7 @@ litmoe install              # installs llama.cpp and lists models that fit
 litmoe install --model gemma-4-26b-a4b   # 17 GB; writes the entry into models.yaml
 litmoe serve
 
-curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:8090/v1/models
 ```
 
 To install a catalog WARP model, run `litmoe install --model
@@ -192,7 +192,7 @@ Full guide: [docs/SETUP.md](docs/SETUP.md)
 
 ```yaml
 host: 127.0.0.1
-port: 8080
+port: 8090
 api_key: null            # or a string to require Bearer / x-api-key auth
 
 models:
@@ -296,19 +296,19 @@ claude                                              # normal Claude Code, still 
 ./scripts/hermes-local -q "one question"
 hermes                                              # unchanged
 ```
-For a persistent setup, create a separate profile (`hermes profile create litmoe --clone`, then `hermes -p litmoe model` → Custom endpoint `http://127.0.0.1:8080/v1`), or add a `model_aliases:` entry with its own `api_key` and switch with `/model local` — see [docs/HARNESSES.md](docs/HARNESSES.md) for the exact block. Avoid `hermes config set model.*` — it rewrites the default profile.
+For a persistent setup, create a separate profile (`hermes profile create litmoe --clone`, then `hermes -p litmoe model` → Custom endpoint `http://127.0.0.1:8090/v1`), or add a `model_aliases:` entry with its own `api_key` and switch with `/model local` — see [docs/HARNESSES.md](docs/HARNESSES.md) for the exact block. Avoid `hermes config set model.*` — it rewrites the default profile.
 
 ### Open WebUI
-Add `http://127.0.0.1:8080/v1` as an **additional** OpenAI API connection (keep the existing ones).
+Add `http://127.0.0.1:8090/v1` as an **additional** OpenAI API connection (keep the existing ones).
 
 ### curl
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+curl http://127.0.0.1:8090/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "gemma-4-26b-a4b",
   "messages": [{"role": "user", "content": "hello"}]
 }'
 
-curl http://127.0.0.1:8080/v1/messages -H "Content-Type: application/json" -d '{
+curl http://127.0.0.1:8090/v1/messages -H "Content-Type: application/json" -d '{
   "model": "gemma-4-26b-a4b",
   "max_tokens": 1024,
   "messages": [{"role": "user", "content": "hello"}]

@@ -55,7 +55,7 @@ litmoe is the front door: a Python package that:
 2. Starts the chosen engine as a subprocess (`llama-server`,
    `python -m sglang.launch_server`, or WARP's upstream `serve/__main__.py`),
    supervises it, and stops it cleanly.
-3. Exposes a single OpenAI + Anthropic-compatible API on 127.0.0.1:8080.
+3. Exposes a single OpenAI + Anthropic-compatible API on 127.0.0.1:8090.
 4. Routes requests to the right engine by model name or alias.
 5. For the two catalog WARP models, resolves pinned source and runtime
    revisions; rejects source or output paths containing a backslash, single

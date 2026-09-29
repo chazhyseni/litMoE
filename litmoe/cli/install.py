@@ -452,8 +452,11 @@ def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
             label=f"git fetch {ref}",
             timeout=300,
         )
+        # Checkout the requested ref, never FETCH_HEAD: a fetch-by-SHA can
+        # leave FETCH_HEAD naming a different branch line, and the detached
+        # checkout then silently builds the wrong revision.
         _run_warp_command(
-            ["git", "checkout", "--detach", "FETCH_HEAD"],
+            ["git", "checkout", "--detach", ref],
             cwd=checkout,
             label=f"git checkout {ref}",
             timeout=300,
@@ -1113,9 +1116,9 @@ def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: i
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
     else:
-        cfg = {"host": "127.0.0.1", "port": 8080, "api_key": None, "models": []}
+        cfg = {"host": "127.0.0.1", "port": 8090, "api_key": None, "models": []}
     cfg.setdefault("host", "127.0.0.1")
-    cfg.setdefault("port", 8080)
+    cfg.setdefault("port", 8090)
     cfg.setdefault("api_key", None)
     models = cfg.setdefault("models", [])
 

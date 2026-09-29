@@ -422,8 +422,8 @@ def test_warp_child_environment_uses_validated_library_without_upstream_auth(
 def test_port_allocation_skips_gateway_port_without_collisions():
     # probe=False: pure arithmetic, independent of what is listening on this host
     assert S.allocate_engine_ports(3, gateway_port=8082, probe=False) == [8081, 8083, 8084]
-    assert S.allocate_engine_ports(2, gateway_port=8080, probe=False) == [8081, 8082]
-    assert S.allocate_engine_ports(0, gateway_port=8080, probe=False) == []
+    assert S.allocate_engine_ports(2, gateway_port=8090, probe=False) == [8081, 8082]
+    assert S.allocate_engine_ports(0, gateway_port=8090, probe=False) == []
 
 
 def test_port_allocation_skips_ports_another_process_holds():
@@ -1063,7 +1063,7 @@ def test_serve_gate_two_thresholds(tmp_path, monkeypatch):
 
     cfg = tmp_path / "models.yaml"
     cfg.write_text(
-        "port: 8080\nmodels:\n"
+        "port: 8090\nmodels:\n"
         "  - {id: gemma-4-26b-a4b, engine: llamacpp, model_path: 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n"
         "  - {id: qwen3.5-122b-a10b, engine: llamacpp, model_path: 'unsloth/Qwen3.5-122B-A10B-GGUF:UD-IQ4_XS', n_ctx: 262144}\n"
         "  - {id: qwen3.8-flash-next, engine: llamacpp, model_path: 'unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n")
@@ -2481,7 +2481,7 @@ def test_install_warp_catalog_model_dispatches_positional_and_option(
     config = tmp_path / "models.yaml"
     old_warp = tmp_path / "old.waste"
     config.write_text(
-        "host: 127.0.0.1\nport: 8080\napi_key: null\nmodels:\n"
+        "host: 127.0.0.1\nport: 8090\napi_key: null\nmodels:\n"
         "  - id: existing\n    engine: llamacpp\n    model_path: /models/existing.gguf\n"
         "    n_ctx: 32768\n    aliases: [existing-alias]\n"
         f"  - id: {model_id}\n    engine: warp\n    model_path: {old_warp}\n"
@@ -2652,7 +2652,7 @@ def test_install_warp_failure_does_not_mutate_config(tmp_path, monkeypatch):
     models_dir = tmp_path / "models"
     config = tmp_path / "models.yaml"
     config.write_text(
-        "host: 127.0.0.1\nport: 8080\napi_key: null\nmodels:\n"
+        "host: 127.0.0.1\nport: 8090\napi_key: null\nmodels:\n"
         "  - id: existing\n    engine: llamacpp\n"
         "    model_path: /models/existing.gguf\n    n_ctx: 32768\n"
         "    aliases: [keep-me]\n"
@@ -2708,7 +2708,7 @@ def test_server_context_preparation_preserves_warp_zero(tmp_path, monkeypatch):
         "glm-5.3-flash-warp",
     )
     config_path.write_text(
-        "host: 127.0.0.1\nport: 8080\nmodels:\n"
+        "host: 127.0.0.1\nport: 8090\nmodels:\n"
         "  - id: glm-5.3-flash-warp\n"
         "    engine: warp\n"
         f"    model_path: {container}\n"
