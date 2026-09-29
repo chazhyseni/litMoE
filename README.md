@@ -146,6 +146,7 @@ After installation, serve the installed entry directly:
 litmoe serve glm-5.3-flash-warp
 # or: litmoe serve deepseek-v4.1-flash-warp
 ```
+
 **Runtime-only/manual alternative:** `litmoe install --engine warp` installs
 only the same pinned runtime. Add an existing local `.waste` container to
 `models.yaml` yourself; manually created or acquired containers remain
