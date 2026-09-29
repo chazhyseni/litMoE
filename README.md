@@ -112,7 +112,10 @@ path with `engine: warp` and `n_ctx: 0`. When `HF_TOKEN` is set, litmoe uses a
 private temporary curl config; the token is not printed or passed in a child
 process's arguments or environment. There are no prebuilt GLM or DeepSeek
 `.waste` release assets: litmoe orchestrates WARP's upstream conversion and
-does not implement a quantizer.
+does not implement a quantizer. During the long download/convert stage,
+litmoe prints a heartbeat line every minute with elapsed seconds and the
+staging download log and run-report log paths; the live shard counter is in
+the download log. Ctrl-C is safe at any point: rerun the command to resume.
 
 | Catalog id | Pinned source revision | Source | Conversion workspace | Output |
 |---|---|---:|---:|---:|
@@ -129,13 +132,20 @@ and continues the pipeline. `--reclaim-source` deletes completed source shards
 as the pipeline progresses. That saves peak storage, but it is irreversible
 and a retry may have to download shards that were not proven complete.
 
+Watch live progress in the stage logs while the CLI heartbeats (the CLI heartbeat
+is a snapshot; the download log has the live shard counter):
+
+```bash
+tail -f <staging-dir>/<model-id>/download.log
+tail -f <models-dir>/<model-id>.warp-run/pipeline.log
+```
+
 After installation, serve the installed entry directly:
 
 ```bash
 litmoe serve glm-5.3-flash-warp
 # or: litmoe serve deepseek-v4.1-flash-warp
 ```
-
 **Runtime-only/manual alternative:** `litmoe install --engine warp` installs
 only the same pinned runtime. Add an existing local `.waste` container to
 `models.yaml` yourself; manually created or acquired containers remain

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ from litmoe.platform_utils import (
 LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
 WARP_REPO = "https://github.com/sqliteai/warp.git"
 WARP_COMMIT = "09fcff352ca55223b08ee222d15054b90546c6a9"
+LONG_QUIET_SECONDS = 60
 
 # Curated "stable" pointer maintained by llama.cpp CI: the latest release
 # (tagged vX.Y.Z) carries only this file; binaries live in the bNNNNN prereleases.
@@ -191,6 +193,64 @@ def pick_llamacpp_variant(variant: str) -> str:
 # ---------------------------------------------------------------------------
 # Engine installers
 # ---------------------------------------------------------------------------
+
+def _run_warp_stage(args: list[str], **kwargs):
+    """Run a model stage with captured internals and visible heartbeats."""
+    kwargs = dict(kwargs)
+    environment = dict(kwargs.get("env") or {})
+    kwargs["env"] = environment
+    script = Path(str(args[1])).name if len(args) > 1 else ""
+    pipeline = script == "pipeline.sh"
+    if pipeline:
+        download_log = Path(environment["SRC"]) / "download.log"
+        pipeline_log = Path(environment["RUN_DIR"]) / "pipeline.log"
+        marquee = (
+            "stage 1: download and convert WARP model; "
+            f"logs: {download_log}, {pipeline_log}"
+        )
+        environment["MARQUEE"] = marquee
+    else:
+        download_log = Path(environment.get("DEST") or "staging") / "download.log"
+        marquee = (
+            "Downloading model from Hugging Face conversion sources; "
+            f"log: {download_log}"
+        )
+
+    click.echo(f"  {marquee}")
+
+    kwargs["capture_output"] = True
+    kwargs["text"] = True
+    done = threading.Event()
+    results = []
+    errors = []
+
+    def invoke() -> None:
+        try:
+            results.append(subprocess.run(args, **kwargs))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="litmoe-warp-stage",
+        daemon=True,
+    )
+    worker.start()
+    interval = max(float(LONG_QUIET_SECONDS), 0.01)
+    elapsed = 0.0
+    while not done.wait(interval):
+        elapsed += interval
+        click.echo(f"  {marquee} ({elapsed:.0f}s elapsed)")
+    worker.join()
+    if errors:
+        raise errors[0]
+    result = results[0]
+    if result.stdout and not pipeline:
+        click.echo(result.stdout, nl=not result.stdout.endswith("\n"))
+    return result
+
 
 def _run_warp_command(
     args: list[str], *, cwd: Path | None, label: str, timeout: int
@@ -426,7 +486,7 @@ def install_warp_model(
     reclaim_source: bool = False,
 ) -> Path:
     """Install a pinned catalog model through the upstream WARP pipeline."""
-    return _warp_models.install_model(
+    path = _warp_models.install_model(
         model_id,
         warp_root=warp_root,
         staging_dir=staging_dir,
@@ -435,9 +495,11 @@ def install_warp_model(
         reclaim_source=reclaim_source,
         preflight=_preflight_warp_disk,
         which=shutil.which,
-        run=subprocess.run,
+        run=_run_warp_stage,
         validate=_validate_warp_container,
     )
+    click.echo(f"  WARP model installation complete: {path}")
+    return path
 
 
 def install_llamacpp(prefix: Path, variant: str = "auto", tag: str | None = None) -> Path:

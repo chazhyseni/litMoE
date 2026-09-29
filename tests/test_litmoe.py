@@ -1509,6 +1509,105 @@ def test_install_warp_model_uses_deterministic_paths_and_pinned_pipeline_environ
     assert not (result / "chat.json").exists()
 
 
+def test_install_warp_model_long_pipeline_reports_progress_and_no_timeout(
+    tmp_path, monkeypatch, capsys,
+):
+    import time
+
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    source = (staging_dir / model_id).absolute()
+    output = (models_dir / f"{model_id}.waste").absolute()
+    run_dir = (models_dir / f"{model_id}.warp-run").absolute()
+    fetch_line = "fetch preflight: 14 / 62 shards complete"
+    internal_stdout = "internal curl auth setup and transfer noise"
+    internal_stderr = "internal validator command noise"
+    pipeline_environments = []
+    _patch_warp_model_prerequisites(monkeypatch)
+    monkeypatch.setattr(I, "LONG_QUIET_SECONDS", 0.1, raising=False)
+    monkeypatch.setattr(
+        I._warp_models, "LONG_QUIET_SECONDS", 0.1, raising=False
+    )
+
+    def fake_run(args, **kwargs):
+        script = next(
+            (Path(str(arg)).name for arg in args if str(arg).endswith(".sh")),
+            "",
+        )
+        if script == "fetch_weights.sh":
+            if kwargs.get("capture_output") or kwargs.get("stdout") is I.subprocess.PIPE:
+                return I.subprocess.CompletedProcess(
+                    args, 0, stdout=fetch_line + "\n", stderr=""
+                )
+            print(fetch_line)
+            return I.subprocess.CompletedProcess(args, 0)
+
+        pipeline_environment = dict(kwargs.get("env") or {})
+        pipeline_environments.append(pipeline_environment)
+        time.sleep(1.9)
+        _fake_waste_container(Path(pipeline_environment["OUT"]), model_id)
+        return I.subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=internal_stdout + "\n",
+            stderr=internal_stderr + "\n",
+        )
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    result = I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+    )
+
+    captured = capsys.readouterr()
+    visible_output = captured.out + captured.err
+    assert result == output
+    assert pipeline_environments[0].get("MARQUEE", "").startswith(
+        "stage 1: download"
+    )
+    assert captured.out.splitlines().count(fetch_line) == 1
+    assert "stage 1: download" in captured.out
+    assert str(source / "download.log") in captured.out
+    assert str(run_dir / "pipeline.log") in captured.out
+    assert internal_stdout not in visible_output
+    assert internal_stderr not in visible_output
+
+
+def test_warp_non_marquee_failure_surfaces_captured_stderr(
+    tmp_path, capsys,
+):
+    diagnostic = "validator rejected malformed fixture"
+
+    def fail_validator(args, **kwargs):
+        return I.subprocess.CompletedProcess(
+            args,
+            7,
+            stdout="validator internal stdout\n",
+            stderr=diagnostic + "\n",
+        )
+
+    with pytest.raises(RuntimeError) as raised:
+        I._warp_models._run_stage(
+            ["validator", "--check"],
+            cwd=tmp_path,
+            env={},
+            stage="validator",
+            source=tmp_path / "source",
+            output=tmp_path / "output.waste",
+            run_dir=tmp_path / "run",
+            run=fail_validator,
+        )
+
+    captured = capsys.readouterr()
+    assert diagnostic in str(raised.value)
+    assert diagnostic not in captured.out + captured.err
+
+
 def test_install_warp_model_removes_temporary_curl_auth_after_failure(
     tmp_path, monkeypatch,
 ):
@@ -1807,11 +1906,9 @@ def test_warp_pipeline_failure_reports_exact_marker_and_resumable_paths(
     output = (models_dir / f"{model_id}.waste").absolute()
     run_dir = (models_dir / f"{model_id}.warp-run").absolute()
     stage_marker = "oracle diff (see diff.txt)"
-    calls = []
     _patch_warp_model_prerequisites(monkeypatch)
 
     def fake_run(args, **kwargs):
-        calls.append(kwargs)
         if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
             source.mkdir(parents=True, exist_ok=True)
             (source / "partial-shard.safetensors").write_bytes(b"resumable")
@@ -1839,10 +1936,6 @@ def test_warp_pipeline_failure_reports_exact_marker_and_resumable_paths(
     assert str(run_dir) in message
     assert (source / "partial-shard.safetensors").read_bytes() == b"resumable"
     assert (output / "trunk.bin.partial").read_bytes() == b"partial"
-    assert calls
-    assert all(call.get("capture_output") is not True for call in calls)
-    assert all(call.get("stdout") is not I.subprocess.PIPE for call in calls)
-    assert all(call.get("stderr") is not I.subprocess.PIPE for call in calls)
 
 
 def test_warp_disk_preflight_combines_same_filesystem_and_credits_resume(

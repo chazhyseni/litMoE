@@ -75,6 +75,12 @@ curl config rather than child arguments or environment. A reclaimed resume
 whose ledgers prove all source shards complete skips the fetch dry-run and
 continues the upstream pipeline.
 
+While the stage runs, litmoe captures internal fetch/pipeline terminal output
+and repeats a one-minute heartbeat with elapsed seconds and the staging
+`download.log` plus run-report `pipeline.log` paths, so multi-hour runs stay
+observable in a terminal; the CLI heartbeat is a snapshot and the live shard
+counter remains in the download log.
+
 ## Why a dispatcher is the right shape
 
 **Inference engines are mature.** ktransformers hit SOSP 2025 with a

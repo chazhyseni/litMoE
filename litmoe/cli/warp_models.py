@@ -288,7 +288,9 @@ def _run_stage(
         return
 
     marker = _read_failure_marker(run_dir, hf_token) if stage == "pipeline" else ""
-    marker_detail = f"; failed stage marker: {marker}" if marker else ""
+    diagnostic = marker or (getattr(result, "stderr", None) or getattr(result, "stdout", None) or "").strip()[:500]
+    kind = "failed stage marker: " if marker else ""
+    marker_detail = f"; {kind}{diagnostic}" if diagnostic else ""
     raise RuntimeError(
         f"WARP {stage} failed (exit {result.returncode}){marker_detail}; {context}. "
         "Partial data was preserved; rerun the same install command to resume."

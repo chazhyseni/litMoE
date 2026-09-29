@@ -86,7 +86,9 @@ output work, prints the revision, sizes, and paths, and asks for confirmation
 1. installs WARP runtime commit
    `09fcff352ca55223b08ee222d15054b90546c6a9`;
 2. invokes WARP's upstream weight-fetch dry-run, unless a proven reclaimed
-   resume can skip it, and runs the conversion pipeline;
+   resume can skip it, and runs the conversion pipeline; the CLI prints a
+   visible heartbeat every minute during the long stage, and the live shard
+   progress is in the staging `download.log`;
 3. validates the real WARP v0 manifest, trunk, codebooks, tokenizer, specials,
    and expert-bank artifacts; and
 4. registers the absolute output path in `models.yaml` with `engine: warp` and
@@ -111,6 +113,14 @@ for serving. Staging can be on another filesystem. If a fetch, conversion, or
 validation step fails, partial source, output, and run reports remain; rerun
 the same command to resume. When the reclaim ledgers prove every source shard
 completed, resume skips the upstream fetch dry-run and continues the pipeline.
+
+The visible CLI heartbeat repeats the stage and both log paths. Watch the
+live fetch/shard progress directly during the long stage:
+
+```bash
+tail -f <models-dir>/.staging/<model-id>/download.log
+tail -f <models-dir>/<model-id>.warp-run/pipeline.log
+```
 
 `--reclaim-source` is opt-in and irreversible: the pipeline deletes completed
 source shards as they become reclaimable, reducing peak storage, but a retry

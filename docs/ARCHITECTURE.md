@@ -94,7 +94,11 @@ prints the pinned revision and size plan, and confirms before writing. It
 installs pinned WARP runtime commit
 `09fcff352ca55223b08ee222d15054b90546c6a9`, then invokes WARP's upstream fetch
 dry-run and conversion pipeline. A proven reclaimed resume skips the fetch
-dry-run and continues the pipeline.
+dry-run and continues the pipeline. During the long stage, the runner wraps
+each stage in a watchdog: internal terminal noise is captured rather than
+printed, and a heartbeat line with elapsed seconds and the `download.log` /
+`pipeline.log` paths repeats every minute so a multi-hour stage never looks
+hung.
 
 When `HF_TOKEN` is set, litmoe places it in a private temporary curl config;
 the token is not printed or passed through child arguments or environment.
