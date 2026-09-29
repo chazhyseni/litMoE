@@ -30,7 +30,6 @@ import yaml
 from litmoe.cli import warp_models as _warp_models
 
 from litmoe.config import default_config_path, expand_path
-from litmoe.engines.warp import DEFAULT_WARP_CTX
 from litmoe.models import (
     CLAUDE_ALIASES,
     DEFAULT_MODEL,
@@ -1109,7 +1108,8 @@ def download_model(model_name: str, quant: str | None, models_dir: Path,
 
 def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: int,
                         config_path: Path, extra_args: list[str] | None = None,
-                        kt_method: str | None = None, aliases: list[str] | None = None) -> None:
+                        kt_method: str | None = None, aliases: list[str] | None = None,
+                        warp_auto_context: bool | None = None) -> None:
     """Insert or replace a model entry in models.yaml (absolute paths)."""
     model_path = expand_path(model_path)
 
@@ -1126,6 +1126,8 @@ def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: i
     entry: dict = {"id": model_name, "engine": engine, "model_path": str(model_path), "n_ctx": n_ctx}
     if engine == "llamacpp":
         entry["n_gpu_layers"] = -1
+    if engine == "warp" and warp_auto_context is not None:
+        entry["warp_auto_context"] = warp_auto_context
     if kt_method:
         entry["kt_method"] = kt_method
         entry["kt_num_gpu_experts"] = 0
@@ -1284,7 +1286,7 @@ def _positive_warp_jobs(
 @click.option("--prefix", type=click.Path(), default=None,
               help="Install prefix for engine binaries (default: ~/.local)")
 @click.option("--n-ctx", default=None, type=int,
-              help="Context size written to models.yaml (WARP: 65536; other engines: native, fitted where supported)")
+              help="Context size written to models.yaml (WARP: auto-fit native at serve time; positive values fix the window)")
 @click.option("--no-mmproj", is_flag=True, help="Skip the vision projector for multimodal models")
 @click.option("--config", "-c", type=click.Path(), default=None, help="Path to models.yaml")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompts")
@@ -1523,8 +1525,10 @@ def install_cmd(
         except Exception as e:
             click.echo(f"  WARP model install failed: {e}", err=True)
             sys.exit(1)
-        model_ctx = n_ctx or DEFAULT_WARP_CTX
-        add_model_to_config(model_name, engine_for_model, path, model_ctx, config_path)
+        add_model_to_config(
+            model_name, engine_for_model, path, n_ctx or 0, config_path,
+            warp_auto_context=not bool(n_ctx),
+        )
     else:
         path, mmproj = download_model(
             model_name,

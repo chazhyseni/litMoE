@@ -29,7 +29,7 @@ process supervision. Every component earns its place.
    │   ENGINE SUPERVISOR                                                            │
    │   - one subprocess per model, own session/pgid, PID file in ~/.litmoe/run      │
    │   - ports 8081+ skipping the gateway port and anything already bound           │
-   │   - llama.cpp n_ctx is memory-aware; WARP 0 resolves to 65536 tokens           │
+   │   - llama.cpp and WARP context fitted using their own memory models          │
    │   - SIGTERM/SIGINT/SIGHUP to the gateway stops every engine (no orphans)       │
    └───────────────┬──────────────────────┬───────────────────────┬────────────────┘
                    │ :8081                │ :8082                 │ :8083
@@ -105,8 +105,8 @@ When `HF_TOKEN` is set, litmoe places it in a private temporary curl config;
 the token is not printed or passed through child arguments or environment.
 After the pipeline returns, litmoe validates the WARP v0 manifest and its
 referenced trunk, codebook, tokenizer, specials, and expert-bank files before
-registering the absolute output path as `engine: warp`, `n_ctx: 65536` (or
-a positive `--n-ctx` override). Partial
+registering the absolute output path as `engine: warp`, `n_ctx: 0`, and
+`warp_auto_context: true` (a positive `--n-ctx` selects fixed mode instead). Partial
 source, output, and run/report data are retained so the same command can
 resume; nothing already downloaded is refetched. The runtime-only
 `litmoe install --engine warp` and manually configured local `.waste`
@@ -115,9 +115,18 @@ containers remain valid alternatives.
 
 ## Engine lifecycle
 
-- `litmoe serve` reads `models.yaml`, applies memory-aware context sizing to
-  llama.cpp models, and repairs legacy WARP `n_ctx: 0` to 65536, persisting it.
-  WARP positive limits are preserved; its container size is not resident RAM.
+- `litmoe serve` applies memory-aware context sizing to llama.cpp models.
+  WARP's adapter invokes the installed `serve.engine.plan_memory` in an isolated
+  process using the same model environment and native library as the server.
+  Auto mode fits the native window against 75% of usable RAM capacity or a
+  smaller explicit budget, including recommended expert-cache and vision memory.
+  It persists the selected `n_ctx` with `warp_auto_context: true`, so restarts
+  re-evaluate the plan. Unmarked legacy 0/65536 values migrate to auto; other
+  positive values remain fixed. `warp_auto_context: false` preserves an
+  intentional positive limit, including 65536. Conflicting `extra_args --ctx`
+  flags are rejected. A planning failure skips that model, not later models.
+  WARP container size is not resident RAM. Budgets are per engine, not
+  reservations against other engines or applications.
   It starts each engine in its own process group, writes
   `~/.litmoe/run/<id>.pid`, waits for readiness, then serves.
 - Engine stdout/stderr append to `logs/<id>.log` with a per-start header.

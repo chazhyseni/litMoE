@@ -1,6 +1,6 @@
 # WARP Engine Integration Implementation Plan
 
-> Context correction (2026-09-29): this historical plan's “0 preserves the container default” assumption is superseded. Upstream `waste_open` maps zero to 4096. litmoe now resolves WARP zero to 65536, always passes `--ctx`, and persists legacy zero repairs. Positive limits remain explicit choices; see [SETUP](../SETUP.md).
+> Context correction (2026-09-29): this historical plan's “0 preserves the container default” assumption is superseded. Upstream `waste_open` maps zero to 4096. litmoe now fits native context using WARP's memory planner, always passes a positive `--ctx`, and persists the result with `warp_auto_context: true`. Unmarked legacy 0/65536 values migrate to auto; `warp_auto_context: false` preserves an intentional positive limit. See [SETUP](../SETUP.md).
 
 > **For Claude:** REQUIRED SUB-SKILL: Use subagent-driven development and test-driven development to implement this plan task-by-task.
 

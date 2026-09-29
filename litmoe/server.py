@@ -23,7 +23,6 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from litmoe.config import GatewayConfig, ModelEntry, expand_path, is_hf_repo_spec
 from litmoe.engines import make_engine, Engine
 from litmoe.engines.base import DEFAULT_ENGINE_PORT
-from litmoe.engines.warp import DEFAULT_WARP_CTX
 from litmoe.models import (_MODEL_OVERHEAD, _OS_HEADROOM_GB, fit_context, lookup as catalog_lookup,
                            memory_budgets_gb, quant_size_gb)
 from litmoe.platform_utils import get_total_memory_bytes, is_macos
@@ -415,13 +414,15 @@ class Gateway:
         ld = Path(log_dir) if log_dir else None
         ports = allocate_engine_ports(len(self.config.models), self.config.port)
         for model, port in zip(self.config.models, ports):
-            self._fix_context(model)
-
+            old_context = (model.n_ctx, model.warp_auto_context)
             logger.info("Loading %s via %s on port %d...", model.id, model.engine, port)
             try:
+                self._fix_context(model)
                 engine = make_engine(model)
                 engine.set_port(port)
                 engine.start(log_dir=ld)
+                if model.engine == "warp" and old_context != (model.n_ctx, model.warp_auto_context):
+                    self._persist_ctx(model)
             except Exception as e:  # FileNotFoundError, ValueError, OSError ...
                 logger.error("Model %s could not be started: %s", model.id, e)
                 continue
@@ -437,17 +438,8 @@ class Gateway:
         written for a model whose weights already exceed the GPU budget — are
         lowered, since starting them ends in an out-of-memory engine that still
         reports healthy. That fit is only for llama.cpp: sglang-kt sizes its
-        own KV. WARP streams weights; replace only its legacy zero sentinel,
-        without treating container size as resident RAM or forcing native 1M.
+        own KV. WARP uses its upstream memory planner in the engine adapter.
         """
-        if model.engine == "warp":
-            if model.n_ctx == 0:
-                model.n_ctx = DEFAULT_WARP_CTX
-                logger.warning("Model %s: replacing WARP n_ctx=0 with %d; "
-                               "the runtime otherwise defaults to 4096 tokens",
-                               model.id, model.n_ctx)
-                self._persist_ctx(model)
-            return
         if model.engine != "llamacpp":
             return
         old = model.n_ctx or 0
@@ -463,7 +455,7 @@ class Gateway:
         self._persist_ctx(model)
 
     def _persist_ctx(self, model: ModelEntry) -> None:
-        """Write the corrected n_ctx back so the fix does not repeat every run.
+        """Write the resolved n_ctx and WARP auto/fixed policy back to config.
 
         Note: yaml.dump re-serializes the file, so comments in models.yaml are lost.
         """
@@ -483,6 +475,8 @@ class Gateway:
             for m in raw.get("models", []) or []:
                 if m.get("id") == model.id:
                     m["n_ctx"] = model.n_ctx
+                    if model.engine == "warp":
+                        m["warp_auto_context"] = model.warp_auto_context
                     break
             with open(cfg_path, "w") as f:
                 _yaml.dump(raw, f, default_flow_style=False, sort_keys=False)

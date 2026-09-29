@@ -1,6 +1,6 @@
 # WARP Model Installation Parity Design
 
-> Context correction (2026-09-29): the zero-context policy below is historical and superseded. WARP installs now write 65536 by default, accept `--n-ctx`, and repair legacy zero entries at serve startup. WARP remains excluded from llama.cpp's full-weight memory fitter; see [SETUP](../SETUP.md).
+> Context correction (2026-09-29): the zero-context policy below is historical and superseded. WARP installs now write `n_ctx: 0` with `warp_auto_context: true`; startup fits native context using WARP's planner and persists both the result and policy. A positive `--n-ctx` selects fixed mode. Unmarked legacy 0/65536 entries migrate to auto. WARP remains excluded from llama.cpp's full-weight fitter; see [SETUP](../SETUP.md).
 
 ## Goal
 

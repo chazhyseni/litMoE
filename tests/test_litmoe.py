@@ -233,7 +233,15 @@ def test_ktransformers_llamafile_needs_gguf_and_bad_method_rejected():
 def _fake_warp_root(tmp_path: Path) -> Path:
     root = tmp_path / "warp"
     (root / "serve").mkdir(parents=True)
-    (root / "serve" / "__main__.py").write_text("")
+    (root / "serve" / "__main__.py").write_text("def parse_size(value): return int(value)\n")
+    (root / "serve" / "engine.py").write_text(
+        "import os\n"
+        "from types import SimpleNamespace\n"
+        "def usable_ram(): return int(os.environ.get('TEST_WARP_RAM_GIB', 96)) * 1024**3\n"
+        "def plan_memory(path, ctx):\n"
+        "    required = 5 * 1024**3 + ctx * 65536\n"
+        "    return SimpleNamespace(recommended_bytes=required, floor_bytes=required, vision_bytes=8*1024**3)\n"
+    )
     library = "libwaste.dylib" if sys.platform == "darwin" else (
         "libwaste.dll" if sys.platform == "win32" else "libwaste.so"
     )
@@ -262,7 +270,7 @@ def test_warp_command_uses_local_container_and_upstream_server(tmp_path, monkeyp
     eng.set_port(8087)
     command = eng.build_command()
     ctx_index = command.index("--ctx")
-    assert int(command[ctx_index + 1]) > 19572
+    assert int(command[ctx_index + 1]) > 87644
     del command[ctx_index:ctx_index + 2]
     assert command == [
         sys.executable,
@@ -341,6 +349,7 @@ def test_warp_invalid_override_falls_back_to_prefix(tmp_path, monkeypatch):
     (stale / "serve" / "__main__.py").write_text("")
     model_path = tmp_path / "glm53.waste"
     model_path.mkdir()
+    (model_path / "manifest.json").write_text('{"config": {"max_position_embeddings": 131072}}')
     monkeypatch.setenv("LITMOE_WARP_DIR", str(stale))
     monkeypatch.setenv("LITMOE_PREFIX", str(prefix))
     monkeypatch.setattr(shutil, "which", lambda *_: None)
@@ -360,6 +369,7 @@ def test_warp_path_launcher_discovers_sibling_prefix_install(tmp_path, monkeypat
     launcher.write_bytes(b"executable")
     model_path = tmp_path / "glm53.waste"
     model_path.mkdir()
+    (model_path / "manifest.json").write_text('{"config": {"max_position_embeddings": 131072}}')
     monkeypatch.setenv("LITMOE_PREFIX", str(prefix))
     monkeypatch.setattr(warp.shutil, "which", lambda *_: str(launcher))
 
@@ -2458,7 +2468,7 @@ def test_warp_cli_rejects_resolved_plan_path_overlap_before_preflight(
     assert not config.exists()
 
 
-@pytest.mark.parametrize("requested_ctx", [None, 0, 98304])
+@pytest.mark.parametrize("requested_ctx", [None, 0, 65536, 131072])
 @pytest.mark.parametrize(
     "model_id,target_args,expected_jobs,expected_reclaim",
     [
@@ -2569,10 +2579,8 @@ def test_install_warp_catalog_model_dispatches_positional_and_option(
     assert warp.engine == "warp"
     assert Path(warp.model_path).is_absolute()
     assert Path(warp.model_path) == container
-    if requested_ctx:
-        assert warp.n_ctx == requested_ctx
-    else:
-        assert warp.n_ctx > 19572
+    assert warp.warp_auto_context is (not bool(requested_ctx))
+    assert warp.n_ctx == (requested_ctx or 0)
     assert warp.aliases == ["warp-alias"]
 
 
@@ -2725,9 +2733,12 @@ def test_install_warp_failure_does_not_mutate_config(tmp_path, monkeypatch):
 @pytest.mark.parametrize("model_id", [
     "glm-5.3-flash-warp", "deepseek-v4.1-flash-warp",
 ])
-@pytest.mark.parametrize("requested_ctx", [0, 4096, 32768])
-def test_server_context_preparation_repairs_warp_zero(
-    tmp_path, monkeypatch, model_id, requested_ctx,
+@pytest.mark.parametrize("requested_ctx,auto", [
+    (0, None), (65536, None), (131072, True),
+    (65536, False), (4096, None), (32768, None),
+])
+def test_server_context_preparation_migrates_warp_defaults(
+    tmp_path, monkeypatch, model_id, requested_ctx, auto,
 ):
     config_path = tmp_path / "models.yaml"
     container = _fake_waste_container(
@@ -2740,9 +2751,14 @@ def test_server_context_preparation_repairs_warp_zero(
         "    engine: warp\n"
         f"    model_path: {container}\n"
         f"    n_ctx: {requested_ctx}\n"
+        + (f"    warp_auto_context: {str(auto).lower()}\n" if auto is not None else "")
     )
     config = load_config(config_path)
     model = config.models[0]
+    from litmoe.engines.warp import WarpEngine
+    root = _fake_warp_root(tmp_path)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    monkeypatch.setattr(WarpEngine, "start", lambda self, log_dir=None: self.build_command())
     monkeypatch.setattr(
         S,
         "compute_memory_aware_ctx",
@@ -2751,13 +2767,16 @@ def test_server_context_preparation_repairs_warp_zero(
         ),
     )
 
-    S.Gateway(config, config_path=str(config_path))._fix_context(model)
+    S.Gateway(config, config_path=str(config_path)).load_engines()
 
-    if requested_ctx:
-        assert model.n_ctx == requested_ctx
+    if auto is True or (auto is None and requested_ctx in (0, 65536)):
+        assert model.n_ctx > 87644
+        assert model.warp_auto_context is True
     else:
-        assert model.n_ctx > 19572
-    assert load_config(config_path).models[0].n_ctx == model.n_ctx
+        assert model.n_ctx == requested_ctx
+        assert model.warp_auto_context is False
+    saved = load_config(config_path).models[0]
+    assert (saved.n_ctx, saved.warp_auto_context) == (model.n_ctx, model.warp_auto_context)
 
 
 def test_warp_stage_runs_in_own_session_and_dies_with_cli(tmp_path, monkeypatch):
@@ -2981,3 +3000,104 @@ def test_install_warp_reuses_pinned_runtime_without_rebuilding(tmp_path, monkeyp
     monkeypatch.setattr(I.subprocess, "run", fake_run)
 
     assert I.install_warp(prefix) == root
+
+
+def test_warp_context_fit_uses_native_when_recommended_memory_fits():
+    from litmoe.engines.warp_context import fit_native_context
+
+    native = 1048576
+    assert fit_native_context(native, 96 * 1024**3, lambda ctx: 5 * 1024**3 + ctx * 65536) == native
+
+
+def test_warp_context_fit_finds_largest_safe_window():
+    from litmoe.engines.warp_context import fit_native_context
+
+    required = lambda ctx: 1024**3 + ctx * 65536
+    budget = required(131072) + 4095 * 65536
+    resolved = fit_native_context(1048576, budget, required)
+    assert resolved == 131072
+    assert required(resolved) <= budget < required(resolved + 4096)
+
+
+def test_warp_context_fit_refuses_insufficient_memory():
+    from litmoe.engines.warp_context import fit_native_context
+
+    with pytest.raises(ValueError, match="memory"):
+        fit_native_context(1048576, 1024, lambda ctx: 2048 + ctx * 4)
+
+
+def test_warp_auto_context_refits_after_restart(tmp_path, monkeypatch):
+    from litmoe.engines.warp import WarpEngine
+
+    root = _fake_warp_root(tmp_path)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        f"models:\n  - id: glm-5.3-flash-warp\n    engine: warp\n"
+        f"    model_path: {tmp_path}\n    n_ctx: 65536\n"
+    )
+    monkeypatch.setattr(WarpEngine, "start", lambda self, log_dir=None: self.build_command())
+    first = S.Gateway(load_config(path), config_path=str(path))
+    first.load_engines()
+    assert first.config.models[0].n_ctx == 1048576
+    second_config = load_config(path)
+    second_config.models[0].env["TEST_WARP_RAM_GIB"] = "16"
+    second = S.Gateway(second_config, config_path=str(path))
+    second.load_engines()
+    assert second.config.models[0].n_ctx == 114688
+    assert load_config(path).models[0].warp_auto_context is True
+
+
+@pytest.mark.parametrize("extra,expected", [
+    (["--budget", str(13 * 1024**3)], 131072),
+    (["--budget=0", "--budget", str(13 * 1024**3)], 131072),
+    (["--budget", str(13 * 1024**3), "--budget=0"], 1048576),
+    (["--budget", str(14 * 1024**3), "--vision"], 16384),
+])
+def test_warp_auto_context_honors_budget_and_vision(tmp_path, monkeypatch, extra, expected):
+    from litmoe.engines.warp import WarpEngine
+
+    root = _fake_warp_root(tmp_path)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    engine = WarpEngine(ModelEntry(
+        id="deepseek-v4.1-flash-warp", engine="warp", model_path=str(tmp_path),
+        n_ctx=0, extra_args=extra,
+    ))
+    command = engine.build_command()
+    assert int(command[command.index("--ctx") + 1]) == expected
+
+
+@pytest.mark.parametrize("extra", [["--ctx", "4096"], ["--ctx=4096"], ["--ct=4096"]])
+def test_warp_rejects_conflicting_context_flags(tmp_path, monkeypatch, extra):
+    from litmoe.engines.warp import WarpEngine
+
+    root = _fake_warp_root(tmp_path)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    engine = WarpEngine(ModelEntry(
+        id="glm-5.3-flash-warp", engine="warp", model_path=str(tmp_path),
+        n_ctx=131072, extra_args=extra,
+    ))
+    with pytest.raises(ValueError, match="not extra_args"):
+        engine.build_command()
+
+
+def test_warp_planning_failure_preserves_config_and_starts_other_models(tmp_path, monkeypatch):
+    from litmoe.engines.warp import WarpEngine
+
+    root = _fake_warp_root(tmp_path)
+    monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        f"models:\n  - id: glm-5.3-flash-warp\n    engine: warp\n"
+        f"    model_path: {tmp_path}\n    n_ctx: 65536\n"
+        "    env: {TEST_WARP_RAM_GIB: '1'}\n"
+        f"  - id: explicit\n    engine: warp\n    model_path: {tmp_path}\n"
+        "    n_ctx: 131072\n    warp_auto_context: false\n"
+    )
+    before = path.read_bytes()
+    monkeypatch.setattr(WarpEngine, "start", lambda self, log_dir=None: self.build_command())
+    gateway = S.Gateway(load_config(path), config_path=str(path))
+    gateway.load_engines()
+    assert "glm-5.3-flash-warp" not in gateway.engines
+    assert "explicit" in gateway.engines
+    assert path.read_bytes() == before

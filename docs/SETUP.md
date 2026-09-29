@@ -92,7 +92,8 @@ confirmation (`--yes` skips the prompt). It then:
 3. validates the resulting WARP v0 manifest, trunk, codebooks, tokenizer,
    specials, and expert-bank artifacts; and
 4. registers the absolute output path in `models.yaml` with `engine: warp`
-   and `n_ctx: 65536` (or a positive `--n-ctx` override).
+   and `n_ctx: 0`, `warp_auto_context: true`; a positive `--n-ctx` writes
+   a fixed limit with `warp_auto_context: false`.
 
 Interrupting the install (Ctrl-C or a closed terminal) stops the download and
 conversion cleanly; rerun the same command to resume — nothing already
@@ -186,12 +187,26 @@ budget (75 % of RAM on macOS) and usable RAM (90 % minus 3 GB). Over the first
 but under the second it starts with a warning — llama.cpp keeps the overflow
 on the CPU, so it is slower. Over RAM it refuses and names a catalog model or
 quant that does fit. WARP catalog and manual entries are not assessed with
-that weights-plus-KV formula: WARP streams weights and sizes its own memory
-budget. litmoe passes a 65,536-token serving window by default; legacy
-`n_ctx: 0` entries are repaired and persisted at startup. Positive limits
-are preserved. Native 1M support does not imply a 1M runtime allocation fits.
-Use `--n-ctx N` at install time or edit `n_ctx` before restarting the server;
-no re-download or conversion is required to change the runtime window. Serve a subset with
+that weights-plus-KV formula: WARP streams weights. At each startup,
+`warp_auto_context: true` uses the installed WARP memory planner to fit the
+native window (1,048,576 tokens for both catalog entries). Recommended resident
+memory, plus vision memory when enabled, must fit 75% of WARP's usable RAM
+capacity or a smaller explicit `--budget`. If native does not fit, the window
+rounds down in 4096-token blocks. Planning failures stop that model rather
+than silently falling back to 4096 or 65536.
+
+The selected positive `n_ctx` is persisted with automatic mode still enabled.
+Unmarked legacy `n_ctx: 0` and `65536` migrate to this policy; other positive
+values stay fixed. Historical explicit 65536 cannot be distinguished from the
+shipped default: set `warp_auto_context: false` and a positive `n_ctx` to retain
+that limit. A positive install-time `--n-ctx N` selects fixed mode automatically.
+Unknown manual model IDs need `config.max_position_embeddings` in their manifest
+or a fixed context. No re-download or conversion is required; restart the gateway.
+
+The WARP budget is per engine and based on capacity, **not current free RAM**.
+Serve one WARP model at a time, or assign budgets that leave room for other
+models and applications. A manually oversized `--budget` is passed upstream
+unchanged, not clamped by context fitting. Serve a subset with
 `litmoe serve <id> [<id2>…]` (or `--model`), or use `--force` to start
 regardless.
 
@@ -287,8 +302,9 @@ those figures are not reproducible from the repo and are no longer cited.
 ## Step 4: models.yaml
 
 `litmoe install --model` writes catalog entries like the first two below and
-writes a generated WARP container as an absolute `engine: warp`, `n_ctx: 65536`
-entry. Existing WARP containers can still be added manually, as shown below.
+writes a generated WARP container as an absolute `engine: warp`, `n_ctx: 0`,
+`warp_auto_context: true` entry. Existing WARP containers can still be added
+manually, as shown below.
 `litmoe init` creates the file with the default catalog model and Claude-name
 aliases.
 
@@ -317,13 +333,15 @@ models:
   - id: glm-5.3-flash-warp
     engine: warp
     model_path: ~/models/glm53.waste
-    n_ctx: 65536               # serving window, independent of the native model maximum
+    n_ctx: 0
+    warp_auto_context: true    # fit native context at each startup
     extra_args: ["--no-thinking"]
 
   - id: deepseek-v4.1-flash-warp
     engine: warp
     model_path: ~/models/deepseek-v4.1-flash.waste
-    n_ctx: 65536
+    n_ctx: 0
+    warp_auto_context: true
 ```
 
 Field reference (see `litmoe/config.py`):
@@ -334,10 +352,11 @@ Field reference (see `litmoe/config.py`):
 | `model_path` | ktransformers | local safetensors directory or HuggingFace repo id |
 | `model_path` | WARP | local `.waste` container; a WARP catalog install writes the generated absolute path, and manual paths remain supported |
 | `n_ctx` | llama.cpp | context; `0` = memory-aware native |
-| `n_ctx` | WARP | explicit `--ctx N`; `0` resolves to 65536 and is persisted at serve startup; positive values are preserved |
+| `n_ctx` | WARP | resolved positive `--ctx N`; automatically fitted and persisted in auto mode; fixed positive window otherwise |
+| `warp_auto_context` | WARP | `true`: re-fit native context each startup; `false`: preserve a positive `n_ctx`; omitted: migrate legacy 0/65536 to auto |
 | `n_gpu_layers` | llama.cpp | `-ngl` |
-| `extra_args` | all | passed through verbatim to the selected engine; WARP accepts upstream flags including `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify` |
-| `env` | all | extra environment for the engine process only |
+| `extra_args` | all | passed through to the engine; WARP supports `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`, but rejects conflicting `--ctx` |
+| `env` | all | extra environment for the engine process; also used by WARP's isolated memory planner |
 | `kt_method` | ktransformers | CPU expert backend: `FP8`, `FP8_PERCHANNEL`, `BF16`, `RAWINT4`, `MXFP4`, `MXFP8` (AVX-512); `AMXINT4`, `AMXINT8` (Intel AMX); `LLAMAFILE` (AVX2, GGUF experts via `gguf_path`) |
 | `kt_num_gpu_experts` | ktransformers | experts pinned on GPU |
 | `kt_cpuinfer` / `kt_threadpool_count` | ktransformers | CPU threads for expert compute (default physical cores) / thread pools (default NUMA nodes) |

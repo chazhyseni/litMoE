@@ -3,8 +3,10 @@
 # `litmoe models` shows the full catalog with what fits THIS host.
 #
 # llama.cpp context is fitted to weights + KV cache at startup.
-# WARP streams weights and defaults to a 65536-token serving window, not its
-# native maximum. Legacy WARP n_ctx: 0 is repaired to 65536 at startup.
+# WARP uses its own memory planner to fit native context at each startup.
+# Unmarked legacy n_ctx: 0/65536 migrate to auto. To fix a positive n_ctx,
+# set warp_auto_context: false. Budgets are per engine, not shared:
+# serve one WARP model at a time or budget explicitly for concurrent engines.
 
 host: 127.0.0.1
 port: 8090
@@ -60,17 +62,19 @@ models:
   # - id: glm-5.3-flash-warp
   #   engine: warp
   #   model_path: ~/models/glm53.waste
-  #   n_ctx: 65536
+  #   n_ctx: 0
+  #   warp_auto_context: true
   #   extra_args: ["--no-thinking"]
   #
   # DeepSeek-V4.1-Flash — 299 GiB container, 4.86 GB resident floor.
   # - id: deepseek-v4.1-flash-warp
   #   engine: warp
   #   model_path: ~/models/deepseek-v4.1-flash.waste
-  #   n_ctx: 65536
+  #   n_ctx: 0
+  #   warp_auto_context: true
   #
-  # WARP extra_args pass through verbatim: --budget, --threads, --cpus,
-  # --cache, --vision, --verify.
+  # WARP extra_args support --budget, --threads, --cpus, --cache, --vision,
+  # and --verify. Use n_ctx + warp_auto_context for context, not --ctx.
 
   # ── 192 GB workstation ────────────────────────────────────────────────────
   # DeepSeek-V4-Flash — MoE (MLA), 1M ctx. 155 GB → ~179 GB.

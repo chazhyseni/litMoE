@@ -68,9 +68,11 @@ class ModelEntry(BaseModel):
     gguf_path: str | None = None
     # llamacpp: -ngl. -1 = offload as many layers as fit ("auto"), 0 = CPU only.
     n_gpu_layers: int = -1
-    # Context window. litmoe raises values below 16384 to the model's native
-    # context if the KV cache fits in RAM (see server.load_engines).
+    # llama.cpp fits zero/small values at startup. WARP uses the policy below.
     n_ctx: int = 65536
+    # WARP only: True re-fits native context at each startup; False fixes n_ctx.
+    # None migrates the legacy unmarked defaults (0 and 65536) to automatic.
+    warp_auto_context: bool | None = None
     extra_args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     # Alternate model IDs that route to this model's engine

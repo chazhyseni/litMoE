@@ -1,6 +1,6 @@
 # WARP Model Installation Parity Implementation Plan
 
-> Context correction (2026-09-29): the zero-preservation tests and `--n-ctx` rejection in this historical plan are superseded. Installs now accept `--n-ctx`, default to 65536, and serve startup persists repairs of legacy zero entries. Tests cover both WARP catalog models and preserve positive overrides; see [SETUP](../SETUP.md).
+> Context correction (2026-09-29): the zero-preservation tests and `--n-ctx` rejection in this historical plan are superseded. Installs default to automatic native-context fitting via WARP's memory planner; a positive `--n-ctx` selects fixed mode. Startup migrates unmarked legacy 0/65536 entries and persists the resolved window with its auto/fixed policy. Tests cover both WARP catalog models, restart sizing, and explicit overrides; see [SETUP](../SETUP.md).
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
 
