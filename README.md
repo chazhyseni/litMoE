@@ -9,7 +9,7 @@ litmoe is not an inference engine — the forward pass runs in llama.cpp, ktrans
 - **One API for multiple engines.** Mix llama.cpp, ktransformers, and WARP in the same `models.yaml`. Clients see one flat model list at one endpoint.
 - **Anthropic Messages API.** `/v1/messages` (and `/v1/messages/count_tokens`) are translated to OpenAI chat completions, so Claude Code, Hermes Agent, and other Anthropic-format tools work unchanged. Model aliases (`claude-sonnet-4-5` → your local model) are built in, and `scripts/claude-local` / `scripts/hermes-local` run a harness against the gateway **without touching its normal configuration** — plain `claude` keeps using your Anthropic account.
 - **A curated model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` installs the listed model and writes its config entry. Downloads are RAM-tiered, while the two WARP entries are storage-sized recipes that run pinned upstream conversions into local `.waste` containers.
-- **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. For catalogued models, context size is set to the native window and reduced only when weights + KV cache would not fit the GPU budget (Metal's share of unified memory on macOS, RAM elsewhere). For WARP, `n_ctx: 0` preserves the local container's default so WARP can size its own memory budget.
+- **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. llama.cpp context is fitted to the weights + KV budget (Metal's share of unified memory on macOS, RAM elsewhere). WARP uses a configurable 65,536-token serving default, not its advertised native maximum; WARP itself sizes its memory budget.
 - **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual engine process.
 - **Streaming.** Raw SSE passthrough for OpenAI requests; event-by-event translation for Anthropic requests (text, thinking, tool_use).
 
@@ -103,7 +103,7 @@ paths, and asks for confirmation before writing. It then installs WARP
 runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9`, downloads the
 pinned source weights, converts them, validates the resulting WARP v0
 manifest and artifacts, and registers the absolute container path with
-`engine: warp` and `n_ctx: 0`. When `HF_TOKEN` is set, litmoe uses a
+`engine: warp` and `n_ctx: 65536` (override with `--n-ctx`). When `HF_TOKEN` is set, litmoe uses a
 private temporary curl config; the token is never printed or passed in a
 child process's arguments or environment.
 
@@ -227,16 +227,16 @@ models:
   - id: glm-5.3-flash-warp
     engine: warp
     model_path: ~/models/glm53.waste
-    n_ctx: 0                             # preserve container default; WARP sizes its memory budget
+    n_ctx: 65536                         # explicit serving window; increase only with memory headroom
     extra_args: ["--no-thinking"]
 
   - id: deepseek-v4.1-flash-warp
     engine: warp
     model_path: ~/models/deepseek-v4.1-flash.waste
-    n_ctx: 0
+    n_ctx: 65536
 ```
 
-Per-model fields: `id`, `engine` (`llamacpp` | `ktransformers` | `warp`), `model_path`, `n_ctx`, `aliases`, `extra_args`, and `env`; llama.cpp also uses `n_gpu_layers`, while ktransformers uses `gguf_path`, `kt_method`, `kt_num_gpu_experts`, `kt_cpuinfer` (default: physical cores), and `kt_threadpool_count` (default: NUMA nodes). For WARP, `model_path` must be a local `.waste` container and `n_ctx: 0` omits `--ctx`, preserving the container default while WARP sizes its memory budget. WARP `extra_args` are passed upstream verbatim and may include `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`. llama-server gets `-t <physical cores>` unless `extra_args` sets `-t`. When the gateway raises a too-small llama.cpp context it writes the resolved value back into `models.yaml` (comments in the file are not preserved by that rewrite).
+Per-model fields: `id`, `engine` (`llamacpp` | `ktransformers` | `warp`), `model_path`, `n_ctx`, `aliases`, `extra_args`, and `env`; llama.cpp also uses `n_gpu_layers`, while ktransformers uses `gguf_path`, `kt_method`, `kt_num_gpu_experts`, `kt_cpuinfer` (default: physical cores), and `kt_threadpool_count` (default: NUMA nodes). For WARP, `model_path` must be a local `.waste` container. The adapter passes an explicit `--ctx`: legacy `n_ctx: 0` resolves to 65,536 and is persisted at serve startup; positive values are preserved. This avoids upstream's zero-to-4096 runtime fallback without forcing a 1M allocation. WARP `extra_args` are passed upstream verbatim and may include `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`; set context with `n_ctx`, rather than a conflicting `--ctx` in `extra_args`. llama-server gets `-t <physical cores>` unless `extra_args` sets `-t`. Context corrections are written back into `models.yaml` (comments in the file are not preserved by that rewrite).
 
 ---
 

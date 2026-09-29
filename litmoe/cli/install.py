@@ -30,6 +30,7 @@ import yaml
 from litmoe.cli import warp_models as _warp_models
 
 from litmoe.config import default_config_path, expand_path
+from litmoe.engines.warp import DEFAULT_WARP_CTX
 from litmoe.models import (
     CLAUDE_ALIASES,
     DEFAULT_MODEL,
@@ -1283,7 +1284,7 @@ def _positive_warp_jobs(
 @click.option("--prefix", type=click.Path(), default=None,
               help="Install prefix for engine binaries (default: ~/.local)")
 @click.option("--n-ctx", default=None, type=int,
-              help="Context size written to models.yaml (default: native context, reduced to fit RAM)")
+              help="Context size written to models.yaml (WARP: 65536; other engines: native, fitted where supported)")
 @click.option("--no-mmproj", is_flag=True, help="Skip the vision projector for multimodal models")
 @click.option("--config", "-c", type=click.Path(), default=None, help="Path to models.yaml")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompts")
@@ -1351,10 +1352,11 @@ def install_cmd(
     info = lookup(model_name) if model_name else None
     is_warp_model = bool(info and info["format"] == WASTE)
     if is_warp_model:
+        if n_ctx is not None and not 0 <= n_ctx <= 2**31 - 1:
+            raise click.BadParameter("must be between 0 and 2147483647", param_hint="--n-ctx")
         incompatible = [
             ("--quant", quant is not None),
             ("--no-mmproj", no_mmproj),
-            ("--n-ctx", n_ctx is not None),
             ("--engine", engine_from_option or positional_engine),
             ("--llamacpp-variant", llamacpp_variant_from_option),
             ("--llamacpp-tag", llamacpp_tag_from_option),
@@ -1521,7 +1523,8 @@ def install_cmd(
         except Exception as e:
             click.echo(f"  WARP model install failed: {e}", err=True)
             sys.exit(1)
-        add_model_to_config(model_name, engine_for_model, path, 0, config_path)
+        model_ctx = n_ctx or DEFAULT_WARP_CTX
+        add_model_to_config(model_name, engine_for_model, path, model_ctx, config_path)
     else:
         path, mmproj = download_model(
             model_name,

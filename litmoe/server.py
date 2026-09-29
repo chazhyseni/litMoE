@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from litmoe.config import GatewayConfig, ModelEntry, expand_path, is_hf_repo_spec
 from litmoe.engines import make_engine, Engine
 from litmoe.engines.base import DEFAULT_ENGINE_PORT
+from litmoe.engines.warp import DEFAULT_WARP_CTX
 from litmoe.models import (_MODEL_OVERHEAD, _OS_HEADROOM_GB, fit_context, lookup as catalog_lookup,
                            memory_budgets_gb, quant_size_gb)
 from litmoe.platform_utils import get_total_memory_bytes, is_macos
@@ -429,14 +430,24 @@ class Gateway:
                 self.engines[alias] = engine
 
     def _fix_context(self, model: ModelEntry) -> None:
-        """Bring n_ctx to a memory-aware value and persist it to models.yaml.
+        """Resolve context defaults and persist corrections to models.yaml.
 
         Zero/stale (< MIN_SANE_CTX) values are raised to the fitted native
         context. Values the current machine cannot hold — e.g. a native 262K
         written for a model whose weights already exceed the GPU budget — are
         lowered, since starting them ends in an out-of-memory engine that still
-        reports healthy. Only for llama.cpp entries: sglang-kt sizes its own KV.
+        reports healthy. That fit is only for llama.cpp: sglang-kt sizes its
+        own KV. WARP streams weights; replace only its legacy zero sentinel,
+        without treating container size as resident RAM or forcing native 1M.
         """
+        if model.engine == "warp":
+            if model.n_ctx == 0:
+                model.n_ctx = DEFAULT_WARP_CTX
+                logger.warning("Model %s: replacing WARP n_ctx=0 with %d; "
+                               "the runtime otherwise defaults to 4096 tokens",
+                               model.id, model.n_ctx)
+                self._persist_ctx(model)
+            return
         if model.engine != "llamacpp":
             return
         old = model.n_ctx or 0

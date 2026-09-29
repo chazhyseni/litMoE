@@ -1,5 +1,7 @@
 # WARP Model Installation Parity Implementation Plan
 
+> Context correction (2026-09-29): the zero-preservation tests and `--n-ctx` rejection in this historical plan are superseded. Installs now accept `--n-ctx`, default to 65536, and serve startup persists repairs of legacy zero entries. Tests cover both WARP catalog models and preserve positive overrides; see [SETUP](../SETUP.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
 
 **Goal:** Make GLM-5.3-Flash and DeepSeek-V4.1-Flash WARP models installable, convertible, validated, and configurable through `litmoe install --model`.

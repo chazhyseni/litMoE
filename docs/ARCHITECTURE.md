@@ -29,7 +29,7 @@ process supervision. Every component earns its place.
    │   ENGINE SUPERVISOR                                                            │
    │   - one subprocess per model, own session/pgid, PID file in ~/.litmoe/run      │
    │   - ports 8081+ skipping the gateway port and anything already bound           │
-   │   - catalog n_ctx is memory-aware; WARP 0 keeps its container default          │
+   │   - llama.cpp n_ctx is memory-aware; WARP 0 resolves to 65536 tokens           │
    │   - SIGTERM/SIGINT/SIGHUP to the gateway stops every engine (no orphans)       │
    └───────────────┬──────────────────────┬───────────────────────┬────────────────┘
                    │ :8081                │ :8082                 │ :8083
@@ -105,7 +105,8 @@ When `HF_TOKEN` is set, litmoe places it in a private temporary curl config;
 the token is not printed or passed through child arguments or environment.
 After the pipeline returns, litmoe validates the WARP v0 manifest and its
 referenced trunk, codebook, tokenizer, specials, and expert-bank files before
-registering the absolute output path as `engine: warp`, `n_ctx: 0`. Partial
+registering the absolute output path as `engine: warp`, `n_ctx: 65536` (or
+a positive `--n-ctx` override). Partial
 source, output, and run/report data are retained so the same command can
 resume; nothing already downloaded is refetched. The runtime-only
 `litmoe install --engine warp` and manually configured local `.waste`
@@ -115,7 +116,8 @@ containers remain valid alternatives.
 ## Engine lifecycle
 
 - `litmoe serve` reads `models.yaml`, applies memory-aware context sizing to
-  catalogued models, and preserves a WARP container's default when `n_ctx: 0`.
+  llama.cpp models, and repairs legacy WARP `n_ctx: 0` to 65536, persisting it.
+  WARP positive limits are preserved; its container size is not resident RAM.
   It starts each engine in its own process group, writes
   `~/.litmoe/run/<id>.pid`, waits for readiness, then serves.
 - Engine stdout/stderr append to `logs/<id>.log` with a per-start header.

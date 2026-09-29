@@ -260,7 +260,11 @@ def test_warp_command_uses_local_container_and_upstream_server(tmp_path, monkeyp
     eng = make_engine(model)
     assert isinstance(eng, WarpEngine)
     eng.set_port(8087)
-    assert eng.build_command() == [
+    command = eng.build_command()
+    ctx_index = command.index("--ctx")
+    assert int(command[ctx_index + 1]) > 19572
+    del command[ctx_index:ctx_index + 2]
+    assert command == [
         sys.executable,
         str(root / "serve" / "__main__.py"),
         str(model_path),
@@ -2454,6 +2458,7 @@ def test_warp_cli_rejects_resolved_plan_path_overlap_before_preflight(
     assert not config.exists()
 
 
+@pytest.mark.parametrize("requested_ctx", [None, 0, 98304])
 @pytest.mark.parametrize(
     "model_id,target_args,expected_jobs,expected_reclaim",
     [
@@ -2472,6 +2477,7 @@ def test_warp_cli_rejects_resolved_plan_path_overlap_before_preflight(
 )
 def test_install_warp_catalog_model_dispatches_positional_and_option(
     tmp_path, monkeypatch, model_id, target_args, expected_jobs, expected_reclaim,
+    requested_ctx,
 ):
     from click.testing import CliRunner
 
@@ -2538,6 +2544,7 @@ def test_install_warp_catalog_model_dispatches_positional_and_option(
         "--staging-dir", str(staging_dir),
         "--models-dir", str(models_dir),
         "--config", str(config),
+        *(["--n-ctx", str(requested_ctx)] if requested_ctx is not None else []),
         "--yes",
     ])
 
@@ -2562,7 +2569,10 @@ def test_install_warp_catalog_model_dispatches_positional_and_option(
     assert warp.engine == "warp"
     assert Path(warp.model_path).is_absolute()
     assert Path(warp.model_path) == container
-    assert warp.n_ctx == 0
+    if requested_ctx:
+        assert warp.n_ctx == requested_ctx
+    else:
+        assert warp.n_ctx > 19572
     assert warp.aliases == ["warp-alias"]
 
 
@@ -2581,6 +2591,21 @@ def test_install_rejects_nonpositive_warp_jobs():
     assert "positive" in result.output.lower() or "at least 1" in result.output.lower()
 
 
+@pytest.mark.parametrize("requested_ctx", ["-1", "2147483648"])
+def test_install_rejects_invalid_warp_context_before_install(monkeypatch, requested_ctx):
+    from click.testing import CliRunner
+
+    monkeypatch.setattr(
+        I, "install_warp",
+        lambda *args, **kwargs: pytest.fail("invalid context must not start installation"),
+    )
+    result = CliRunner().invoke(I.install_cmd, [
+        "--model", "glm-5.3-flash-warp", "--n-ctx", requested_ctx, "--yes",
+    ])
+    assert result.exit_code == 2
+    assert "--n-ctx" in result.output
+
+
 @pytest.mark.parametrize(
     "args,option",
     [
@@ -2591,10 +2616,6 @@ def test_install_rejects_nonpositive_warp_jobs():
         (
             ["--model", "glm-5.3-flash-warp", "--no-mmproj"],
             "--no-mmproj",
-        ),
-        (
-            ["--model", "glm-5.3-flash-warp", "--n-ctx", "32768"],
-            "--n-ctx",
         ),
         (
             ["--model", "glm-5.3-flash-warp", "--engine", "llamacpp"],
@@ -2701,20 +2722,25 @@ def test_install_warp_failure_does_not_mutate_config(tmp_path, monkeypatch):
     assert partial.read_bytes() == b"resume me"
 
 
-def test_server_context_preparation_preserves_warp_zero(tmp_path, monkeypatch):
+@pytest.mark.parametrize("model_id", [
+    "glm-5.3-flash-warp", "deepseek-v4.1-flash-warp",
+])
+@pytest.mark.parametrize("requested_ctx", [0, 4096, 32768])
+def test_server_context_preparation_repairs_warp_zero(
+    tmp_path, monkeypatch, model_id, requested_ctx,
+):
     config_path = tmp_path / "models.yaml"
     container = _fake_waste_container(
-        tmp_path / "glm-5.3-flash-warp.waste",
-        "glm-5.3-flash-warp",
+        tmp_path / f"{model_id}.waste",
+        model_id,
     )
     config_path.write_text(
         "host: 127.0.0.1\nport: 8090\nmodels:\n"
-        "  - id: glm-5.3-flash-warp\n"
+        f"  - id: {model_id}\n"
         "    engine: warp\n"
         f"    model_path: {container}\n"
-        "    n_ctx: 0\n"
+        f"    n_ctx: {requested_ctx}\n"
     )
-    before = config_path.read_bytes()
     config = load_config(config_path)
     model = config.models[0]
     monkeypatch.setattr(
@@ -2727,8 +2753,11 @@ def test_server_context_preparation_preserves_warp_zero(tmp_path, monkeypatch):
 
     S.Gateway(config, config_path=str(config_path))._fix_context(model)
 
-    assert model.n_ctx == 0
-    assert config_path.read_bytes() == before
+    if requested_ctx:
+        assert model.n_ctx == requested_ctx
+    else:
+        assert model.n_ctx > 19572
+    assert load_config(config_path).models[0].n_ctx == model.n_ctx
 
 
 def test_warp_stage_runs_in_own_session_and_dies_with_cli(tmp_path, monkeypatch):

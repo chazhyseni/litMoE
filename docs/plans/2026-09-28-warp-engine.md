@@ -1,5 +1,7 @@
 # WARP Engine Integration Implementation Plan
 
+> Context correction (2026-09-29): this historical plan's “0 preserves the container default” assumption is superseded. Upstream `waste_open` maps zero to 4096. litmoe now resolves WARP zero to 65536, always passes `--ctx`, and persists legacy zero repairs. Positive limits remain explicit choices; see [SETUP](../SETUP.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use subagent-driven development and test-driven development to implement this plan task-by-task.
 
 **Goal:** Add a first-class local WARP engine so litMoE can serve existing `.waste` containers—especially GLM-5.3-Flash and DeepSeek-V4.1-Flash—through its OpenAI and Anthropic endpoints without a remote inference API.

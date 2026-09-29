@@ -146,7 +146,7 @@
   <text x="970" y="832" class="box-text">runs upstream fetch dry-run + pipeline</text>
   <text x="970" y="852" class="box-text">validates WARP v0 artifacts, then registers</text>
   <text x="970" y="872" class="box-text-mono">manual: litmoe install --engine warp</text>
-  <text x="970" y="892" class="box-text">absolute output path · engine: warp · n_ctx: 0</text>
+  <text x="970" y="892" class="box-text">absolute path · engine: warp · n_ctx: 65536</text>
   <text x="970" y="912" class="box-text">WARP owns conversion and inference code</text>
 
   <!-- Bottom: models.yaml and CLI -->
@@ -164,7 +164,7 @@
     <text x="130" y="1138">- id: glm-5.3-flash-warp</text>
     <text x="160" y="1159">engine: warp</text>
     <text x="160" y="1180">model_path: /home/me/.litmoe/models/glm-5.3-flash-warp.waste</text>
-    <text x="160" y="1201">n_ctx: 0  # preserve container default</text>
+    <text x="160" y="1201">n_ctx: 65536  # explicit serving window</text>
     <text x="160" y="1222">extra_args: ["--no-thinking"]</text>
   </g>
 

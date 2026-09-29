@@ -2,9 +2,9 @@
 # Copy to models.yaml (or run `litmoe init`) and uncomment what fits your machine.
 # `litmoe models` shows the full catalog with what fits THIS host.
 #
-# Catalog entries start with the model's native context; litmoe lowers n_ctx
-# at start-up if RAM cannot hold weights + KV cache. WARP uses different
-# semantics: n_ctx: 0 preserves the .waste container default.
+# llama.cpp context is fitted to weights + KV cache at startup.
+# WARP streams weights and defaults to a 65536-token serving window, not its
+# native maximum. Legacy WARP n_ctx: 0 is repaired to 65536 at startup.
 
 host: 127.0.0.1
 port: 8090
@@ -55,19 +55,19 @@ models:
   # ── WARP ────────────────────────────────────────────────────────────────
   # `litmoe install --model glm-5.3-flash-warp` installs the model and writes
   # the container path here. Options: --staging-dir, --warp-jobs,
-  # --reclaim-source. Or add a local .waste container manually.
+  # --reclaim-source, --n-ctx. Or add a local .waste container manually.
   # GLM-5.3-Flash — 112 GB container, 5.14 GB resident floor.
   # - id: glm-5.3-flash-warp
   #   engine: warp
   #   model_path: ~/models/glm53.waste
-  #   n_ctx: 0
+  #   n_ctx: 65536
   #   extra_args: ["--no-thinking"]
   #
   # DeepSeek-V4.1-Flash — 299 GiB container, 4.86 GB resident floor.
   # - id: deepseek-v4.1-flash-warp
   #   engine: warp
   #   model_path: ~/models/deepseek-v4.1-flash.waste
-  #   n_ctx: 0
+  #   n_ctx: 65536
   #
   # WARP extra_args pass through verbatim: --budget, --threads, --cpus,
   # --cache, --vision, --verify.

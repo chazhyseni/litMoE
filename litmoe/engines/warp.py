@@ -9,6 +9,10 @@ from pathlib import Path
 from litmoe.config import ModelEntry, expand_path
 from litmoe.engines.base import Engine
 
+# Zero reaches a 4096-token fallback in waste_open, not the trained context.
+# Use a bounded serving default; larger windows must be selected explicitly.
+DEFAULT_WARP_CTX = 65_536
+
 
 def _library_name() -> str:
     if sys.platform == "darwin":
@@ -106,8 +110,7 @@ class WarpEngine(Engine):
             "--model-id",
             self.model.id,
         ]
-        if self.model.n_ctx > 0:
-            cmd.extend(["--ctx", str(self.model.n_ctx)])
+        cmd.extend(["--ctx", str(self.model.n_ctx or DEFAULT_WARP_CTX)])
         cmd.extend(self.model.extra_args)
         return cmd
 

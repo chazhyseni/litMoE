@@ -1,5 +1,7 @@
 # WARP Model Installation Parity Design
 
+> Context correction (2026-09-29): the zero-context policy below is historical and superseded. WARP installs now write 65536 by default, accept `--n-ctx`, and repair legacy zero entries at serve startup. WARP remains excluded from llama.cpp's full-weight memory fitter; see [SETUP](../SETUP.md).
+
 ## Goal
 
 Make WARP-backed GLM-5.3-Flash and DeepSeek-V4.1-Flash installable through the same catalog command used by other litMoE models:
