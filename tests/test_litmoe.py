@@ -2841,8 +2841,8 @@ def test_warp_install_refuses_concurrent_stage_processes(tmp_path, monkeypatch):
     )
     calls = []
 
-    def fake_snapshot(path):
-        calls.append(Path(path))
+    def fake_snapshot(paths):
+        calls.append(tuple(Path(path) for path in paths))
         return [4242]
 
     monkeypatch.setattr(
@@ -2863,7 +2863,10 @@ def test_warp_install_refuses_concurrent_stage_processes(tmp_path, monkeypatch):
             models_dir=tmp_path / "models",
         )
 
-    assert calls == [source]
+    source = (staging_dir / model_id).absolute()
+    output = (tmp_path / "models" / f"{model_id}.waste").absolute()
+    run_dir = (tmp_path / "models" / f"{model_id}.warp-run").absolute()
+    assert calls == [(source, output, run_dir)]
 
 
 def test_warp_install_dedupes_download_state_ledger(tmp_path, monkeypatch):
@@ -2901,3 +2904,51 @@ def test_warp_install_dedupes_download_state_ledger(tmp_path, monkeypatch):
 
     assert result.is_dir()
     assert (source / ".download-state").read_text().splitlines() == shards
+
+def test_stage_matcher_covers_seedless_ancestors(monkeypatch):
+    """pipeline.sh carries paths only in env vars; its children carry none.
+
+    The matcher must still count convert.py (which names the paths), its
+    multiprocessing workers (which name nothing), and pipeline.sh itself
+    (an ancestor of convert.py), or a rerun stacks a second conversion on
+    a live one.
+    """
+    source = Path("/staging/glm")
+    output = Path("/models/glm.waste")
+    run_dir = Path("/models/glm.warp-run")
+    table = {
+        10: (1, "/bin/bash /warp/tools/pipeline.sh"),
+        11: (10, "uv run python tools/convert.py --src /staging/glm --out /models/glm.waste"),
+        12: (11, "python -c from multiprocessing.spawn import spawn_main"),
+        13: (1, "python -c from multiprocessing.spawn import spawn_main"),
+        14: (1, "/bin/bash /other/tools/pipeline.sh"),
+    }
+
+    monkeypatch.setattr(I._warp_models, "_stage_processes", lambda: table)
+
+    assert I._warp_models._snapshot_live_processes((source, output, run_dir)) == [10, 11, 12]
+    assert I._warp_models._snapshot_live_processes((Path("/staging/other"), Path("/models/other.waste"), Path("/models/other.run"))) == []
+
+
+def test_install_warp_reuses_pinned_runtime_without_rebuilding(tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    root = prefix / "lib" / "warp"
+    (root / "serve").mkdir(parents=True)
+    (root / "serve" / "__main__.py").write_text("")
+    library = "libwaste.dylib" if sys.platform == "darwin" else (
+        "libwaste.dll" if sys.platform == "win32" else "libwaste.so"
+    )
+    (root / library).write_bytes(b"library")
+    (root / "tools").mkdir()
+    (root / "tools" / "fetch_weights.sh").write_text("#!/usr/bin/env bash\n")
+    (root / "tools" / "pipeline.sh").write_text("#!/usr/bin/env bash\n")
+
+    import subprocess as subprocess_module
+
+    def fake_run(args, **kwargs):
+        assert args[:3] == ["git", "rev-parse", "HEAD"], args
+        return subprocess_module.CompletedProcess(args, 0, I.WARP_COMMIT + "\n", "")
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    assert I.install_warp(prefix) == root

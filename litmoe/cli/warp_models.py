@@ -125,45 +125,30 @@ def _dedupe_download_state(source_dir: Path) -> None:
         state.write_text("\n".join(unique) + "\n" if unique else "")
 
 
-def _find_live_stage_pids(source_dir: Path) -> list[int]:
-    """PIDs of fetch/pipeline processes operating on *source_dir*.
+_STAGE_MARKERS = ("fetch_weights.sh", "pipeline.sh", ".worker.sh", "convert.py")
 
-    A previous litmoe process can die without stopping the shell stages it
-    started. Rerunning would stack a second concurrent fetch onto the
-    survivor, and two ``curl -C -`` writers on one shard file corrupt each
-    other's partial data. Any live match — even from another machine user —
-    means refuse rather than corrupt.
-    """
-    marker = str(source_dir)
-    pids: list[int] = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid == os.getpid():
-            continue
+
+def _stage_processes() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, command) for every process, from ``ps`` or ``/proc``."""
+    if Path("/proc").is_dir():
+        table: dict[int, tuple[int, str]] = {}
         try:
-            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat_fields = (entry / "stat").read_text().rsplit(")", 1)[-1].split()
+                    ppid = int(stat_fields[1])
+                    command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+                except (OSError, ValueError, IndexError):
+                    continue
+                table[int(entry.name)] = (ppid, command)
         except OSError:
-            continue
-        args = [part.decode("utf-8", "replace") for part in cmdline if part]
-        if not args:
-            continue
-        joined = " ".join(args)
-        if marker in joined and any(
-            "fetch_weights.sh" in a or "pipeline.sh" in a or ".worker.sh" in a
-            for a in args
-        ):
-            pids.append(pid)
-    return pids
-
-
-def _macos_find_live_stage_pids(source_dir: Path) -> list[int]:
-    """Same live-stage detection on macOS, via ``ps``."""
-    marker = str(source_dir)
+            return {}
+        return table
     try:
         process = _real_popen(
-            ["ps", "-axo", "pid=,command="],
+            ["ps", "-axo", "pid=,ppid=,command="],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -173,34 +158,67 @@ def _macos_find_live_stage_pids(source_dir: Path) -> list[int]:
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate()
-            return []
+            return {}
     except (OSError, subprocess.SubprocessError):
-        return []
+        return {}
     if process.returncode != 0 or not listing:
-        return []
-    pids: list[int] = []
+        return {}
+    table = {}
     for line in listing.splitlines():
-        fields = line.strip().split(None, 1)
-        if len(fields) != 2 or not fields[0].isdigit():
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             continue
-        pid = int(fields[0])
-        if pid == os.getpid():
-            continue
-        command = fields[1]
-        if marker not in command:
-            continue
-        if (
-            "fetch_weights.sh" in command
-            or "pipeline.sh" in command
-            or ".worker.sh" in command
-        ):
-            pids.append(pid)
-    return pids
+        table[int(fields[0])] = (int(fields[1]), fields[2])
+    return table
 
+
+def _snapshot_live_processes(paths: tuple[Path, ...]) -> list[int]:
+    """PIDs of live fetch/convert processes working on *paths*.
+
+    A stage can outlive the litmoe run that started it. A rerun would then
+    run a second fetch or conversion against the same files; upstream tooling
+    has no locking, so refuse instead of corrupting. A process counts when
+    its own command names a plan path (``convert.py`` arguments) or it
+    descends from one that does (``pipeline.sh`` passes paths via the
+    environment, so its curl/xargs children carry none).
+    """
+    markers = tuple(str(path) for path in paths)
+    table = _stage_processes()
+    if not table:
+        return []
+    seeds = {
+        pid
+        for pid, (_ppid, command) in table.items()
+        if pid != os.getpid()
+        and any(marker in command for marker in markers)
+        and any(name in command for name in _STAGE_MARKERS)
+    }
+
+    def related(pid: int) -> bool:
+        seen: set[int] = set()
+        while pid in table and pid not in seen:
+            if pid in seeds or pid == os.getpid():
+                return pid in seeds
+            seen.add(pid)
+            pid = table[pid][0]
+        return False
+
+    # Descendants of a seed inherit its work; ancestors (pipeline.sh above
+    # convert.py) are the seed's own supervisors and must count too.
+    matched = set(seeds)
+    for pid in table:
+        if related(pid):
+            matched.add(pid)
+    for seed in seeds:
+        pid = table[seed][0]
+        while pid in table and pid != os.getpid() and pid != 1:
+            matched.add(pid)
+            pid = table[pid][0]
+    return sorted(matched)
 
 @contextmanager
 def _install_lock(run_dir: Path, model_id: str):
-    """Serialize installs of one model and refuse to stack on live stages."""
+    """Serialize installs of one model behind a run-dir lock."""
     run_dir.mkdir(parents=True, exist_ok=True)
     lock_path = run_dir / "install.lock"
     existing_pid = _read_pid(lock_path)
@@ -222,15 +240,6 @@ def _install_lock(run_dir: Path, model_id: str):
                 lock_path.unlink(missing_ok=True)
         except OSError:
             pass
-
-
-def _snapshot_live_processes(source_dir: Path) -> list[int]:
-    """Live stage PIDs for *source_dir* on this platform."""
-    if sys.platform == "darwin":
-        return _macos_find_live_stage_pids(source_dir)
-    if Path("/proc").is_dir():
-        return _find_live_stage_pids(source_dir)
-    return []
 
 
 def require_tools(
@@ -598,14 +607,14 @@ def install_model(
         if not script.is_file():
             raise RuntimeError(f"WARP runtime is missing required tool: {script}")
 
-    live = _snapshot_live_processes(plan.source)
+    live = _snapshot_live_processes((plan.source, plan.output, plan.run_dir))
     if live:
         listed = ", ".join(str(pid) for pid in live[:8])
         raise RuntimeError(
             f"a WARP fetch or conversion for {model_id!r} is already running "
             f"(PID{'' if len(live) == 1 else 's'} {listed}). Two installs "
-            "would write the same shard files at once and corrupt them; "
-            "wait for the running one to finish or stop it first."
+            "would write the same files at once; wait for the running one "
+            "to finish or stop it first."
         )
 
     reclaimed = _reclaimed_source_is_complete(plan.source)

@@ -391,9 +391,38 @@ def _warp_library_name() -> str:
         return "libwaste.dll"
     return "libwaste.so"
 
+def _installed_warp_root(prefix: Path) -> Path | None:
+    """The installed WARP runtime root when it is complete and pinned."""
+    root = prefix / "lib" / "warp"
+    required = (
+        root / "serve" / "__main__.py",
+        root / _warp_library_name(),
+        root / "tools" / "fetch_weights.sh",
+        root / "tools" / "pipeline.sh",
+    )
+    if not all(path.is_file() for path in required):
+        return None
+    try:
+        pinned = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if pinned.returncode != 0:
+        return None
+    return root if pinned.stdout.strip() == WARP_COMMIT else None
+
 
 def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
-    """Build and install an exact WARP source revision."""
+    """Build and install an exact WARP source revision, or reuse the pinned one."""
+    existing = _installed_warp_root(prefix)
+    if existing is not None:
+        click.echo(f"  WARP already installed: {existing}")
+        return existing
     for tool in ("git", "make"):
         if not shutil.which(tool):
             raise RuntimeError(
@@ -1364,6 +1393,16 @@ def install_cmd(
             )
         except Exception as exc:
             raise click.ClickException(str(exc)) from exc
+        live = _warp_models._snapshot_live_processes(
+            (plan.source, plan.output, plan.run_dir)
+        )
+        if live:
+            listed = ", ".join(str(pid) for pid in live[:8])
+            raise click.ClickException(
+                f"a WARP install for {model_name} is already running (PID"
+                f"{'' if len(live) == 1 else 's'} {listed}); wait for it to "
+                "finish or stop it, then rerun."
+            )
 
         output_unit = (
             "GiB"
@@ -1409,6 +1448,13 @@ def install_cmd(
     if engine == "warp":
         click.echo("Installing WARP...")
         try:
+            if _warp_models._snapshot_live_processes(
+                (prefix / "lib" / "warp",)
+            ):
+                raise RuntimeError(
+                    "a WARP fetch or conversion is running from the runtime "
+                    "tree; stop it before replacing the runtime"
+                )
             warp_root = install_warp(prefix)
         except Exception as e:
             click.echo(f"  WARP install failed: {e}", err=True)
