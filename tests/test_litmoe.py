@@ -2755,13 +2755,39 @@ def test_warp_stage_runs_in_own_session_and_dies_with_cli(tmp_path, monkeypatch)
     monkeypatch.setattr(I, "LONG_QUIET_SECONDS", 0.05, raising=False)
 
     def stage_pgid():
+        """Process group of the stage tree, or None when it is gone.
+
+        Linux: match ``/proc/<pid>/cmdline`` directly — full argv, never
+        truncated. When stdout is not a tty, some ``ps`` builds cut the
+        command column at a narrow width and the long pytest tmp path no
+        longer matches, so the scan would miss a live stage entirely.
+        Elsewhere (macOS): fall back to ``ps`` as before.
+        """
+        target = str(script)
+        proc_root = Path("/proc")
+        if proc_root.is_dir():
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                args = [part.decode("utf-8", "replace") for part in cmdline if part]
+                if target not in args:
+                    continue
+                try:
+                    return os.getpgid(int(entry.name))
+                except OSError:
+                    continue
+            return None
         listings = subprocess_module.run(
             ["ps", "-axo", "pgid=,command="],
             capture_output=True,
             text=True,
         ).stdout
         for line in listings.splitlines():
-            if str(script) in line and "sleep" not in line:
+            if target in line and "sleep" not in line:
                 return int(line.split()[0])
         return None
 
