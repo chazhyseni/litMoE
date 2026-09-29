@@ -7,6 +7,10 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+
+# Local agent/coordinator runtime state
+.claude-flow/
+.swarm/
 .venv/
 venv/
 
