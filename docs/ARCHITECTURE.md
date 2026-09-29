@@ -92,13 +92,14 @@ the three paths not to overlap or nest, including through resolved symlink
 aliases. It checks `git`, `make`, `bash`, `curl`, `uv`, and free storage,
 prints the pinned revision and size plan, and confirms before writing. It
 installs pinned WARP runtime commit
-`09fcff352ca55223b08ee222d15054b90546c6a9`, then invokes WARP's upstream fetch
-dry-run and conversion pipeline. A proven reclaimed resume skips the fetch
-dry-run and continues the pipeline. During the long stage, the runner wraps
-each stage in a watchdog: internal terminal noise is captured rather than
-printed, and a heartbeat line with elapsed seconds and the `download.log` /
-`pipeline.log` paths repeats every minute so a multi-hour stage never looks
-hung.
+`09fcff352ca55223b08ee222d15054b90546c6a9`, then runs WARP's upstream
+download and conversion pipeline. Each stage runs in its own session and is
+owned by the CLI: on interrupt or hangup the entire stage process group is
+terminated, so no orphaned download or conversion survives its parent. A
+second install of the same model is refused while one is running. Internal
+terminal noise is captured rather than printed, and a heartbeat line with
+elapsed seconds and the `download.log` / `pipeline.log` paths repeats every
+minute so a multi-hour stage never looks hung.
 
 When `HF_TOKEN` is set, litmoe places it in a private temporary curl config;
 the token is not printed or passed through child arguments or environment.
@@ -106,8 +107,9 @@ After the pipeline returns, litmoe validates the WARP v0 manifest and its
 referenced trunk, codebook, tokenizer, specials, and expert-bank files before
 registering the absolute output path as `engine: warp`, `n_ctx: 0`. Partial
 source, output, and run/report data are retained so the same command can
-resume. The runtime-only `litmoe install --engine warp` and manually configured
-local `.waste` containers remain valid alternatives.
+resume; nothing already downloaded is refetched. The runtime-only
+`litmoe install --engine warp` and manually configured local `.waste`
+containers remain valid alternatives.
 
 
 ## Engine lifecycle

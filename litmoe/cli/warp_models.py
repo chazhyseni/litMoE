@@ -5,17 +5,20 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 from litmoe.models import WASTE, lookup
 
 _DISK_SAFETY_FRACTION = 0.05
+_real_popen = subprocess.Popen
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,7 @@ class WarpInstallPlan:
     run_dir: Path
     source_bytes: int
     output_workspace_bytes: int
+    lock_path: Path
 
 
 def build_plan(
@@ -70,7 +74,163 @@ def build_plan(
         run_dir=paths["run"],
         source_bytes=int(info["source_size_gib"]) * 1024**3,
         output_workspace_bytes=int(info["output_workspace_gib"]) * 1024**3,
+        lock_path=paths["run"] / "install.lock",
     )
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether *pid* names a live process (zombies answer 'Permission' too)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _read_pid(path: Path) -> int | None:
+    """The PID recorded at *path*, or None when unreadable or non-numeric."""
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    fields = text.split()
+    if not fields or not fields[0].isdigit():
+        return None
+    return int(fields[0])
+
+
+def _dedupe_download_state(source_dir: Path) -> None:
+    """Rewrite ``.download-state`` without duplicate shard entries.
+
+    Concurrent fetch passes append lines without locking, so a ledger that
+    was ever written by two runs at once can list a shard twice; the
+    upstream pipeline counts lines, which would let it finish while shards
+    are still missing. Keeping first-seen order, drop duplicates in place.
+    """
+    state = source_dir / ".download-state"
+    try:
+        lines = state.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return
+    seen: set[str] = set()
+    unique: list[str] = []
+    for line in lines:
+        name = line.strip()
+        if name and name not in seen:
+            seen.add(name)
+            unique.append(name)
+    if len(unique) != len(lines):
+        state.write_text("\n".join(unique) + "\n" if unique else "")
+
+
+def _find_live_stage_pids(source_dir: Path) -> list[int]:
+    """PIDs of fetch/pipeline processes operating on *source_dir*.
+
+    A previous litmoe process can die without stopping the shell stages it
+    started. Rerunning would stack a second concurrent fetch onto the
+    survivor, and two ``curl -C -`` writers on one shard file corrupt each
+    other's partial data. Any live match — even from another machine user —
+    means refuse rather than corrupt.
+    """
+    marker = str(source_dir)
+    pids: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        args = [part.decode("utf-8", "replace") for part in cmdline if part]
+        if not args:
+            continue
+        joined = " ".join(args)
+        if marker in joined and any(
+            "fetch_weights.sh" in a or "pipeline.sh" in a or ".worker.sh" in a
+            for a in args
+        ):
+            pids.append(pid)
+    return pids
+
+
+def _macos_find_live_stage_pids(source_dir: Path) -> list[int]:
+    """Same live-stage detection on macOS, via ``ps``."""
+    marker = str(source_dir)
+    try:
+        process = _real_popen(
+            ["ps", "-axo", "pid=,command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            listing, _ = process.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return []
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if process.returncode != 0 or not listing:
+        return []
+    pids: list[int] = []
+    for line in listing.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        pid = int(fields[0])
+        if pid == os.getpid():
+            continue
+        command = fields[1]
+        if marker not in command:
+            continue
+        if (
+            "fetch_weights.sh" in command
+            or "pipeline.sh" in command
+            or ".worker.sh" in command
+        ):
+            pids.append(pid)
+    return pids
+
+
+@contextmanager
+def _install_lock(run_dir: Path, model_id: str):
+    """Serialize installs of one model and refuse to stack on live stages."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir / "install.lock"
+    existing_pid = _read_pid(lock_path)
+    if existing_pid is not None and _pid_alive(existing_pid):
+        raise RuntimeError(
+            f"another litmoe WARP install of {model_id!r} is running (PID "
+            f"{existing_pid}); it owns the fetch and conversion stages. Wait "
+            "for it to finish, or stop it, before starting another."
+        )
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        yield
+    finally:
+        try:
+            if _read_pid(lock_path) == os.getpid():
+                lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _snapshot_live_processes(source_dir: Path) -> list[int]:
+    """Live stage PIDs for *source_dir* on this platform."""
+    if sys.platform == "darwin":
+        return _macos_find_live_stage_pids(source_dir)
+    if Path("/proc").is_dir():
+        return _find_live_stage_pids(source_dir)
+    return []
 
 
 def require_tools(
@@ -273,12 +433,21 @@ def _run_stage(
     source: Path,
     output: Path,
     run_dir: Path,
-    run: Callable[..., subprocess.CompletedProcess[str]],
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     hf_token: str | None = None,
 ) -> None:
+    """Run one upstream stage; KeyboardInterrupt kills the whole stage tree.
+
+    The runner passed as *run* (``litmoe.cli.install._run_warp_stage``)
+    starts the stage in its own session and terminates the entire process
+    group when litmoe is interrupted, so no orphaned fetch or conversion
+    survives the CLI that started it.
+    """
     context = f"source {source}; output {output}; run directory {run_dir}"
     try:
         result = run(args, cwd=cwd, env=dict(env))
+    except KeyboardInterrupt:
+        raise
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"WARP {stage} failed: {exc}; {context}. Partial data was preserved; "
@@ -429,6 +598,16 @@ def install_model(
         if not script.is_file():
             raise RuntimeError(f"WARP runtime is missing required tool: {script}")
 
+    live = _snapshot_live_processes(plan.source)
+    if live:
+        listed = ", ".join(str(pid) for pid in live[:8])
+        raise RuntimeError(
+            f"a WARP fetch or conversion for {model_id!r} is already running "
+            f"(PID{'' if len(live) == 1 else 's'} {listed}). Two installs "
+            "would write the same shard files at once and corrupt them; "
+            "wait for the running one to finish or stop it first."
+        )
+
     reclaimed = _reclaimed_source_is_complete(plan.source)
     preflight(
         plan.source,
@@ -436,6 +615,7 @@ def install_model(
         source_bytes=plan.source_bytes,
         output_bytes=plan.output_workspace_bytes,
     )
+    _dedupe_download_state(plan.source)
     info = plan.info
     common = {
         "MODEL": str(info["warp_profile"]),
@@ -450,16 +630,16 @@ def install_model(
         "MIN_FREE_GB": str(info["output_workspace_gib"]),
     }
 
-    with _pipeline_environment() as (environment, hf_token):
+    with _install_lock(plan.run_dir, model_id), _pipeline_environment() as (environment, hf_token):
         environment.update(common)
         plan.source.mkdir(parents=True, exist_ok=True)
         plan.output.parent.mkdir(parents=True, exist_ok=True)
         if not reclaimed:
             _run_stage(
-                [executables["bash"], str(fetch_script), "--dry-run"],
+                [executables["bash"], str(fetch_script)],
                 cwd=warp_root,
                 env=environment,
-                stage="fetch preflight",
+                stage="download",
                 source=plan.source,
                 output=plan.output,
                 run_dir=plan.run_dir,

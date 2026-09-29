@@ -62,8 +62,9 @@ litmoe is the front door: a Python package that:
    quote, newline, or carriage return; requires source, output, and run/report
    paths not to overlap or nest, including through resolved symlink aliases;
    preflights `git`, `make`, `bash`, `curl`, `uv`, and storage; invokes WARP's
-   upstream fetch/conversion scripts; validates the WARP v0 manifest and
-   artifacts; and writes the absolute container path to the config.
+   upstream fetch/conversion scripts in a litmoe-owned session; validates the
+   WARP v0 manifest and artifacts; and writes the absolute container path to
+   the config.
 6. Connects agent harnesses (Claude Code, Hermes) **per process**, never by
    rewriting their global configuration.
 
@@ -71,9 +72,12 @@ That's it. No custom forward pass, CUDA kernels, or quantizer. The WARP install
 path orchestrates upstream tooling; WARP owns conversion and inference.
 
 For authenticated source fetches, litmoe puts `HF_TOKEN` in a private temporary
-curl config rather than child arguments or environment. A reclaimed resume
-whose ledgers prove all source shards complete skips the fetch dry-run and
-continues the upstream pipeline.
+curl config rather than child arguments or environment.
+
+The CLI owns every stage process group it starts: an interrupt stops the whole
+download/conversion tree, and a concurrent install of the same model is
+refused. Resuming the same command continues from the on-disk shard ledger —
+nothing already downloaded is refetched.
 
 While the stage runs, litmoe captures internal fetch/pipeline terminal output
 and repeats a one-minute heartbeat with elapsed seconds and the staging

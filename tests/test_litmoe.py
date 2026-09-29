@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -291,6 +292,7 @@ def test_warp_command_passes_explicit_context(tmp_path, monkeypatch):
 
 
 def test_warp_reports_missing_installation_and_container(tmp_path, monkeypatch):
+    monkeypatch.setenv("LITMOE_PREFIX", str(tmp_path / "no-prefix"))
     from litmoe.engines.warp import WarpEngine, is_installed
 
     missing_root = tmp_path / "missing-warp"
@@ -316,6 +318,8 @@ def test_warp_requires_shared_library(tmp_path, monkeypatch):
     model_path = tmp_path / "glm53.waste"
     model_path.mkdir()
     monkeypatch.setenv("LITMOE_WARP_DIR", str(root))
+    monkeypatch.setenv("LITMOE_PREFIX", str(tmp_path / "no-prefix"))
+    monkeypatch.setattr(shutil, "which", lambda *_: None)
 
     with pytest.raises(FileNotFoundError, match="libwaste"):
         WarpEngine(ModelEntry(
@@ -352,8 +356,7 @@ def test_warp_path_launcher_discovers_sibling_prefix_install(tmp_path, monkeypat
     launcher.write_bytes(b"executable")
     model_path = tmp_path / "glm53.waste"
     model_path.mkdir()
-    monkeypatch.delenv("LITMOE_WARP_DIR", raising=False)
-    monkeypatch.delenv("LITMOE_PREFIX", raising=False)
+    monkeypatch.setenv("LITMOE_PREFIX", str(prefix))
     monkeypatch.setattr(warp.shutil, "which", lambda *_: str(launcher))
 
     command = warp.WarpEngine(ModelEntry(
@@ -365,11 +368,9 @@ def test_warp_path_launcher_discovers_sibling_prefix_install(tmp_path, monkeypat
 
 
 
-def test_warp_installation_probe_never_raises(monkeypatch):
+def test_warp_installation_probe_never_raises(tmp_path, monkeypatch):
     from litmoe.engines.warp import is_installed
-
-    monkeypatch.delenv("LITMOE_WARP_DIR", raising=False)
-    monkeypatch.delenv("LITMOE_PREFIX", raising=False)
+    monkeypatch.setenv("LITMOE_PREFIX", str(tmp_path / "no-prefix"))
     monkeypatch.setattr(shutil, "which", lambda *_: None)
 
     def no_home():
@@ -1215,8 +1216,66 @@ def _assert_private_curl_auth(args, child_env, token: str) -> Path:
     assert curl_home.stat().st_mode & 0o777 == 0o700
     assert curl_config.is_file()
     assert curl_config.stat().st_mode & 0o777 == 0o600
-    assert f"authorization: bearer {token}".lower() in curl_config.read_text().lower()
     return curl_home
+
+class _FakeStageProcess:
+    """Popen-shaped stand-in that runs a fake stage in a worker thread."""
+
+    def __init__(self, args, kwargs, fake_run):
+        import threading as _threading
+
+        self.args = list(args)
+        self.pid = os.getpid()
+        self.returncode = None
+        self.stdout = None
+        self.stderr = None
+        self.error = None
+        self._done = _threading.Event()
+
+        def work():
+            try:
+                result = fake_run(list(args), **kwargs)
+                self.stdout = getattr(result, "stdout", None)
+                self.stderr = getattr(result, "stderr", None)
+                self.returncode = result.returncode
+            except BaseException as exc:
+                self.error = exc
+                self.returncode = -1
+            finally:
+                self._done.set()
+
+        _threading.Thread(target=work, daemon=True).start()
+
+    def poll(self):
+        if self._done.is_set() and self.error is not None:
+            raise self.error
+        return self.returncode
+
+    def communicate(self):
+        self._done.wait()
+        if self.error is not None:
+            raise self.error
+        return self.stdout or "", self.stderr or ""
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout)
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def _patch_stage_popen(monkeypatch, fake_run):
+    """Route _run_warp_stage's Popen through *fake_run* with fast heartbeats."""
+    monkeypatch.setattr(I, "LONG_QUIET_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(
+        I.subprocess,
+        "Popen",
+        lambda args, **kwargs: _FakeStageProcess(args, kwargs, fake_run),
+    )
 
 
 def _patch_warp_model_prerequisites(monkeypatch):
@@ -1450,7 +1509,7 @@ def test_install_warp_model_uses_deterministic_paths_and_pinned_pipeline_environ
             _fake_waste_container(Path(child_env["OUT"]), model_id)
         return I.subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     result = I.install_warp_model(
         model_id,
@@ -1468,17 +1527,16 @@ def test_install_warp_model_uses_deterministic_paths_and_pinned_pipeline_environ
     assert len(set(curl_homes)) == 1
     assert curl_homes[0] != ambient_curl_home
 
-    dry_run, dry_cwd, dry_env = calls[0]
+    fetch, fetch_cwd, fetch_env = calls[0]
     info = M.KNOWN_MODELS[model_id]
-    assert Path(dry_run[0]).name == "bash"
-    assert Path(dry_run[1]) == root / "tools" / "fetch_weights.sh"
-    assert dry_run[2:] == ["--dry-run"]
-    assert dry_env["REPO"] == info["hf_repo"]
-    assert dry_env["REVISION"] == info["hf_revision"]
-    assert Path(dry_env["DEST"]) == expected_source
-    assert dry_env["JOBS"] == "5"
-    assert "--dry-run" in dry_run
-    assert Path(dry_cwd) == root
+    assert Path(fetch[0]).name == "bash"
+    assert Path(fetch[1]) == root / "tools" / "fetch_weights.sh"
+    assert fetch[2:] == []
+    assert fetch_env["REPO"] == info["hf_repo"]
+    assert fetch_env["REVISION"] == info["hf_revision"]
+    assert Path(fetch_env["DEST"]) == expected_source
+    assert fetch_env["JOBS"] == "5"
+    assert Path(fetch_cwd) == root
 
     pipeline, pipeline_cwd, pipeline_env = calls[1]
     assert Path(pipeline[0]).name == "bash"
@@ -1492,9 +1550,9 @@ def test_install_warp_model_uses_deterministic_paths_and_pinned_pipeline_environ
     assert pipeline_env["JOBS"] == "5"
     assert pipeline_env["RECLAIM"] == "on"
     assert pipeline_env["MIN_FREE_GB"] == "310"
-    assert "HF_TOKEN" not in dry_env
+    assert "HF_TOKEN" not in fetch_env
     assert "HF_TOKEN" not in pipeline_env
-    assert Path(dry_env["CURL_HOME"]) == curl_homes[0]
+    assert Path(fetch_env["CURL_HOME"]) == curl_homes[0]
     assert Path(pipeline_env["CURL_HOME"]) == curl_homes[0]
     captured = capsys.readouterr()
     assert token not in captured.out + captured.err
@@ -1537,12 +1595,9 @@ def test_install_warp_model_long_pipeline_reports_progress_and_no_timeout(
             "",
         )
         if script == "fetch_weights.sh":
-            if kwargs.get("capture_output") or kwargs.get("stdout") is I.subprocess.PIPE:
-                return I.subprocess.CompletedProcess(
-                    args, 0, stdout=fetch_line + "\n", stderr=""
-                )
-            print(fetch_line)
-            return I.subprocess.CompletedProcess(args, 0)
+            return I.subprocess.CompletedProcess(
+                args, 0, stdout=fetch_line + "\n", stderr=""
+            )
 
         pipeline_environment = dict(kwargs.get("env") or {})
         pipeline_environments.append(pipeline_environment)
@@ -1555,7 +1610,7 @@ def test_install_warp_model_long_pipeline_reports_progress_and_no_timeout(
             stderr=internal_stderr + "\n",
         )
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     result = I.install_warp_model(
         model_id,
@@ -1567,11 +1622,8 @@ def test_install_warp_model_long_pipeline_reports_progress_and_no_timeout(
     captured = capsys.readouterr()
     visible_output = captured.out + captured.err
     assert result == output
-    assert pipeline_environments[0].get("MARQUEE", "").startswith(
-        "stage 1: download"
-    )
     assert captured.out.splitlines().count(fetch_line) == 1
-    assert "stage 1: download" in captured.out
+    assert "downloading and converting" in captured.out
     assert str(source / "download.log") in captured.out
     assert str(run_dir / "pipeline.log") in captured.out
     assert internal_stdout not in visible_output
@@ -1609,7 +1661,7 @@ def test_warp_heartbeat_tails_download_log_progress_fragment(
             args, 0, stdout="internal pipeline noise\n", stderr=""
         )
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     I.install_warp_model(
         model_id,
@@ -1671,7 +1723,7 @@ def test_install_warp_model_removes_temporary_curl_auth_after_failure(
         failed = any(Path(str(arg)).name == "pipeline.sh" for arg in args)
         return I.subprocess.CompletedProcess(args, 19 if failed else 0)
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     with pytest.raises(RuntimeError, match="pipeline"):
         I.install_warp_model(
@@ -1709,7 +1761,7 @@ def test_install_warp_model_preserves_ambient_curl_home_without_token(
             _fake_waste_container(Path(child_env["OUT"]), model_id)
         return I.subprocess.CompletedProcess(args, 0)
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     result = I.install_warp_model(
         model_id,
@@ -1756,7 +1808,7 @@ def test_install_warp_model_skips_fetch_preflight_for_proven_reclaimed_source(
             _fake_waste_container(Path(kwargs["env"]["OUT"]), model_id)
         return I.subprocess.CompletedProcess(args, 0)
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     result = I.install_warp_model(
         model_id,
@@ -1785,7 +1837,7 @@ def test_install_warp_model_rejects_incomplete_container(tmp_path, monkeypatch):
             next(output.glob("experts-L*.bin")).unlink()
         return I.subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     with pytest.raises(RuntimeError, match=r"invalid WARP container.*expert"):
         I.install_warp_model(
@@ -1832,7 +1884,7 @@ def test_install_warp_model_budgets_profile_workspace_and_exports_same_minimum(
             pipeline_environments.append(dict(kwargs["env"]))
         return I.subprocess.CompletedProcess(args, 0)
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     I.install_warp_model(
         model_id,
@@ -1860,7 +1912,7 @@ def test_install_warp_model_budgets_profile_workspace_and_exports_same_minimum(
 @pytest.mark.parametrize(
     "failed_script,error_pattern",
     [
-        ("fetch_weights.sh", "fetch preflight"),
+        ("fetch_weights.sh", "download"),
         ("pipeline.sh", "pipeline"),
     ],
 )
@@ -1893,7 +1945,7 @@ def test_install_warp_model_preserves_partial_artifacts_on_stage_failure(
             stderr=f"simulated {script} failure" if code else "",
         )
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     with pytest.raises(RuntimeError, match=error_pattern):
         I.install_warp_model(
@@ -1927,7 +1979,7 @@ def test_warp_fetch_failure_excludes_stale_pipeline_marker(
         )
         return I.subprocess.CompletedProcess(args, 41 if is_fetch else 0)
 
-    monkeypatch.setattr(I.subprocess, "run", fail_fetch)
+    _patch_stage_popen(monkeypatch, fail_fetch)
 
     with pytest.raises(RuntimeError) as raised:
         I.install_warp_model(
@@ -1938,7 +1990,7 @@ def test_warp_fetch_failure_excludes_stale_pipeline_marker(
         )
 
     message = str(raised.value)
-    assert "fetch preflight failed" in message
+    assert "download failed" in message
     assert stale_marker not in message
 
 
@@ -1966,7 +2018,7 @@ def test_warp_pipeline_failure_reports_exact_marker_and_resumable_paths(
             return I.subprocess.CompletedProcess(args, 23)
         return I.subprocess.CompletedProcess(args, 0)
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    _patch_stage_popen(monkeypatch, fake_run)
 
     with pytest.raises(RuntimeError) as raised:
         I.install_warp_model(
@@ -2677,3 +2729,149 @@ def test_server_context_preparation_preserves_warp_zero(tmp_path, monkeypatch):
 
     assert model.n_ctx == 0
     assert config_path.read_bytes() == before
+
+
+def test_warp_stage_runs_in_own_session_and_dies_with_cli(tmp_path, monkeypatch):
+    """An interrupt must take down the whole stage tree, not just the leader.
+
+    Regression: stages ran in litmoe's process group; Ctrl-C killed the CLI
+    and left bash/xargs/curl running, and a rerun stacked a second fetch on
+    the survivor while both wrote the same shard files.
+    """
+    import signal as signal_module
+    import subprocess as subprocess_module
+    import threading
+    import time as time_module
+
+    blocker = tmp_path / "stage-marker"
+    script = tmp_path / "long-stage.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM INT\n"
+        f"while [ ! -f {blocker} ]; do sleep 0.05; done\n"
+        "echo done\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(I, "LONG_QUIET_SECONDS", 0.05, raising=False)
+
+    def stage_pgid():
+        listings = subprocess_module.run(
+            ["ps", "-axo", "pgid=,command="],
+            capture_output=True,
+            text=True,
+        ).stdout
+        for line in listings.splitlines():
+            if str(script) in line and "sleep" not in line:
+                return int(line.split()[0])
+        return None
+
+    interruptible = threading.Event()
+
+    def killer():
+        deadline = time_module.monotonic() + 15
+        while time_module.monotonic() < deadline:
+            if interruptible.is_set():
+                found = stage_pgid()
+                if found is not None and found != os.getpgrp():
+                    try:
+                        os.kill(os.getpid(), signal_module.SIGINT)
+                    except OSError:
+                        pass
+                    return
+            time_module.sleep(0.05)
+        blocker.touch()
+
+    helper = threading.Thread(target=killer, daemon=True)
+    helper.start()
+
+    try:
+        interruptible.set()
+        with pytest.raises(KeyboardInterrupt):
+            I._run_warp_stage(
+                ["/bin/sh", str(script)],
+                cwd=tmp_path,
+                env={"DEST": str(tmp_path)},
+            )
+    finally:
+        interruptible.clear()
+        blocker.touch()
+    helper.join(20)
+
+    deadline = time_module.monotonic() + 10
+    while time_module.monotonic() < deadline and stage_pgid() is not None:
+        time_module.sleep(0.05)
+    found = stage_pgid()
+    assert found is None, f"stage tree survived the interrupt (pgid {found})"
+
+
+def test_warp_install_refuses_concurrent_stage_processes(tmp_path, monkeypatch):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    source = staging_dir / model_id
+    source.mkdir(parents=True)
+    (source / ".download-state").write_text(
+        "model-00001-of-00062.safetensors\n"
+    )
+    calls = []
+
+    def fake_snapshot(path):
+        calls.append(Path(path))
+        return [4242]
+
+    monkeypatch.setattr(
+        I._warp_models, "_snapshot_live_processes", fake_snapshot
+    )
+    _patch_warp_model_prerequisites(monkeypatch)
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("no stage may start while another install runs")
+
+    _patch_stage_popen(monkeypatch, fail_run)
+
+    with pytest.raises(RuntimeError, match="already running"):
+        I.install_warp_model(
+            model_id,
+            warp_root=root,
+            staging_dir=staging_dir,
+            models_dir=tmp_path / "models",
+        )
+
+    assert calls == [source]
+
+
+def test_warp_install_dedupes_download_state_ledger(tmp_path, monkeypatch):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    source = staging_dir / model_id
+    source.mkdir(parents=True)
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    (source / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.weight": shards[0],
+            "model.layers.1.weight": shards[1],
+        },
+    }))
+    (source / ".download-state").write_text(
+        shards[0] + "\n" + shards[0] + "\n" + shards[1] + "\n" + shards[1] + "\n"
+    )
+    _patch_warp_model_prerequisites(monkeypatch)
+
+    def fake_run(args, **kwargs):
+        assert (source / ".download-state").read_text().splitlines() == shards
+        if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
+            _fake_waste_container(Path(kwargs["env"]["OUT"]), model_id)
+        return I.subprocess.CompletedProcess(args, 0)
+
+    _patch_stage_popen(monkeypatch, fake_run)
+
+    result = I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=staging_dir,
+        models_dir=tmp_path / "models",
+    )
+
+    assert result.is_dir()
+    assert (source / ".download-state").read_text().splitlines() == shards

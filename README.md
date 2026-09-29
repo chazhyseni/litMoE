@@ -97,25 +97,23 @@ litmoe install --model glm-5.3-flash-warp \
 litmoe install --model deepseek-v4.1-flash-warp \
   --warp-jobs 6 --reclaim-source
 ```
+The command requires `git`, `make`, `bash`, `curl`, and `uv`. litmoe checks
+dependencies and free disk space, prints the pinned revision, sizes, and
+paths, and asks for confirmation before writing. It then installs WARP
+runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9`, downloads the
+pinned source weights, converts them, validates the resulting WARP v0
+manifest and artifacts, and registers the absolute container path with
+`engine: warp` and `n_ctx: 0`. When `HF_TOKEN` is set, litmoe uses a
+private temporary curl config; the token is never printed or passed in a
+child process's arguments or environment.
 
-The command requires `git`, `make`, `bash`, `curl`, and `uv`. It resolves
-absolute paths and rejects source or output paths containing a backslash,
-single quote, newline, or carriage return (the pinned upstream pipeline cannot
-represent them safely). Source, output, and run/report paths must not overlap
-or nest, including through resolved symlink aliases. litmoe then checks
-dependencies and available storage, prints the pinned revision, sizes, and
-paths, and asks for confirmation before writing. It then
-installs WARP runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9`,
-runs the upstream fetch dry-run and conversion pipeline, validates the
-resulting WARP v0 manifest and artifacts, and registers the absolute container
-path with `engine: warp` and `n_ctx: 0`. When `HF_TOKEN` is set, litmoe uses a
-private temporary curl config; the token is not printed or passed in a child
-process's arguments or environment. There are no prebuilt GLM or DeepSeek
-`.waste` release assets: litmoe orchestrates WARP's upstream conversion and
-does not implement a quantizer. During the long download/convert stage,
-litmoe prints a heartbeat line every minute with elapsed seconds and the
-staging download log and run-report log paths; the live shard counter is in
-the download log. Ctrl-C is safe at any point: rerun the command to resume.
+Interrupting the command (Ctrl-C or a closed terminal) stops the download
+and conversion cleanly; rerun the same command to resume — nothing already
+downloaded is refetched. A second install of the same model is refused
+while one is running. During the download and conversion, litmoe prints a
+heartbeat every minute with elapsed time and the newest progress line;
+the full logs are at the staging `download.log` and the run-report
+`pipeline.log`.
 
 | Catalog id | Pinned source revision | Source | Conversion workspace | Output |
 |---|---|---:|---:|---:|
@@ -124,19 +122,15 @@ the download log. Ctrl-C is safe at any point: rerun the command to resume.
 
 By default, output is `<models-dir>/<model-id>.waste` and source staging is
 `<models-dir>/.staging/<model-id>`. Put `--models-dir` on fast internal NVMe;
-`--staging-dir` may point to another filesystem. On failure, partial source,
-output, and `<models-dir>/<model-id>.warp-run` reports remain in place; rerun
-the same command to resume. If the reclaim ledgers prove that all source
-shards were completed, the resumed install skips the upstream fetch dry-run
-and continues the pipeline. `--reclaim-source` deletes completed source shards
-as the pipeline progresses. That saves peak storage, but it is irreversible
-and a retry may have to download shards that were not proven complete.
+`--staging-dir` may point to another filesystem. On failure, partial data
+and reports remain in place; rerun the same command to resume.
+`--reclaim-source` deletes completed source shards as the conversion
+progresses, saving peak storage at the cost of re-downloading them on a retry.
 
-Watch live progress in the stage logs while the CLI heartbeats; each heartbeat
-now also shows the newest progress line from the live stage log:
+Watch live progress in the stage logs while the CLI heartbeats:
 
 ```bash
-tail -f <staging-dir>/<model-id>/download.log
+tail -f <models-dir>/.staging/<model-id>/download.log
 tail -f <models-dir>/<model-id>.warp-run/pipeline.log
 ```
 

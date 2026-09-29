@@ -52,33 +52,25 @@ models:
   #   n_gpu_layers: -1
   #   n_ctx: 262144
 
-  # ── WARP catalog conversion or manual local containers ────────────────────
-  # `litmoe install --model glm-5.3-flash-warp`
-  # `litmoe install --model deepseek-v4.1-flash-warp`
-  # writes a validated generated container as an absolute path with n_ctx: 0.
-  # Use `--staging-dir /bulk/staging --models-dir /internal/nvme/models` to
-  # separate source staging from output; `--warp-jobs N` changes concurrency.
-  # `--reclaim-source` saves space by irreversibly deleting completed source
-  # shards. `litmoe install --engine warp` plus either manual entry below
-  # remains supported. Published throughput requires fast internal NVMe.
-  #
-  # GLM-5.3-Flash — upstream: 112 GB container, 5.14 GB resident floor,
-  # 3.32 tok/s short / 3.86 tok/s long on a 64 GB M5 Pro.
+  # ── WARP ────────────────────────────────────────────────────────────────
+  # `litmoe install --model glm-5.3-flash-warp` installs the model and writes
+  # the container path here. Options: --staging-dir, --warp-jobs,
+  # --reclaim-source. Or add a local .waste container manually.
+  # GLM-5.3-Flash — 112 GB container, 5.14 GB resident floor.
   # - id: glm-5.3-flash-warp
   #   engine: warp
   #   model_path: ~/models/glm53.waste
-  #   n_ctx: 0                    # preserve container default; WARP sizes its memory budget
+  #   n_ctx: 0
   #   extra_args: ["--no-thinking"]
   #
-  # DeepSeek-V4.1-Flash — upstream: 299 GiB container, 4.86 GB resident floor,
-  # about 3.7 tok/s.
+  # DeepSeek-V4.1-Flash — 299 GiB container, 4.86 GB resident floor.
   # - id: deepseek-v4.1-flash-warp
   #   engine: warp
   #   model_path: ~/models/deepseek-v4.1-flash.waste
   #   n_ctx: 0
   #
-  # WARP extra_args are passed through verbatim; upstream flags include
-  # --budget, --threads, --cpus, --cache, --vision, and --verify.
+  # WARP extra_args pass through verbatim: --budget, --threads, --cpus,
+  # --cache, --vision, --verify.
 
   # ── 192 GB workstation ────────────────────────────────────────────────────
   # DeepSeek-V4-Flash — MoE (MLA), 1M ctx. 155 GB → ~179 GB.

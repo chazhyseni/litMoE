@@ -13,13 +13,14 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -226,9 +227,44 @@ def _latest_stage_fragment(logs: list[Path]) -> str:
     return best
 
 
+def _terminate_stage_tree(process: subprocess.Popen) -> None:
+    """Stop a stage and every process it spawned, then reap the leader."""
+    try:
+        pgid = os.getpgid(process.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        pgid = None
+    if pgid is not None and pgid != os.getpgid(0):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                break
+            try:
+                process.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
 
 def _run_warp_stage(args: list[str], **kwargs):
-    """Run a model stage with captured internals and visible heartbeats."""
+    """Run a WARP model stage in its own session; litmoe owns its lifetime.
+
+    The stage runs detached from litmoe's process group so litmoe decides
+    when it stops. On Ctrl-C or terminal hangup the whole tree — bash,
+    xargs, workers, curls — is terminated before litmoe exits, so nothing
+    is left running to collide with a rerun. Heartbeats with the newest
+    live log line are printed while the stage runs.
+    """
     kwargs = dict(kwargs)
     environment = dict(kwargs.get("env") or {})
     kwargs["env"] = environment
@@ -238,51 +274,89 @@ def _run_warp_stage(args: list[str], **kwargs):
         download_log = Path(environment["SRC"]) / "download.log"
         pipeline_log = Path(environment["RUN_DIR"]) / "pipeline.log"
         marquee = (
-            "stage 1: download and convert WARP model; "
+            "downloading and converting WARP model; "
             f"logs: {download_log}, {pipeline_log}"
         )
-        environment["MARQUEE"] = marquee
     else:
         download_log = Path(environment.get("DEST") or "staging") / "download.log"
-        marquee = (
-            "Downloading model from Hugging Face conversion sources; "
-            f"log: {download_log}"
-        )
+        pipeline_log = download_log
+        marquee = f"downloading model weights; log: {download_log}"
 
     click.echo(f"  {marquee}")
 
-    kwargs["capture_output"] = True
+    kwargs["stdout"] = subprocess.PIPE
+    kwargs["stderr"] = subprocess.PIPE
     kwargs["text"] = True
-    done = threading.Event()
-    results = []
-    errors = []
+    kwargs["start_new_session"] = True
 
-    def invoke() -> None:
-        try:
-            results.append(subprocess.run(args, **kwargs))
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            done.set()
-
-    worker = threading.Thread(
-        target=invoke,
-        name="litmoe-warp-stage",
-        daemon=True,
-    )
-    worker.start()
-    logs = [download_log, pipeline_log] if pipeline else []
-    interval = max(float(LONG_QUIET_SECONDS), 0.01)
+    stop = threading.Event()
     started = time.monotonic()
-    while not done.wait(interval):
+    process_holder: list[subprocess.Popen] = []
+
+    def forward_signal(_signum, _frame):
+        stop.set()
+        if process_holder:
+            _terminate_stage_tree(process_holder[0])
+
+    forwarded = [
+        sig for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None))
+        if sig is not None
+    ]
+    previous = {}
+    for sig in forwarded:
+        try:
+            previous[sig] = signal.signal(sig, forward_signal)
+        except (ValueError, OSError):
+            pass
+
+    captured: dict[str, str] = {}
+
+    def capture(proc: subprocess.Popen) -> None:
+        try:
+            out, err = proc.communicate()
+        except BaseException:
+            return
+        captured["stdout"] = out or ""
+        captured["stderr"] = err or ""
+
+    reader: threading.Thread | None = None
+    try:
+        process = subprocess.Popen(args, **kwargs)
+        process_holder.append(process)
+        reader = threading.Thread(target=capture, args=(process,), daemon=True)
+        reader.start()
+
+        logs = [download_log, pipeline_log] if pipeline else [download_log]
+        interval = max(float(LONG_QUIET_SECONDS), 0.01)
+        while not stop.is_set():
+            if process.poll() is not None and not reader.is_alive():
+                break
+            if stop.wait(interval):
+                break
+            elapsed = time.monotonic() - started
+            fragment = _latest_stage_fragment(logs)
+            detail = f" | {fragment}" if fragment else ""
+            click.echo(f"  {marquee} ({elapsed:.0f}s elapsed){detail}")
+    finally:
+        if process_holder and process_holder[0].poll() is None:
+            _terminate_stage_tree(process_holder[0])
+        if reader is not None:
+            for _ in range(6):
+                if not reader.is_alive():
+                    break
+                reader.join(5)
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+    if stop.is_set():
         elapsed = time.monotonic() - started
-        fragment = _latest_stage_fragment(logs)
-        detail = f" | {fragment}" if fragment else ""
-        click.echo(f"  {marquee} ({elapsed:.0f}s elapsed){detail}")
-    worker.join()
-    if errors:
-        raise errors[0]
-    result = results[0]
+        click.echo(f"  {marquee} (interrupted after {elapsed:.0f}s)")
+        raise KeyboardInterrupt
+    result = subprocess.CompletedProcess(
+        args, process.returncode, captured.get("stdout", ""), captured.get("stderr", "")
+    )
     if result.stdout and not pipeline:
         click.echo(result.stdout, nl=not result.stdout.endswith("\n"))
     return result
@@ -1388,6 +1462,13 @@ def install_cmd(
                 jobs=warp_jobs,
                 reclaim_source=reclaim_source,
             )
+        except KeyboardInterrupt:
+            click.echo(
+                "\n  Interrupted; the download and conversion were stopped. "
+                "Partial data was preserved; rerun the same command to resume.",
+                err=True,
+            )
+            sys.exit(130)
         except Exception as e:
             click.echo(f"  WARP model install failed: {e}", err=True)
             sys.exit(1)

@@ -79,20 +79,25 @@ Before creating data, litmoe resolves the paths and rejects source or output
 paths containing a backslash, single quote, newline, or carriage return (the
 pinned upstream pipeline cannot represent them safely). Source, output, and
 run/report paths must not overlap or nest, including through resolved symlink
-aliases. litmoe verifies the tools, checks free space for resumable source and
-output work, prints the revision, sizes, and paths, and asks for confirmation
-(`--yes` skips the prompt). It then:
+aliases. litmoe verifies the tools, checks free space for the resumable source
+and output work, prints the revision, sizes, and paths, and asks for
+confirmation (`--yes` skips the prompt). It then:
 
 1. installs WARP runtime commit
    `09fcff352ca55223b08ee222d15054b90546c6a9`;
-2. invokes WARP's upstream weight-fetch dry-run, unless a proven reclaimed
-   resume can skip it, and runs the conversion pipeline; the CLI prints a
-   visible heartbeat every minute during the long stage, and the live shard
-   progress is in the staging `download.log`;
-3. validates the real WARP v0 manifest, trunk, codebooks, tokenizer, specials,
-   and expert-bank artifacts; and
-4. registers the absolute output path in `models.yaml` with `engine: warp` and
-   `n_ctx: 0`.
+2. downloads the pinned source weights and runs the conversion pipeline,
+   printing a heartbeat every minute with elapsed time and the newest
+   progress line; the full logs are the staging `download.log` and the
+   run-report `pipeline.log`;
+3. validates the resulting WARP v0 manifest, trunk, codebooks, tokenizer,
+   specials, and expert-bank artifacts; and
+4. registers the absolute output path in `models.yaml` with `engine: warp`
+   and `n_ctx: 0`.
+
+Interrupting the install (Ctrl-C or a closed terminal) stops the download and
+conversion cleanly; rerun the same command to resume — nothing already
+downloaded is refetched. A second install of the same model is refused while
+one is running.
 
 When `HF_TOKEN` is set, litmoe stores it in a private temporary curl config. It
 does not print the token or include it in a child process's arguments or
@@ -111,12 +116,10 @@ is `<models-dir>/.staging`, so its source path is
 `<models-dir>/<model-id>.warp-run`. Put `--models-dir` on fast internal NVMe
 for serving. Staging can be on another filesystem. If a fetch, conversion, or
 validation step fails, partial source, output, and run reports remain; rerun
-the same command to resume. When the reclaim ledgers prove every source shard
-completed, resume skips the upstream fetch dry-run and continues the pipeline.
+the same command to resume.
 
-The visible CLI heartbeat repeats the stage, both log paths, and the newest
-progress line from whichever stage log was written last. Watch the
-live fetch/shard progress directly during the long stage:
+The CLI heartbeat prints every minute with elapsed time and the newest
+progress line from the live stage logs. Watch the full progress directly:
 
 ```bash
 tail -f <models-dir>/.staging/<model-id>/download.log
