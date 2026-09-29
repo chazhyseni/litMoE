@@ -132,8 +132,8 @@ and continues the pipeline. `--reclaim-source` deletes completed source shards
 as the pipeline progresses. That saves peak storage, but it is irreversible
 and a retry may have to download shards that were not proven complete.
 
-Watch live progress in the stage logs while the CLI heartbeats (the CLI heartbeat
-is a snapshot; the download log has the live shard counter):
+Watch live progress in the stage logs while the CLI heartbeats; each heartbeat
+now also shows the newest progress line from the live stage log:
 
 ```bash
 tail -f <staging-dir>/<model-id>/download.log

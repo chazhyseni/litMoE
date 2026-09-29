@@ -114,7 +114,8 @@ validation step fails, partial source, output, and run reports remain; rerun
 the same command to resume. When the reclaim ledgers prove every source shard
 completed, resume skips the upstream fetch dry-run and continues the pipeline.
 
-The visible CLI heartbeat repeats the stage and both log paths. Watch the
+The visible CLI heartbeat repeats the stage, both log paths, and the newest
+progress line from whichever stage log was written last. Watch the
 live fetch/shard progress directly during the long stage:
 
 ```bash

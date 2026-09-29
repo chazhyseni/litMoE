@@ -1578,6 +1578,53 @@ def test_install_warp_model_long_pipeline_reports_progress_and_no_timeout(
     assert internal_stderr not in visible_output
 
 
+def test_warp_heartbeat_tails_download_log_progress_fragment(
+    tmp_path, monkeypatch, capsys,
+):
+    import time
+
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    _patch_warp_model_prerequisites(monkeypatch)
+    monkeypatch.setattr(I, "LONG_QUIET_SECONDS", 0.05, raising=False)
+
+    def fake_run(args, **kwargs):
+        environment = dict(kwargs.get("env") or {})
+        script = next(
+            (Path(str(arg)).name for arg in args if str(arg).endswith(".sh")),
+            "",
+        )
+        if script == "fetch_weights.sh":
+            return I.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        log = Path(environment["SRC"]) / "download.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("[1/62] 5.1G/12.4G (41%)\r[1/62] 5.2G/12.4G (42%)\n")
+            handle.write("shards        : 25 / 62 complete\n")
+        time.sleep(0.35)
+        _fake_waste_container(Path(environment["OUT"]), model_id)
+        return I.subprocess.CompletedProcess(
+            args, 0, stdout="internal pipeline noise\n", stderr=""
+        )
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+    )
+
+    out = capsys.readouterr().out
+    heartbeats = [line for line in out.splitlines() if "s elapsed" in line]
+    assert heartbeats, out
+    for line in heartbeats:
+        assert "62 complete" in line, line
+        assert "internal pipeline noise" not in line, line
+
 def test_warp_non_marquee_failure_surfaces_captured_stderr(
     tmp_path, capsys,
 ):

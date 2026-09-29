@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import threading
 from pathlib import Path
 from typing import Any
@@ -193,6 +194,38 @@ def pick_llamacpp_variant(variant: str) -> str:
 # ---------------------------------------------------------------------------
 # Engine installers
 # ---------------------------------------------------------------------------
+def _latest_log_fragment(log: Path, *, limit: int = 4096) -> str:
+    """Return the last non-empty line of a live stage log, if readable."""
+    try:
+        with open(log, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit), os.SEEK_SET)
+            chunk = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(chunk.replace("\r", "\n").splitlines()):
+        candidate = line.strip()
+        if candidate:
+            return candidate[:120]
+    return ""
+
+
+def _latest_stage_fragment(logs: list[Path]) -> str:
+    """Pick the newest live fragment across stage logs (fetch or convert)."""
+    best_mtime = -1.0
+    best = ""
+    for log in logs:
+        try:
+            mtime = log.stat().st_mtime
+        except OSError:
+            continue
+        fragment = _latest_log_fragment(log)
+        if fragment and mtime > best_mtime:
+            best_mtime, best = mtime, fragment
+    return best
+
+
 
 def _run_warp_stage(args: list[str], **kwargs):
     """Run a model stage with captured internals and visible heartbeats."""
@@ -238,11 +271,14 @@ def _run_warp_stage(args: list[str], **kwargs):
         daemon=True,
     )
     worker.start()
+    logs = [download_log, pipeline_log] if pipeline else []
     interval = max(float(LONG_QUIET_SECONDS), 0.01)
-    elapsed = 0.0
+    started = time.monotonic()
     while not done.wait(interval):
-        elapsed += interval
-        click.echo(f"  {marquee} ({elapsed:.0f}s elapsed)")
+        elapsed = time.monotonic() - started
+        fragment = _latest_stage_fragment(logs)
+        detail = f" | {fragment}" if fragment else ""
+        click.echo(f"  {marquee} ({elapsed:.0f}s elapsed){detail}")
     worker.join()
     if errors:
         raise errors[0]
