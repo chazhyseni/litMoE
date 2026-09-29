@@ -59,11 +59,11 @@ process supervision. Every component earns its place.
                                   └──────────────────────────────────────┘
                                                       ▲
                                   ┌───────────────────┴──────────────────┐
-                                  │ litmoe/models.py — downloadable      │
-                                  │ llama.cpp/ktransformers catalog      │
-                                  │ tiers, quants, sizes, ctx, kt flags  │
-                                  │ → `litmoe models`, `install`, `init` │
-                                  │ WARP containers remain local-only    │
+                                  │ litmoe/models.py — install catalog   │
+                                  │ downloads + pinned WARP recipes      │
+                                  │ → `models`, `install`, `init`        │
+                                  │ manual local paths supported         │
+                                  │                                      │
                                   └──────────────────────────────────────┘
 
 ## Data flow
@@ -80,6 +80,31 @@ process supervision. Every component earns its place.
 The gateway never touches the forward pass; it adds a few milliseconds and no
 compute. WARP's upstream server is a local subprocess, not a remote inference
 API.
+
+## WARP catalog installation
+
+`litmoe install --model glm-5.3-flash-warp` and
+`litmoe install --model deepseek-v4.1-flash-warp` are orchestration paths, not
+new inference or quantization implementations. The CLI resolves deterministic
+absolute source, output, and run/report paths; rejects source or output paths
+containing a backslash, single quote, newline, or carriage return; and requires
+the three paths not to overlap or nest, including through resolved symlink
+aliases. It checks `git`, `make`, `bash`, `curl`, `uv`, and free storage,
+prints the pinned revision and size plan, and confirms before writing. It
+installs pinned WARP runtime commit
+`09fcff352ca55223b08ee222d15054b90546c6a9`, then invokes WARP's upstream fetch
+dry-run and conversion pipeline. A proven reclaimed resume skips the fetch
+dry-run and continues the pipeline.
+
+When `HF_TOKEN` is set, litmoe places it in a private temporary curl config;
+the token is not printed or passed through child arguments or environment.
+After the pipeline returns, litmoe validates the WARP v0 manifest and its
+referenced trunk, codebook, tokenizer, specials, and expert-bank files before
+registering the absolute output path as `engine: warp`, `n_ctx: 0`. Partial
+source, output, and run/report data are retained so the same command can
+resume. The runtime-only `litmoe install --engine warp` and manually configured
+local `.waste` containers remain valid alternatives.
+
 
 ## Engine lifecycle
 
@@ -114,7 +139,7 @@ under `~/.litmoe/` and `models.yaml`; engine installers also write to
 
 ```
 litmoe/
-├── models.py          catalog (tiers, quants, sizes, ctx, KV) — single source of truth
+├── models.py          catalog (downloads + pinned WARP recipes, sizes, ctx, KV)
 ├── config.py          models.yaml schema + validation
 ├── server.py          gateway, Anthropic↔OpenAI translation, engine supervision
 ├── platform_utils.py  RAM, physical cores, macOS quirks
@@ -125,7 +150,7 @@ litmoe/
 │   └── warp.py        upstream WARP server adapter for local .waste containers
 └── cli/
     ├── main.py        doctor · init · models · serve · status · stop
-    └── install.py     engine install (release/source/kt wheels/pinned WARP) + catalog model download
+    └── install.py     engine installs + catalog downloads / upstream WARP orchestration and validation
 scripts/claude-local   Claude Code against the gateway, per-process env only
 scripts/hermes-local   Hermes Agent against the gateway, per-process env only
 tests/test_litmoe.py   catalog, config, ctx math, port allocation, Anthropic translation, stop safety

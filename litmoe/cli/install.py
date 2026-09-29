@@ -24,6 +24,8 @@ from typing import Any
 import click
 import yaml
 
+from litmoe.cli import warp_models as _warp_models
+
 from litmoe.config import default_config_path, expand_path
 from litmoe.models import (
     CLAUDE_ALIASES,
@@ -31,6 +33,7 @@ from litmoe.models import (
     GGUF,
     KNOWN_MODELS,
     SAFETENSORS,
+    WASTE,
     TIER_LABELS,
     fit_context,
     largest_quant_that_fits,
@@ -192,6 +195,8 @@ def pick_llamacpp_variant(variant: str) -> str:
 def _run_warp_command(
     args: list[str], *, cwd: Path | None, label: str, timeout: int
 ) -> None:
+    environment = os.environ.copy()
+    environment.pop("HF_TOKEN", None)
     try:
         result = subprocess.run(
             args,
@@ -199,6 +204,7 @@ def _run_warp_command(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"{label} failed: {exc}") from exc
@@ -298,51 +304,140 @@ def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
                 staged_launcher.symlink_to((dest_dir / cli_name).absolute())
 
             backup = stage_dir / "previous"
+            launcher_backup = stage_dir / "previous-launcher"
+            failed_install = stage_dir / "failed-install"
+            failed_launcher = stage_dir / "failed-launcher"
             had_previous = dest_dir.exists() or dest_dir.is_symlink()
-            if had_previous:
-                os.replace(dest_dir, backup)
+            had_launcher = wrapper.exists() or wrapper.is_symlink()
+            failure_message = "could not replace WARP installation"
             try:
-                os.replace(checkout, dest_dir)
-            except OSError as exc:
-                rollback_error = None
                 if had_previous:
-                    try:
-                        os.replace(backup, dest_dir)
-                    except OSError as rollback_exc:
-                        rollback_error = rollback_exc
-
-                message = f"could not replace WARP installation: {exc}"
-                if rollback_error is not None:
-                    stage_cleanup.pop_all()
-                    message += (
-                        f"; rollback also failed: {rollback_error}; "
-                        f"recovery files retained at {stage_dir}"
-                    )
-                raise RuntimeError(message) from exc
-
-            try:
+                    os.replace(dest_dir, backup)
+                if had_launcher:
+                    failure_message = "could not install WARP CLI launcher"
+                    os.replace(wrapper, launcher_backup)
+                failure_message = "could not replace WARP installation"
+                os.replace(checkout, dest_dir)
+                failure_message = "could not install WARP CLI launcher"
                 os.replace(staged_launcher, wrapper)
-            except OSError as exc:
+            except BaseException as exc:
                 rollback_error = None
-                failed_install = stage_dir / "failed-install"
                 try:
-                    os.replace(dest_dir, failed_install)
-                    if had_previous:
+                    if launcher_backup.exists() or launcher_backup.is_symlink():
+                        if wrapper.exists() or wrapper.is_symlink():
+                            os.replace(wrapper, failed_launcher)
+                        os.replace(launcher_backup, wrapper)
+                    elif not had_launcher and (
+                        wrapper.exists() or wrapper.is_symlink()
+                    ):
+                        os.replace(wrapper, failed_launcher)
+
+                    if backup.exists() or backup.is_symlink():
+                        if dest_dir.exists() or dest_dir.is_symlink():
+                            os.replace(dest_dir, failed_install)
                         os.replace(backup, dest_dir)
-                except OSError as rollback_exc:
+                    elif not had_previous and (
+                        dest_dir.exists() or dest_dir.is_symlink()
+                    ):
+                        os.replace(dest_dir, failed_install)
+                except BaseException as rollback_exc:
                     rollback_error = rollback_exc
 
-                message = f"could not install WARP CLI launcher: {exc}"
                 if rollback_error is not None:
                     stage_cleanup.pop_all()
-                    message += (
-                        f"; rollback also failed: {rollback_error}; "
-                        f"recovery files retained at {stage_dir}"
-                    )
-                raise RuntimeError(message) from exc
+                if isinstance(exc, OSError):
+                    message = f"{failure_message}: {exc}"
+                    if rollback_error is not None:
+                        message += (
+                            f"; rollback also failed: {rollback_error}; "
+                            f"recovery files retained at {stage_dir}"
+                        )
+                    raise RuntimeError(message) from exc
+                if rollback_error is not None:
+                    raise RuntimeError(
+                        f"WARP cutover interrupted; rollback also failed: "
+                        f"{rollback_error}; recovery files retained at {stage_dir}"
+                    ) from exc
+                raise
 
     click.echo(f"  WARP installed: {dest_dir}")
     return dest_dir
+
+def _filesystem_device(path: Path) -> int:
+    """Compatibility hook for WARP disk-preflight filesystem detection."""
+    return _warp_models.filesystem_device(path)
+
+
+def _preflight_warp_disk(
+    source_dir: Path,
+    output_dir: Path,
+    *,
+    source_bytes: int,
+    output_bytes: int,
+) -> None:
+    """Check resumable WARP source/output requirements before conversion."""
+    _warp_models.preflight_disk(
+        source_dir,
+        output_dir,
+        source_bytes=source_bytes,
+        output_bytes=output_bytes,
+        device=_filesystem_device,
+        disk_usage=shutil.disk_usage,
+    )
+
+
+def _prepare_warp_model_plan(
+    model_id: str,
+    *,
+    staging_dir: Path,
+    models_dir: Path,
+) -> _warp_models.WarpInstallPlan:
+    """Validate prerequisites and storage before confirmation or installation."""
+    _warp_models.require_tools(
+        ("git", "make", "bash", "uv", "curl"),
+        which=shutil.which,
+    )
+    plan = _warp_models.build_plan(
+        model_id,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+    )
+    _preflight_warp_disk(
+        plan.source,
+        plan.output,
+        source_bytes=plan.source_bytes,
+        output_bytes=plan.output_workspace_bytes,
+    )
+    return plan
+
+
+def _validate_warp_container(container: Path, model_id: str) -> None:
+    """Validate a completed local ``.waste`` container."""
+    _warp_models.validate_container(container, model_id)
+
+
+def install_warp_model(
+    model_id: str,
+    *,
+    warp_root: Path,
+    staging_dir: Path,
+    models_dir: Path,
+    jobs: int = 3,
+    reclaim_source: bool = False,
+) -> Path:
+    """Install a pinned catalog model through the upstream WARP pipeline."""
+    return _warp_models.install_model(
+        model_id,
+        warp_root=warp_root,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+        jobs=jobs,
+        reclaim_source=reclaim_source,
+        preflight=_preflight_warp_disk,
+        which=shutil.which,
+        run=subprocess.run,
+        validate=_validate_warp_container,
+    )
 
 
 def install_llamacpp(prefix: Path, variant: str = "auto", tag: str | None = None) -> Path:
@@ -906,11 +1001,15 @@ def print_model_table(ram_gb: float | None) -> None:
         budget = ram_gb * (0.75 if is_macos() else 1.0)
         click.echo(f"Detected {ram_gb:.0f} GB RAM" + (f" (Metal can use ~{budget:.0f} GB by default)" if is_macos() else ""))
         click.echo()
-    tiers = sorted({v["tier"] for v in KNOWN_MODELS.values()})
+    tiers = sorted({
+        info["tier"]
+        for info in KNOWN_MODELS.values()
+        if info["format"] != WASTE
+    })
     for tier in tiers:
         click.echo(f"== {TIER_LABELS[tier]} ==")
         for mid, info in KNOWN_MODELS.items():
-            if info["tier"] != tier:
+            if info["format"] == WASTE or info.get("tier") != tier:
                 continue
             size = quant_size_gb(mid, None)
             default = info.get("default_quant", info.get("kt_method"))
@@ -926,12 +1025,38 @@ def print_model_table(ram_gb: float | None) -> None:
             click.echo(f"  {mid:32s} {engine:20s} {default:>12s} {size:5.0f} GB  {info['params']}"
                        + (f"  [{fit}]" if fit else ""))
         click.echo()
+
+    warp_models = [(mid, info) for mid, info in KNOWN_MODELS.items() if info["format"] == WASTE]
+    if warp_models:
+        click.echo("== WARP conversion containers ==")
+        for mid, info in warp_models:
+            size = quant_size_gb(mid, None)
+            unit = (
+                "GiB"
+                if info["output_size_bytes"] == info["size_gb"] * 1024**3
+                else "GB"
+            )
+            click.echo(
+                f"  {mid:32s} {'WARP (.waste)':20s} {info['warp_profile']:>12s} "
+                f"{size:5.0f} {unit}  {info['params']}"
+            )
+        click.echo()
     click.echo("Install: litmoe install --model <name> [--quant <quant>]")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _positive_warp_jobs(
+    _ctx: click.Context,
+    _param: click.Parameter,
+    value: int,
+) -> int:
+    if value < 1:
+        raise click.BadParameter("must be a positive integer")
+    return value
+
 
 @click.command("install")
 @click.argument("targets", nargs=-1)
@@ -945,6 +1070,12 @@ def print_model_table(ram_gb: float | None) -> None:
 @click.option("--llamacpp-tag", default=None, help="Pin a llama.cpp release tag (e.g. b11005)")
 @click.option("--models-dir", type=click.Path(), default=None,
               help="Where to store model weights (default: ~/.litmoe/models)")
+@click.option("--staging-dir", type=click.Path(), default=None,
+              help="WARP source staging root (default: <models-dir>/.staging)")
+@click.option("--warp-jobs", type=int, default=3, show_default=True,
+              callback=_positive_warp_jobs, help="Positive parallel job count for WARP conversion")
+@click.option("--reclaim-source", is_flag=True,
+              help="Delete WARP source shards as conversion makes them reclaimable")
 @click.option("--prefix", type=click.Path(), default=None,
               help="Install prefix for engine binaries (default: ~/.local)")
 @click.option("--n-ctx", default=None, type=int,
@@ -952,8 +1083,25 @@ def print_model_table(ram_gb: float | None) -> None:
 @click.option("--no-mmproj", is_flag=True, help="Skip the vision projector for multimodal models")
 @click.option("--config", "-c", type=click.Path(), default=None, help="Path to models.yaml")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompts")
-def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_tag, models_dir,
-                prefix, n_ctx, no_mmproj, config, yes):
+@click.pass_context
+def install_cmd(
+    ctx,
+    targets,
+    model_name,
+    quant,
+    engine,
+    llamacpp_variant,
+    llamacpp_tag,
+    models_dir,
+    staging_dir,
+    warp_jobs,
+    reclaim_source,
+    prefix,
+    n_ctx,
+    no_mmproj,
+    config,
+    yes,
+):
     """Install an engine and/or download model weights in one command.
 
     \b
@@ -966,26 +1114,112 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
       litmoe install --model minimax-m2.7           # 141 GB MoE, 192 GB workstation
       litmoe install --model kimi-k3                # 594 GB MoE, 768 GB server
       litmoe install --model glm-5.3-flash          # ktransformers (Linux + NVIDIA GPU)
+      litmoe install glm-5.3-flash-warp              # 112 GB WARP container
+      litmoe install --model deepseek-v4.1-flash-warp # 299 GB WARP container
       litmoe install --engine llamacpp --llamacpp-variant cuda
       litmoe install warp                           # pinned WARP source build
     """
-    models_dir = expand_path(models_dir) if models_dir else _default_models_dir()
-    prefix = expand_path(prefix) if prefix else _default_prefix()
-    config_path = expand_path(config) if config else default_config_path()
-
-    for t in targets:
-        if t in ("llamacpp", "ktransformers", "warp", "both"):
-            engine = t if engine is None else engine
-        elif lookup(t):
-            model_name = t if model_name is None else model_name
+    engine_from_option = (
+        ctx.get_parameter_source("engine") is click.core.ParameterSource.COMMANDLINE
+    )
+    warp_jobs_from_option = (
+        ctx.get_parameter_source("warp_jobs") is click.core.ParameterSource.COMMANDLINE
+    )
+    llamacpp_variant_from_option = (
+        ctx.get_parameter_source("llamacpp_variant")
+        is click.core.ParameterSource.COMMANDLINE
+    )
+    llamacpp_tag_from_option = (
+        ctx.get_parameter_source("llamacpp_tag")
+        is click.core.ParameterSource.COMMANDLINE
+    )
+    positional_engine = False
+    for target in targets:
+        if target in ("llamacpp", "ktransformers", "warp", "both"):
+            if engine is None:
+                engine = target
+            positional_engine = True
+        elif lookup(target):
+            model_name = target if model_name is None else model_name
         else:
-            raise click.BadParameter(f"unknown target: {t}")
+            raise click.BadParameter(f"unknown target: {target}")
 
     info = lookup(model_name) if model_name else None
+    is_warp_model = bool(info and info["format"] == WASTE)
+    if is_warp_model:
+        incompatible = [
+            ("--quant", quant is not None),
+            ("--no-mmproj", no_mmproj),
+            ("--n-ctx", n_ctx is not None),
+            ("--engine", engine_from_option or positional_engine),
+            ("--llamacpp-variant", llamacpp_variant_from_option),
+            ("--llamacpp-tag", llamacpp_tag_from_option),
+        ]
+        for option, supplied in incompatible:
+            if supplied:
+                raise click.BadParameter(
+                    f"{option} is not supported for WARP catalog models",
+                    param_hint=option,
+                )
+    else:
+        warp_only = [
+            ("--staging-dir", staging_dir is not None),
+            ("--warp-jobs", warp_jobs_from_option),
+            ("--reclaim-source", reclaim_source),
+        ]
+        for option, supplied in warp_only:
+            if supplied:
+                raise click.BadParameter(
+                    f"{option} is only valid for WARP catalog models",
+                    param_hint=option,
+                )
+
     if engine is None:
         engine = info["engine"] if info else "llamacpp"
 
+    models_dir = expand_path(models_dir) if models_dir else _default_models_dir()
+    staging_dir = expand_path(staging_dir) if staging_dir else models_dir / ".staging"
+    prefix = expand_path(prefix) if prefix else _default_prefix()
+    config_path = expand_path(config) if config else default_config_path()
+
+    if is_warp_model:
+        assert info is not None and model_name is not None
+        try:
+            plan = _prepare_warp_model_plan(
+                model_name,
+                staging_dir=staging_dir,
+                models_dir=models_dir,
+            )
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        output_unit = (
+            "GiB"
+            if info["output_size_bytes"] == info["size_gb"] * 1024**3
+            else "GB"
+        )
+        click.echo("WARP conversion plan:")
+        click.echo(f"  Revision: {info['hf_revision']}")
+        click.echo(
+            f"  Source: {info['source_size_gib']} GiB -> {plan.source}"
+        )
+        click.echo(
+            f"  Container: {info['size_gb']} {output_unit} -> {plan.output}"
+        )
+        click.echo(
+            f"  Conversion workspace: {info['output_workspace_gib']} GiB"
+        )
+        if reclaim_source:
+            click.echo(
+                "  WARNING: --reclaim-source is irreversible: completed source "
+                "shards are removed, and a retry may need to re-download them."
+            )
+        if not yes:
+            click.confirm("Proceed with WARP conversion?", abort=True)
+
+
     # 1. Engine install
+    warp_root = None
     if engine in ("llamacpp", "both"):
         click.echo("Installing llama.cpp...")
         try:
@@ -1003,13 +1237,12 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
     if engine == "warp":
         click.echo("Installing WARP...")
         try:
-            install_warp(prefix)
+            warp_root = install_warp(prefix)
         except Exception as e:
             click.echo(f"  WARP install failed: {e}", err=True)
             sys.exit(1)
 
-
-    # 2. Model download
+    # 2. Model installation
     if not model_name:
         total = get_total_memory_bytes()
         click.echo()
@@ -1017,9 +1250,13 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
             ram_gb = total / 1e9
             recs = recommended_for_ram(ram_gb * (0.75 if is_macos() else 1.0))
             click.echo(f"Detected {ram_gb:.0f} GB RAM. Models that fit, fastest first:")
-            for r in recs:
-                ri = KNOWN_MODELS[r]
-                click.echo(f"  litmoe install --model {r:32s} # {quant_size_gb(r, None):.0f} GB, {ri['params']}")
+            for recommendation in recs:
+                recommended_info = KNOWN_MODELS[recommendation]
+                click.echo(
+                    f"  litmoe install --model {recommendation:32s} "
+                    f"# {quant_size_gb(recommendation, None):.0f} GB, "
+                    f"{recommended_info['params']}"
+                )
         else:
             click.echo(f"To add a model:  litmoe install --model {DEFAULT_MODEL}")
         click.echo("Full list:  litmoe models")
@@ -1030,7 +1267,7 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
     budget_gb = (total / 1e9) * (0.75 if is_macos() else 1.0) if total else None
     quant_val = choose_quant(model_name, quant, budget_gb)
     size_note = quant_size_gb(model_name, quant_val)
-    if size_note and not yes:
+    if info["format"] != WASTE and size_note and not yes:
         need = ram_needed_gb(model_name, quant_val)
         msg = f"  {model_name} {quant_val or ''} is ~{size_note:.0f} GB on disk"
         if need and total:
@@ -1041,43 +1278,79 @@ def install_cmd(targets, model_name, quant, engine, llamacpp_variant, llamacpp_t
         click.confirm("Proceed with download?", abort=True)
 
     click.echo(f"Installing model: {model_name} [{quant_val}]" if quant_val else f"Installing model: {model_name}")
-    path, mmproj = download_model(model_name, quant_val, models_dir, with_mmproj=not no_mmproj)
     engine_for_model = info["engine"]
-
-    if info["format"] == GGUF:
-        weights_gb = None
+    if info["format"] == WASTE:
+        assert warp_root is not None
         try:
-            pat = re.sub(r"-\d{5}-of-(\d{5})\.gguf$", r"-*-of-\1.gguf", path.name)
-            files = list(path.parent.glob(pat)) if pat != path.name else [path]
-            weights_gb = sum(f.stat().st_size for f in files) / 1e9
-        except OSError:
-            pass
-        ctx = choose_n_ctx(model_name, weights_gb, n_ctx)
-        extra = list(info.get("extra_args", []))
-        if mmproj:
-            extra += ["--mmproj", str(mmproj)]
-        add_model_to_config(model_name, engine_for_model, path, ctx, config_path, extra_args=extra or None)
+            path = install_warp_model(
+                model_name,
+                warp_root=warp_root,
+                staging_dir=staging_dir,
+                models_dir=models_dir,
+                jobs=warp_jobs,
+                reclaim_source=reclaim_source,
+            )
+        except Exception as e:
+            click.echo(f"  WARP model install failed: {e}", err=True)
+            sys.exit(1)
+        add_model_to_config(model_name, engine_for_model, path, 0, config_path)
     else:
-        ctx = n_ctx or info["native_ctx"]
-        add_model_to_config(model_name, engine_for_model, path, ctx, config_path,
-                            extra_args=list(info.get("extra_args", [])) or None,
-                            kt_method=info["kt_method"])
-        click.echo("  ktransformers entry written: needs an NVIDIA GPU at serve time "
-                   "(kt_num_gpu_experts=0 keeps all experts on CPU).")
+        path, mmproj = download_model(
+            model_name,
+            quant_val,
+            models_dir,
+            with_mmproj=not no_mmproj,
+        )
+        if info["format"] == GGUF:
+            weights_gb = None
+            try:
+                pattern = re.sub(r"-\d{5}-of-(\d{5})\.gguf$", r"-*-of-\1.gguf", path.name)
+                files = list(path.parent.glob(pattern)) if pattern != path.name else [path]
+                weights_gb = sum(file.stat().st_size for file in files) / 1e9
+            except OSError:
+                pass
+            model_ctx = choose_n_ctx(model_name, weights_gb, n_ctx)
+            extra = list(info.get("extra_args", []))
+            if mmproj:
+                extra += ["--mmproj", str(mmproj)]
+            add_model_to_config(
+                model_name,
+                engine_for_model,
+                path,
+                model_ctx,
+                config_path,
+                extra_args=extra or None,
+            )
+        else:
+            model_ctx = n_ctx or info["native_ctx"]
+            add_model_to_config(
+                model_name,
+                engine_for_model,
+                path,
+                model_ctx,
+                config_path,
+                extra_args=list(info.get("extra_args", [])) or None,
+                kt_method=info["kt_method"],
+            )
+            click.echo("  ktransformers entry written: needs an NVIDIA GPU at serve time "
+                       "(kt_num_gpu_experts=0 keeps all experts on CPU).")
     if info.get("notes"):
         click.echo(f"  NOTE: {info['notes']}")
 
     from litmoe.config import load_config
     from litmoe.server import check_fits_together
     try:
-        v = check_fits_together(load_config(config_path).models)
+        validation = check_fits_together(load_config(config_path).models)
     except Exception:  # unreadable/partial config: the serve-time check will catch it
-        v = None
+        validation = None
     click.echo()
-    crowded = v is not None and v.level == "no" and len(v.per_model) > 1
+    crowded = validation is not None and validation.level == "no" and len(validation.per_model) > 1
     if crowded:
-        click.echo(f"  NOTE: models.yaml now lists {len(v.per_model)} models needing ~{v.total_gb:.0f} GB together; "
-                   f"this machine has ~{v.ram_limit_gb:.0f} GB usable. `litmoe serve` loads all of them at once,")
+        click.echo(
+            f"  NOTE: models.yaml now lists {len(validation.per_model)} models needing "
+            f"~{validation.total_gb:.0f} GB together; this machine has "
+            f"~{validation.ram_limit_gb:.0f} GB usable. `litmoe serve` loads all of them at once,"
+        )
         click.echo(f"        so serve one at a time:  litmoe serve {model_name}")
         click.echo()
     click.echo("Done. Next:  litmoe serve" + (f" {model_name}" if crowded else ""))

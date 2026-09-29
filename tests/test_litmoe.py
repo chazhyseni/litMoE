@@ -646,6 +646,39 @@ def test_install_warp_builds_and_verifies_pinned_source(tmp_path, monkeypatch):
     assert (prefix / "bin" / "waste").resolve() == root / "waste"
 
 
+def test_install_warp_build_subprocesses_do_not_inherit_hf_token(
+    tmp_path, monkeypatch,
+):
+    source, ref = _fake_warp_source(tmp_path)
+    prefix = tmp_path / "prefix"
+    token = "runtime-build-secret"
+    calls = []
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I.shutil, "which", lambda tool: f"/fake/bin/{tool}")
+    monkeypatch.setenv("HF_TOKEN", token)
+
+    def fake_run(args, **kwargs):
+        command = list(args)
+        calls.append((command, kwargs))
+        if command[:3] == ["git", "clone", "--no-checkout"]:
+            shutil.copytree(source, Path(command[-1]))
+        elif command == ["make"]:
+            checkout = Path(kwargs["cwd"])
+            (checkout / "waste").write_bytes(b"new launcher")
+            (checkout / "waste.exe").write_bytes(b"new launcher")
+            for library in ("libwaste.so", "libwaste.dylib", "libwaste.dll"):
+                (checkout / library).write_bytes(b"new library")
+        return I.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    I.install_warp(prefix, ref=ref)
+
+    assert len(calls) == 5
+    assert all(isinstance(kwargs.get("env"), dict) for _, kwargs in calls)
+    assert all("HF_TOKEN" not in kwargs["env"] for _, kwargs in calls)
+
+
 def test_install_warp_copies_discoverable_windows_launcher(tmp_path, monkeypatch):
     source, ref = _fake_warp_source(tmp_path)
     prefix = tmp_path / "prefix"
@@ -659,6 +692,54 @@ def test_install_warp_copies_discoverable_windows_launcher(tmp_path, monkeypatch
     assert launcher.is_file()
     assert not launcher.is_symlink()
     assert launcher.read_bytes() == (root / "waste.exe").read_bytes()
+
+
+@pytest.mark.parametrize("cutover", ["tree", "launcher"])
+def test_install_warp_keyboard_interrupt_restores_windows_runtime_and_launcher(
+    tmp_path, monkeypatch, cutover,
+):
+    source, ref = _fake_warp_source(tmp_path)
+    prefix = tmp_path / "prefix"
+    previous = prefix / "lib" / "warp"
+    previous.mkdir(parents=True)
+    (previous / "runtime-version").write_text("old runtime")
+    launcher = prefix / "bin" / "waste.exe"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes(b"old launcher")
+    real_replace = I.os.replace
+    interrupted = False
+
+    def interrupt_cutover(source_path, destination_path):
+        nonlocal interrupted
+        source_path = Path(source_path)
+        destination_path = Path(destination_path)
+        tree_cutover = source_path.name == "checkout" and destination_path == previous
+        launcher_cutover = (
+            source_path.name == "waste-link" and destination_path == launcher
+        )
+        if not interrupted and (
+            (cutover == "tree" and tree_cutover)
+            or (cutover == "launcher" and launcher_cutover)
+        ):
+            interrupted = True
+            raise KeyboardInterrupt
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I.shutil, "which", lambda tool: f"/fake/bin/{tool}")
+    monkeypatch.setattr(I.sys, "platform", "win32")
+    monkeypatch.setattr(I.os, "replace", interrupt_cutover)
+
+    with pytest.raises(KeyboardInterrupt):
+        I.install_warp(prefix, ref=ref)
+
+    assert interrupted
+    assert previous.is_dir()
+    assert (previous / "runtime-version").is_file()
+    assert (previous / "runtime-version").read_text() == "old runtime"
+    assert not (previous / "serve").exists()
+    assert launcher.read_bytes() == b"old launcher"
+    assert not launcher.is_symlink()
 
 
 def test_install_warp_restores_previous_tree_when_launcher_install_fails(tmp_path, monkeypatch):
@@ -1018,3 +1099,1440 @@ def test_serve_gate_two_thresholds(tmp_path, monkeypatch):
 
     r = run("nope")
     assert r.exit_code == 1 and "not in" in r.output
+
+
+# ---------------------------------------------------------------------------
+# catalog-installable WARP models
+# ---------------------------------------------------------------------------
+
+WARP_CATALOG_MODELS = {
+    "glm-5.3-flash-warp": {
+        "repo": "zai-org/GLM-5.3-Flash",
+        "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+        "profile": "glm",
+        "arch": "glm5-next",
+        "source_gib": 306,
+        "output_gb": 112,
+        "output_bytes": 112_000_000_000,
+        "output_workspace_gib": 120,
+        "native_ctx": 1_048_576,
+        "active_b": 17.31,
+        "params": "313.89B total, 17.31B active per token, WARP container",
+        "tier": M.TIER_LAPTOP_48,
+    },
+    "deepseek-v4.1-flash-warp": {
+        "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+        "profile": "ds41",
+        "arch": "deepseek-v41",
+        "source_gib": 475,
+        "output_gb": 299,
+        "output_bytes": 299 * 1024**3,
+        "output_workspace_gib": 310,
+        "native_ctx": 1_048_576,
+        "active_b": 16.62,
+        "params": (
+            "552.37B backbone + 197B Engram/n-gram memory, "
+            "16.62B active per token, WARP container"
+        ),
+        "tier": M.TIER_LAPTOP_48,
+    },
+}
+
+
+def _fake_installable_warp_root(tmp_path: Path) -> Path:
+    root = _fake_warp_root(tmp_path)
+    tools = root / "tools"
+    tools.mkdir()
+    (tools / "fetch_weights.sh").write_text("#!/usr/bin/env bash\n")
+    (tools / "pipeline.sh").write_text("#!/usr/bin/env bash\n")
+    return root
+
+
+def _fake_waste_container(
+    path: Path,
+    model_id: str,
+    *,
+    include_chat: bool | None = None,
+) -> Path:
+    """Write a tiny container with the pinned WARP v0 on-disk contract."""
+    expected = WARP_CATALOG_MODELS[model_id]
+    layer_number = 3 if expected["arch"] == "glm5-next" else 0
+    layer_file = f"experts-L{layer_number}.bin"
+    trunk_data = b"\0" * 16
+    layer_data = b"\1" * 32
+    manifest = {
+        "format_version": 0,
+        "arch": expected["arch"],
+        "tensor_prefix": "model.",
+        "config": {"max_position_embeddings": expected["native_ctx"]},
+        "expert_quant": {
+            "fmt": "VQ3R",
+            "stages": 3,
+            "vec_dim": 128,
+            "entries": 256,
+            "index_block": 256,
+            "index_bits": 8,
+            "bits_per_weight": 0.1875,
+        },
+        "layers": {
+            str(layer_number): {
+                "file": layer_file,
+                "experts": 288 if expected["arch"] == "glm5-next" else 384,
+                "bytes": len(layer_data),
+                "codebook_base": 0,
+            },
+        },
+        "trunk": [{
+            "name": "embed_tokens.weight",
+            "fmt": 1,
+            "off": 0,
+            "shape": [4],
+            "bytes": len(trunk_data),
+        }],
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    (path / "trunk.bin").write_bytes(trunk_data)
+    (path / layer_file).write_bytes(layer_data)
+    (path / "codebooks.bin").write_bytes(b"\2" * 16)
+    (path / "tokenizer.model").write_bytes(b"tiny tokenizer metadata")
+    (path / "specials.json").write_text("{}")
+    if include_chat is None:
+        include_chat = expected["arch"] == "glm5-next"
+    if include_chat:
+        (path / "chat.json").write_text("{}")
+    return path
+
+
+def _assert_private_curl_auth(args, child_env, token: str) -> Path:
+    assert "HF_TOKEN" not in child_env
+    assert all(token not in str(value) for value in child_env.values())
+    assert token not in " ".join(map(str, args))
+    curl_home = Path(child_env["CURL_HOME"])
+    curl_config = curl_home / ".curlrc"
+    assert curl_home.is_dir()
+    assert curl_home.stat().st_mode & 0o777 == 0o700
+    assert curl_config.is_file()
+    assert curl_config.stat().st_mode & 0o777 == 0o600
+    assert f"authorization: bearer {token}".lower() in curl_config.read_text().lower()
+    return curl_home
+
+
+def _patch_warp_model_prerequisites(monkeypatch):
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I,
+        "_preflight_warp_disk",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+
+
+def test_warp_catalog_entries_are_installable_and_valid():
+    assert M.WASTE == "waste"
+    for model_id, expected in WARP_CATALOG_MODELS.items():
+        info = M.lookup(model_id)
+        assert info is M.KNOWN_MODELS[model_id]
+        assert info["engine"] == "warp"
+        assert info["format"] == M.WASTE
+        assert info["hf_repo"] == expected["repo"]
+        assert info["hf_revision"] == expected["revision"]
+        assert info["warp_profile"] == expected["profile"]
+        assert info["arch"] == expected["arch"]
+        assert info["source_size_gib"] == expected["source_gib"]
+        assert info["size_gb"] == expected["output_gb"]
+        assert info["output_size_bytes"] == expected["output_bytes"]
+        assert info["output_workspace_gib"] == expected["output_workspace_gib"]
+        assert info["native_ctx"] == expected["native_ctx"]
+        assert info["active_b"] == expected["active_b"]
+        assert info["params"] == expected["params"]
+        assert info["tier"] == expected["tier"]
+        assert M.quant_size_gb(model_id, None) == expected["output_gb"]
+        assert "quants" not in info and "default_quant" not in info
+        assert model_id not in M.gguf_models()
+        assert model_id not in M.kt_models()
+    assert not set(WARP_CATALOG_MODELS) & set(M.recommended_for_ram(2048))
+    assert M.validate_catalog() == []
+
+
+@pytest.mark.parametrize("field", [
+    "arch",
+    "native_ctx",
+    "active_b",
+    "tier",
+    "output_workspace_gib",
+])
+def test_warp_catalog_validation_rejects_missing_runtime_metadata(
+    monkeypatch, field,
+):
+    model_id = "glm-5.3-flash-warp"
+    invalid = dict(M.KNOWN_MODELS[model_id])
+    invalid.pop(field)
+    monkeypatch.setitem(M.KNOWN_MODELS, model_id, invalid)
+
+    problems = "\n".join(M.validate_catalog())
+    assert model_id in problems
+    assert field in problems
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("hf_revision", "main"),
+    ("warp_profile", ""),
+    ("arch", ""),
+    ("source_size_gib", 0),
+    ("size_gb", 0),
+    ("output_size_bytes", 0),
+    ("output_workspace_gib", 0),
+    ("native_ctx", 0),
+    ("active_b", 0),
+    ("tier", -1),
+])
+def test_warp_catalog_validation_rejects_invalid_metadata(
+    monkeypatch, field, bad_value,
+):
+    model_id = "glm-5.3-flash-warp"
+    invalid = dict(M.KNOWN_MODELS[model_id])
+    invalid[field] = bad_value
+    monkeypatch.setitem(M.KNOWN_MODELS, model_id, invalid)
+
+    problems = "\n".join(M.validate_catalog())
+    assert model_id in problems
+    assert field in problems
+
+
+@pytest.mark.parametrize("model_id", WARP_CATALOG_MODELS)
+def test_warp_container_accepts_real_v0_manifest_schema(model_id, tmp_path):
+    container = _fake_waste_container(tmp_path / f"{model_id}.waste", model_id)
+
+    I._validate_warp_container(container, model_id)
+
+    manifest = json.loads((container / "manifest.json").read_text())
+    assert manifest["format_version"] == 0
+    assert manifest["arch"] == WARP_CATALOG_MODELS[model_id]["arch"]
+    assert isinstance(manifest["trunk"], list) and manifest["trunk"]
+    assert isinstance(manifest["layers"], dict) and manifest["layers"]
+    if model_id == "deepseek-v4.1-flash-warp":
+        assert not (container / "chat.json").exists()
+
+
+@pytest.mark.parametrize("case,expected_detail", [
+    ("wrong-format", "format"),
+    ("wrong-arch", "arch"),
+    ("malformed-trunk", "trunk"),
+    ("empty-trunk", "trunk"),
+    ("empty-layers", "layer"),
+    ("nonnumeric-layer", "layer"),
+    ("malformed-layer", "codebook_base"),
+    ("wrong-layer-name", "experts-"),
+    ("missing-layer-file", "experts-"),
+])
+def test_warp_container_rejects_invalid_v0_manifest(
+    tmp_path, case, expected_detail,
+):
+    model_id = "glm-5.3-flash-warp"
+    container = _fake_waste_container(tmp_path / "model.waste", model_id)
+    manifest_path = container / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    layer_number = next(iter(manifest["layers"]))
+
+    if case == "wrong-format":
+        manifest["format_version"] = 1
+    elif case == "wrong-arch":
+        manifest["arch"] = "deepseek-v41"
+    elif case == "malformed-trunk":
+        manifest["trunk"] = "trunk.bin"
+    elif case == "empty-trunk":
+        manifest["trunk"] = []
+    elif case == "empty-layers":
+        manifest["layers"] = {}
+    elif case == "nonnumeric-layer":
+        manifest["layers"]["not-a-layer"] = manifest["layers"].pop(layer_number)
+    elif case == "malformed-layer":
+        manifest["layers"][layer_number].pop("codebook_base")
+    elif case == "wrong-layer-name":
+        old_name = manifest["layers"][layer_number]["file"]
+        new_name = "renamed-expert-bank.bin"
+        (container / old_name).rename(container / new_name)
+        manifest["layers"][layer_number]["file"] = new_name
+    elif case == "missing-layer-file":
+        (container / manifest["layers"][layer_number]["file"]).unlink()
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError) as raised:
+        I._validate_warp_container(container, model_id)
+    assert "invalid WARP container" in str(raised.value)
+    assert expected_detail in str(raised.value).lower()
+
+
+@pytest.mark.parametrize("filename", [
+    "trunk.bin",
+    "codebooks.bin",
+    "tokenizer.model",
+    "specials.json",
+])
+def test_warp_container_rejects_missing_core_file(tmp_path, filename):
+    model_id = "glm-5.3-flash-warp"
+    container = _fake_waste_container(tmp_path / "model.waste", model_id)
+    (container / filename).unlink()
+
+    with pytest.raises(RuntimeError) as raised:
+        I._validate_warp_container(container, model_id)
+    assert filename in str(raised.value)
+
+
+def test_model_table_labels_warp_containers(capsys):
+    I.print_model_table(None)
+    lines = capsys.readouterr().out.splitlines()
+    for model_id in WARP_CATALOG_MODELS:
+        line = next(line for line in lines if model_id in line)
+        assert "WARP (.waste)" in line
+        assert "ktransformers" not in line
+
+
+@pytest.mark.parametrize("missing_tool", ["uv", "curl"])
+def test_install_warp_model_checks_dependencies_before_creating_paths(
+    tmp_path, monkeypatch, missing_tool,
+):
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    commands = []
+
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: None if command == missing_tool else f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I.subprocess,
+        "run",
+        lambda *args, **kwargs: commands.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match=rf"\b{missing_tool}\b"):
+        I.install_warp_model(
+            "glm-5.3-flash-warp",
+            warp_root=root,
+            staging_dir=staging_dir,
+            models_dir=models_dir,
+        )
+
+    assert commands == []
+    assert not staging_dir.exists()
+    assert not models_dir.exists()
+
+
+def test_install_warp_model_uses_deterministic_paths_and_pinned_pipeline_environment(
+    tmp_path, monkeypatch, capsys,
+):
+    model_id = "deepseek-v4.1-flash-warp"
+    token = "secret-test-token"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "external-staging"
+    models_dir = tmp_path / "internal-models"
+    ambient_curl_home = tmp_path / "ambient-curl-home"
+    calls = []
+    curl_homes = []
+    _patch_warp_model_prerequisites(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", token)
+    monkeypatch.setenv("CURL_HOME", str(ambient_curl_home))
+
+    def fake_run(args, **kwargs):
+        child_env = dict(kwargs.get("env") or {})
+        curl_homes.append(_assert_private_curl_auth(args, child_env, token))
+        calls.append((list(args), kwargs.get("cwd"), child_env))
+        if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
+            _fake_waste_container(Path(child_env["OUT"]), model_id)
+        return I.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    result = I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+        jobs=5,
+        reclaim_source=True,
+    )
+
+    expected_source = (staging_dir / model_id).absolute()
+    expected_output = (models_dir / f"{model_id}.waste").absolute()
+    assert result == expected_output
+    assert len(calls) == 2
+    assert len(set(curl_homes)) == 1
+    assert curl_homes[0] != ambient_curl_home
+
+    dry_run, dry_cwd, dry_env = calls[0]
+    info = M.KNOWN_MODELS[model_id]
+    assert Path(dry_run[0]).name == "bash"
+    assert Path(dry_run[1]) == root / "tools" / "fetch_weights.sh"
+    assert dry_run[dry_run.index("--repo") + 1] == info["hf_repo"]
+    assert dry_run[dry_run.index("--revision") + 1] == info["hf_revision"]
+    assert Path(dry_run[dry_run.index("--dest") + 1]) == expected_source
+    assert dry_run[dry_run.index("--jobs") + 1] == "5"
+    assert "--dry-run" in dry_run
+    assert Path(dry_cwd) == root
+
+    pipeline, pipeline_cwd, pipeline_env = calls[1]
+    assert Path(pipeline[0]).name == "bash"
+    assert Path(pipeline[1]) == root / "tools" / "pipeline.sh"
+    assert Path(pipeline_cwd) == root
+    assert pipeline_env["MODEL"] == "ds41"
+    assert pipeline_env["REPO"] == info["hf_repo"]
+    assert pipeline_env["REVISION"] == info["hf_revision"]
+    assert Path(pipeline_env["SRC"]) == expected_source
+    assert Path(pipeline_env["OUT"]) == expected_output
+    assert pipeline_env["JOBS"] == "5"
+    assert pipeline_env["RECLAIM"] == "on"
+    assert pipeline_env["MIN_FREE_GB"] == "310"
+    assert "HF_TOKEN" not in dry_env
+    assert "HF_TOKEN" not in pipeline_env
+    assert Path(dry_env["CURL_HOME"]) == curl_homes[0]
+    assert Path(pipeline_env["CURL_HOME"]) == curl_homes[0]
+    captured = capsys.readouterr()
+    assert token not in captured.out + captured.err
+    assert all(not curl_home.exists() for curl_home in curl_homes)
+
+    manifest = json.loads((result / "manifest.json").read_text())
+    assert manifest["format_version"] == 0
+    assert manifest["arch"] == "deepseek-v41"
+    assert (result / "trunk.bin").is_file()
+    assert (result / "tokenizer.model").is_file()
+    assert list(result.glob("experts-L*.bin"))
+    assert not (result / "chat.json").exists()
+
+
+def test_install_warp_model_removes_temporary_curl_auth_after_failure(
+    tmp_path, monkeypatch,
+):
+    model_id = "glm-5.3-flash-warp"
+    token = "failure-secret-token"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    curl_homes = []
+    _patch_warp_model_prerequisites(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", token)
+
+    def fake_run(args, **kwargs):
+        child_env = dict(kwargs.get("env") or {})
+        curl_homes.append(_assert_private_curl_auth(args, child_env, token))
+        failed = any(Path(str(arg)).name == "pipeline.sh" for arg in args)
+        return I.subprocess.CompletedProcess(args, 19 if failed else 0)
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="pipeline"):
+        I.install_warp_model(
+            model_id,
+            warp_root=root,
+            staging_dir=tmp_path / "staging",
+            models_dir=tmp_path / "models",
+        )
+
+    assert len(curl_homes) == 2
+    assert all(not curl_home.exists() for curl_home in curl_homes)
+
+
+def test_install_warp_model_preserves_ambient_curl_home_without_token(
+    tmp_path, monkeypatch,
+):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    ambient_curl_home = tmp_path / "existing curl home"
+    ambient_curl_home.mkdir()
+    ambient_config = ambient_curl_home / ".curlrc"
+    ambient_config.write_text("user-agent = fixture\n")
+    calls = []
+    _patch_warp_model_prerequisites(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("CURL_HOME", str(ambient_curl_home))
+
+    def fake_run(args, **kwargs):
+        child_env = dict(kwargs.get("env") or {})
+        calls.append(list(args))
+        assert "HF_TOKEN" not in child_env
+        assert child_env["CURL_HOME"] == str(ambient_curl_home)
+        assert ambient_config.read_text() == "user-agent = fixture\n"
+        if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
+            _fake_waste_container(Path(child_env["OUT"]), model_id)
+        return I.subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    result = I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=tmp_path / "staging",
+        models_dir=tmp_path / "models",
+    )
+
+    assert len(calls) == 2
+    assert result.is_dir()
+    assert ambient_curl_home.is_dir()
+    assert ambient_config.read_text() == "user-agent = fixture\n"
+
+
+def test_install_warp_model_skips_fetch_preflight_for_proven_reclaimed_source(
+    tmp_path, monkeypatch,
+):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    source = staging_dir / model_id
+    source.mkdir(parents=True)
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    (source / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.weight": shards[0],
+            "model.layers.1.weight": shards[1],
+        },
+    }))
+    (source / ".download-state").write_text("\n".join(shards) + "\n")
+    (source / ".reclaimed").write_text("\n".join(shards) + "\n")
+    scripts = []
+    _patch_warp_model_prerequisites(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    def fake_run(args, **kwargs):
+        script = next(
+            (Path(str(arg)).name for arg in args if str(arg).endswith(".sh")),
+            "",
+        )
+        scripts.append(script)
+        if script == "pipeline.sh":
+            _fake_waste_container(Path(kwargs["env"]["OUT"]), model_id)
+        return I.subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    result = I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+        reclaim_source=True,
+    )
+
+    assert scripts == ["pipeline.sh"]
+    assert result == (models_dir / f"{model_id}.waste").absolute()
+    assert json.loads((result / "manifest.json").read_text())["format_version"] == 0
+
+
+def test_install_warp_model_rejects_incomplete_container(tmp_path, monkeypatch):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    _patch_warp_model_prerequisites(monkeypatch)
+
+    def fake_run(args, **kwargs):
+        if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
+            output = Path(kwargs["env"]["OUT"])
+            _fake_waste_container(output, model_id)
+            next(output.glob("experts-L*.bin")).unlink()
+        return I.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"invalid WARP container.*expert"):
+        I.install_warp_model(
+            model_id,
+            warp_root=root,
+            staging_dir=staging_dir,
+            models_dir=models_dir,
+        )
+    assert (models_dir / f"{model_id}.waste" / "manifest.json").is_file()
+    assert (models_dir / f"{model_id}.waste" / "trunk.bin").is_file()
+
+
+@pytest.mark.parametrize("model_id", WARP_CATALOG_MODELS)
+def test_install_warp_model_budgets_profile_workspace_and_exports_same_minimum(
+    tmp_path, monkeypatch, model_id,
+):
+    expected = WARP_CATALOG_MODELS[model_id]
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    preflight_calls = []
+    pipeline_environments = []
+
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I,
+        "_preflight_warp_disk",
+        lambda source, output, **sizes: preflight_calls.append(
+            (Path(source), Path(output), sizes)
+        ),
+    )
+    monkeypatch.setattr(
+        I,
+        "_validate_warp_container",
+        lambda container, got_model_id: None,
+    )
+
+    def fake_run(args, **kwargs):
+        if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
+            pipeline_environments.append(dict(kwargs["env"]))
+        return I.subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    I.install_warp_model(
+        model_id,
+        warp_root=root,
+        staging_dir=staging_dir,
+        models_dir=models_dir,
+    )
+
+    source = (staging_dir / model_id).absolute()
+    output = (models_dir / f"{model_id}.waste").absolute()
+    assert preflight_calls == [(
+        source,
+        output,
+        {
+            "source_bytes": expected["source_gib"] * 1024**3,
+            "output_bytes": expected["output_workspace_gib"] * 1024**3,
+        },
+    )]
+    assert len(pipeline_environments) == 1
+    assert pipeline_environments[0]["MIN_FREE_GB"] == str(
+        expected["output_workspace_gib"]
+    )
+
+
+@pytest.mark.parametrize(
+    "failed_script,error_pattern",
+    [
+        ("fetch_weights.sh", "fetch preflight"),
+        ("pipeline.sh", "pipeline"),
+    ],
+)
+def test_install_warp_model_preserves_partial_artifacts_on_stage_failure(
+    tmp_path, monkeypatch, failed_script, error_pattern,
+):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    expected_source = staging_dir / model_id
+    expected_output = models_dir / f"{model_id}.waste"
+    _patch_warp_model_prerequisites(monkeypatch)
+
+    def fake_run(args, **kwargs):
+        script = next(
+            (Path(str(arg)).name for arg in args if str(arg).endswith(".sh")),
+            "",
+        )
+        expected_source.mkdir(parents=True, exist_ok=True)
+        (expected_source / "partial-shard.safetensors").write_bytes(b"resumable")
+        if script == "pipeline.sh":
+            expected_output.mkdir(parents=True, exist_ok=True)
+            (expected_output / "trunk.bin.partial").write_bytes(b"partial")
+        code = 17 if script == failed_script else 0
+        return I.subprocess.CompletedProcess(
+            args,
+            code,
+            stdout="",
+            stderr=f"simulated {script} failure" if code else "",
+        )
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=error_pattern):
+        I.install_warp_model(
+            model_id,
+            warp_root=root,
+            staging_dir=staging_dir,
+            models_dir=models_dir,
+        )
+
+    assert (expected_source / "partial-shard.safetensors").read_bytes() == b"resumable"
+    if failed_script == "pipeline.sh":
+        assert (expected_output / "trunk.bin.partial").read_bytes() == b"partial"
+
+
+def test_warp_fetch_failure_excludes_stale_pipeline_marker(
+    tmp_path, monkeypatch,
+):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    run_dir = models_dir / f"{model_id}.warp-run"
+    stale_marker = "stale pipeline failure from an earlier run"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".failed").write_text(stale_marker + "\n")
+    _patch_warp_model_prerequisites(monkeypatch)
+
+    def fail_fetch(args, **kwargs):
+        is_fetch = any(
+            Path(str(arg)).name == "fetch_weights.sh" for arg in args
+        )
+        return I.subprocess.CompletedProcess(args, 41 if is_fetch else 0)
+
+    monkeypatch.setattr(I.subprocess, "run", fail_fetch)
+
+    with pytest.raises(RuntimeError) as raised:
+        I.install_warp_model(
+            model_id,
+            warp_root=root,
+            staging_dir=staging_dir,
+            models_dir=models_dir,
+        )
+
+    message = str(raised.value)
+    assert "fetch preflight failed" in message
+    assert stale_marker not in message
+
+
+def test_warp_pipeline_failure_reports_exact_marker_and_resumable_paths(
+    tmp_path, monkeypatch,
+):
+    model_id = "glm-5.3-flash-warp"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    source = (staging_dir / model_id).absolute()
+    output = (models_dir / f"{model_id}.waste").absolute()
+    run_dir = (models_dir / f"{model_id}.warp-run").absolute()
+    stage_marker = "oracle diff (see diff.txt)"
+    calls = []
+    _patch_warp_model_prerequisites(monkeypatch)
+
+    def fake_run(args, **kwargs):
+        calls.append(kwargs)
+        if any(Path(str(arg)).name == "pipeline.sh" for arg in args):
+            source.mkdir(parents=True, exist_ok=True)
+            (source / "partial-shard.safetensors").write_bytes(b"resumable")
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "trunk.bin.partial").write_bytes(b"partial")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / ".failed").write_text(stage_marker + "\n")
+            return I.subprocess.CompletedProcess(args, 23)
+        return I.subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as raised:
+        I.install_warp_model(
+            model_id,
+            warp_root=root,
+            staging_dir=staging_dir,
+            models_dir=models_dir,
+        )
+
+    message = str(raised.value)
+    assert stage_marker in message
+    assert str(source) in message
+    assert str(output) in message
+    assert str(run_dir) in message
+    assert (source / "partial-shard.safetensors").read_bytes() == b"resumable"
+    assert (output / "trunk.bin.partial").read_bytes() == b"partial"
+    assert calls
+    assert all(call.get("capture_output") is not True for call in calls)
+    assert all(call.get("stdout") is not I.subprocess.PIPE for call in calls)
+    assert all(call.get("stderr") is not I.subprocess.PIPE for call in calls)
+
+
+def test_warp_disk_preflight_combines_same_filesystem_and_credits_resume(
+    tmp_path, monkeypatch,
+):
+    staging = tmp_path / "staging"
+    output = tmp_path / "model.waste"
+    staging.mkdir()
+    output.mkdir()
+    (staging / "partial.safetensors").write_bytes(b"s" * 200)
+    (output / "trunk.bin").write_bytes(b"o" * 100)
+    free = {"bytes": 1000}
+
+    monkeypatch.setattr(
+        I.shutil,
+        "disk_usage",
+        lambda path: type("Usage", (), {"free": free["bytes"]})(),
+    )
+    monkeypatch.setattr(
+        I,
+        "_filesystem_device",
+        lambda path: 7,
+        raising=False,
+    )
+
+    # Remaining bytes are 800 source + 500 output. Each would fit by itself,
+    # but a shared filesystem must budget for both together plus safety margin.
+    with pytest.raises(RuntimeError, match="same filesystem"):
+        I._preflight_warp_disk(
+            staging,
+            output,
+            source_bytes=1000,
+            output_bytes=600,
+        )
+
+    # Resume credit makes 1400 sufficient; starting from zero would not fit.
+    free["bytes"] = 1400
+    I._preflight_warp_disk(
+        staging,
+        output,
+        source_bytes=1000,
+        output_bytes=600,
+    )
+
+
+def test_warp_disk_preflight_credits_proven_reclaimed_source_only(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "staging"
+    output = tmp_path / "model.waste"
+    source.mkdir()
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    (source / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "model.layers.0.weight": shards[0],
+            "model.layers.1.weight": shards[1],
+        },
+    }))
+    (source / ".download-state").write_text("\n".join(shards) + "\n")
+    (source / shards[0]).write_bytes(b"verified shard")
+    (source / ".reclaimed").write_text(shards[1] + "\n")
+
+    monkeypatch.setattr(
+        I,
+        "_filesystem_device",
+        lambda path: 7,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        I.shutil,
+        "disk_usage",
+        lambda path: type("Usage", (), {"free": 0})(),
+    )
+
+    # The index proves the complete shard set, download-state proves each
+    # finished, and the reclaim ledger explains the one no longer on disk.
+    I._preflight_warp_disk(
+        source,
+        output,
+        source_bytes=10_000,
+        output_bytes=0,
+    )
+
+    # A missing shard without ledger evidence is not completion credit.
+    (source / ".reclaimed").write_text("")
+    with pytest.raises(RuntimeError, match="disk preflight"):
+        I._preflight_warp_disk(
+            source,
+            output,
+            source_bytes=10_000,
+            output_bytes=0,
+        )
+
+    # Nor is a ledger enough when download-state never proved the shard.
+    (source / ".reclaimed").write_text(shards[1] + "\n")
+    (source / ".download-state").write_text(shards[0] + "\n")
+    with pytest.raises(RuntimeError, match="disk preflight"):
+        I._preflight_warp_disk(
+            source,
+            output,
+            source_bytes=10_000,
+            output_bytes=0,
+        )
+
+
+def test_warp_disk_preflight_checks_split_filesystems_independently(
+    tmp_path, monkeypatch,
+):
+    staging = tmp_path / "staging"
+    output = tmp_path / "model.waste"
+    staging.mkdir()
+    output.mkdir()
+    (staging / "partial.safetensors").write_bytes(b"s" * 200)
+    (output / "trunk.bin").write_bytes(b"o" * 100)
+    free = {staging: 700, output: 10_000}
+
+    monkeypatch.setattr(
+        I,
+        "_filesystem_device",
+        lambda path: 1 if Path(path) == staging else 2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        I.shutil,
+        "disk_usage",
+        lambda path: type("Usage", (), {"free": free[Path(path)]})(),
+    )
+
+    with pytest.raises(RuntimeError, match="staging"):
+        I._preflight_warp_disk(
+            staging,
+            output,
+            source_bytes=1000,
+            output_bytes=600,
+        )
+
+    free[staging] = 850
+    free[output] = 500
+    with pytest.raises(RuntimeError, match="output"):
+        I._preflight_warp_disk(
+            staging,
+            output,
+            source_bytes=1000,
+            output_bytes=600,
+        )
+
+    free[output] = 550
+    I._preflight_warp_disk(
+        staging,
+        output,
+        source_bytes=1000,
+        output_bytes=600,
+    )
+
+
+def test_install_help_describes_warp_model_options():
+    from click.testing import CliRunner
+
+    result = CliRunner().invoke(I.install_cmd, ["--help"])
+    assert result.exit_code == 0, result.output
+    assert "--staging-dir" in result.output
+    assert "--warp-jobs" in result.output
+    assert "--reclaim-source" in result.output
+    assert "glm-5.3-flash-warp" in result.output
+    assert "deepseek-v4.1-flash-warp" in result.output
+
+
+@pytest.mark.parametrize("model_id", WARP_CATALOG_MODELS)
+def test_warp_cli_preflights_and_explains_destructive_plan_before_confirmation(
+    tmp_path, monkeypatch, model_id,
+):
+    from click.testing import CliRunner
+
+    expected = WARP_CATALOG_MODELS[model_id]
+    prefix = tmp_path / "prefix"
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    config = tmp_path / "models.yaml"
+    source = (staging_dir / model_id).absolute()
+    output = (models_dir / f"{model_id}.waste").absolute()
+    checked_tools = []
+    disk_checks = []
+    install_events = []
+
+    def fake_which(command):
+        checked_tools.append(command)
+        return f"/fake/bin/{command}"
+
+    def fake_disk_usage(path):
+        disk_checks.append(Path(path))
+        return type("Usage", (), {"free": 10**15})()
+
+    monkeypatch.setattr(I.shutil, "which", fake_which)
+    monkeypatch.setattr(I.shutil, "disk_usage", fake_disk_usage)
+    monkeypatch.setattr(
+        I,
+        "install_warp",
+        lambda *args, **kwargs: install_events.append("runtime") or tmp_path / "runtime",
+    )
+    monkeypatch.setattr(
+        I,
+        "install_warp_model",
+        lambda *args, **kwargs: install_events.append("model") or output,
+    )
+    monkeypatch.setattr(I, "get_total_memory_bytes", lambda: None)
+
+    result = CliRunner().invoke(I.install_cmd, [
+        "--model", model_id,
+        "--prefix", str(prefix),
+        "--staging-dir", str(staging_dir),
+        "--models-dir", str(models_dir),
+        "--config", str(config),
+        "--reclaim-source",
+    ], input="n\n")
+
+    assert result.exit_code != 0
+    assert "Aborted" in result.output
+    assert set(("git", "make", "bash", "uv", "curl")) <= set(checked_tools)
+    assert disk_checks
+    assert expected["revision"] in result.output
+    assert f"{expected['source_gib']} GiB" in result.output
+    output_unit = "GB" if model_id == "glm-5.3-flash-warp" else "GiB"
+    assert f"{expected['output_gb']} {output_unit}" in result.output
+    assert f"{expected['output_workspace_gib']} GiB" in result.output
+    assert str(source) in result.output
+    assert str(output) in result.output
+    assert "irreversible" in result.output.lower()
+    assert "re-download" in result.output.lower()
+    prompt_at = result.output.index("Proceed with WARP conversion?")
+    for detail in (expected["revision"], str(source), str(output), "irreversible"):
+        assert result.output.lower().index(detail.lower()) < prompt_at
+    assert install_events == []
+    assert not prefix.exists()
+    assert not staging_dir.exists()
+    assert not models_dir.exists()
+    assert not config.exists()
+
+
+@pytest.mark.parametrize("option", ["--staging-dir", "--models-dir"])
+@pytest.mark.parametrize("character,expected_detail", [
+    pytest.param("'", "single quote", id="single-quote"),
+    pytest.param("\n", "newline", id="newline"),
+    pytest.param("\r", "carriage return", id="carriage-return"),
+    pytest.param("\\", "backslash", id="backslash"),
+])
+def test_warp_cli_rejects_upstream_unsafe_paths_before_confirmation(
+    tmp_path, monkeypatch, option, character, expected_detail,
+):
+    from click.testing import CliRunner
+
+    bad_path = tmp_path / f"unsafe{character}path"
+    staging_dir = bad_path if option == "--staging-dir" else tmp_path / "staging"
+    models_dir = bad_path if option == "--models-dir" else tmp_path / "models"
+    prefix = tmp_path / "prefix"
+    config = tmp_path / "models.yaml"
+    install_events = []
+
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I.shutil,
+        "disk_usage",
+        lambda path: type("Usage", (), {"free": 10**15})(),
+    )
+    monkeypatch.setattr(
+        I,
+        "install_warp",
+        lambda *args, **kwargs: install_events.append("runtime") or tmp_path / "runtime",
+    )
+    monkeypatch.setattr(
+        I,
+        "install_warp_model",
+        lambda *args, **kwargs: install_events.append("model"),
+    )
+    monkeypatch.setattr(I, "get_total_memory_bytes", lambda: None)
+
+    result = CliRunner().invoke(I.install_cmd, [
+        "--model", "glm-5.3-flash-warp",
+        "--prefix", str(prefix),
+        "--staging-dir", str(staging_dir),
+        "--models-dir", str(models_dir),
+        "--config", str(config),
+    ])
+
+    assert result.exit_code != 0
+    assert expected_detail in result.output.lower()
+    assert "path" in result.output.lower()
+    assert "Proceed with WARP conversion?" not in result.output
+    assert install_events == []
+    assert not prefix.exists()
+    assert not staging_dir.exists()
+    assert not models_dir.exists()
+    assert not config.exists()
+
+
+@pytest.mark.parametrize("layout", [
+    "output-under-source",
+    "source-under-output",
+    "source-under-run",
+    "source-equals-output-via-symlink",
+    "output-equals-run-via-symlink",
+    "run-under-output-via-symlink",
+    "source-under-output-via-ancestor-symlink",
+])
+def test_warp_cli_rejects_resolved_plan_path_overlap_before_preflight(
+    tmp_path, monkeypatch, layout,
+):
+    from click.testing import CliRunner
+
+    model_id = "glm-5.3-flash-warp"
+    base = tmp_path / layout
+    staging_dir = base / "staging"
+    models_dir = base / "models"
+    pair = ("source", "output")
+
+    if layout == "output-under-source":
+        models_dir = staging_dir / model_id
+    elif layout == "source-under-output":
+        staging_dir = models_dir / f"{model_id}.waste"
+    elif layout == "source-under-run":
+        staging_dir = models_dir / f"{model_id}.warp-run"
+        pair = ("source", "run")
+    elif layout == "source-equals-output-via-symlink":
+        staging_dir.mkdir(parents=True)
+        models_dir.mkdir(parents=True)
+        output = models_dir / f"{model_id}.waste"
+        output.mkdir()
+        (staging_dir / model_id).symlink_to(output, target_is_directory=True)
+    elif layout == "output-equals-run-via-symlink":
+        models_dir.mkdir(parents=True)
+        run_dir = models_dir / f"{model_id}.warp-run"
+        run_dir.mkdir()
+        (models_dir / f"{model_id}.waste").symlink_to(
+            run_dir,
+            target_is_directory=True,
+        )
+        pair = ("output", "run")
+    elif layout == "run-under-output-via-symlink":
+        models_dir.mkdir(parents=True)
+        (models_dir / f"{model_id}.waste").symlink_to(
+            models_dir,
+            target_is_directory=True,
+        )
+        pair = ("output", "run")
+    elif layout == "source-under-output-via-ancestor-symlink":
+        models_dir.mkdir(parents=True)
+        output = models_dir / f"{model_id}.waste"
+        aliased_staging = output / "staging-root"
+        aliased_staging.mkdir(parents=True)
+        staging_dir = base / "staging-link"
+        staging_dir.symlink_to(aliased_staging, target_is_directory=True)
+
+    source = staging_dir / model_id
+    output = models_dir / f"{model_id}.waste"
+    run_dir = models_dir / f"{model_id}.warp-run"
+    targets = (source, output, run_dir)
+    before = {
+        path: (path.exists(), path.is_symlink())
+        for path in targets
+    }
+    disk_checks = []
+    install_events = []
+    prefix = base / "prefix"
+    config = base / "models.yaml"
+
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I,
+        "_preflight_warp_disk",
+        lambda *args, **kwargs: disk_checks.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        I,
+        "install_warp",
+        lambda *args, **kwargs: install_events.append("runtime") or base / "runtime",
+    )
+    monkeypatch.setattr(
+        I,
+        "install_warp_model",
+        lambda *args, **kwargs: install_events.append("model"),
+    )
+    monkeypatch.setattr(I, "get_total_memory_bytes", lambda: None)
+
+    result = CliRunner().invoke(I.install_cmd, [
+        "--model", model_id,
+        "--prefix", str(prefix),
+        "--staging-dir", str(staging_dir),
+        "--models-dir", str(models_dir),
+        "--config", str(config),
+    ])
+
+    message = result.output.lower()
+    assert result.exit_code != 0
+    assert "overlap" in message or "nested" in message
+    planned_paths = {"source": source, "output": output, "run": run_dir}
+    for name in pair:
+        path = planned_paths[name]
+        assert any(
+            detail in message
+            for detail in (name, str(path).lower(), str(path.resolve()).lower())
+        )
+    assert "Proceed with WARP conversion?" not in result.output
+    assert disk_checks == []
+    assert install_events == []
+    assert {
+        path: (path.exists(), path.is_symlink())
+        for path in targets
+    } == before
+    assert not prefix.exists()
+    assert not config.exists()
+
+
+@pytest.mark.parametrize(
+    "model_id,target_args,expected_jobs,expected_reclaim",
+    [
+        ("glm-5.3-flash-warp", ["glm-5.3-flash-warp"], 3, False),
+        (
+            "deepseek-v4.1-flash-warp",
+            [
+                "--model", "deepseek-v4.1-flash-warp",
+                "--warp-jobs", "4",
+                "--reclaim-source",
+            ],
+            4,
+            True,
+        ),
+    ],
+)
+def test_install_warp_catalog_model_dispatches_positional_and_option(
+    tmp_path, monkeypatch, model_id, target_args, expected_jobs, expected_reclaim,
+):
+    from click.testing import CliRunner
+
+    prefix = tmp_path / "prefix"
+    staging_dir = tmp_path / "staging dir"
+    models_dir = tmp_path / "models dir"
+    config = tmp_path / "models.yaml"
+    old_warp = tmp_path / "old.waste"
+    config.write_text(
+        "host: 127.0.0.1\nport: 8080\napi_key: null\nmodels:\n"
+        "  - id: existing\n    engine: llamacpp\n    model_path: /models/existing.gguf\n"
+        "    n_ctx: 32768\n    aliases: [existing-alias]\n"
+        f"  - id: {model_id}\n    engine: warp\n    model_path: {old_warp}\n"
+        "    n_ctx: 0\n    aliases: [warp-alias]\n"
+    )
+    container = _fake_waste_container(
+        models_dir / f"{model_id}.waste",
+        model_id,
+    ).absolute()
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    events = []
+
+    def fake_install_runtime(got_prefix, **kwargs):
+        events.append(("runtime", got_prefix))
+        return root
+
+    def fake_install_model(
+        got_model,
+        *,
+        warp_root,
+        staging_dir,
+        models_dir,
+        jobs,
+        reclaim_source,
+    ):
+        events.append((
+            "model",
+            got_model,
+            warp_root,
+            staging_dir,
+            models_dir,
+            jobs,
+            reclaim_source,
+        ))
+        return container
+
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I.shutil,
+        "disk_usage",
+        lambda path: type("Usage", (), {"free": 10**15})(),
+    )
+    monkeypatch.setattr(I, "install_warp", fake_install_runtime)
+    monkeypatch.setattr(I, "install_warp_model", fake_install_model, raising=False)
+    monkeypatch.setattr(I, "get_total_memory_bytes", lambda: None)
+
+    result = CliRunner().invoke(I.install_cmd, [
+        *target_args,
+        "--prefix", str(prefix),
+        "--staging-dir", str(staging_dir),
+        "--models-dir", str(models_dir),
+        "--config", str(config),
+        "--yes",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert events == [
+        ("runtime", prefix),
+        (
+            "model",
+            model_id,
+            root,
+            staging_dir,
+            models_dir,
+            expected_jobs,
+            expected_reclaim,
+        ),
+    ]
+    loaded = load_config(config)
+    existing = next(model for model in loaded.models if model.id == "existing")
+    warp = next(model for model in loaded.models if model.id == model_id)
+    assert existing.aliases == ["existing-alias"]
+    assert existing.model_path == "/models/existing.gguf"
+    assert warp.engine == "warp"
+    assert Path(warp.model_path).is_absolute()
+    assert Path(warp.model_path) == container
+    assert warp.n_ctx == 0
+    assert warp.aliases == ["warp-alias"]
+
+
+def test_install_rejects_nonpositive_warp_jobs():
+    from click.testing import CliRunner
+
+    result = CliRunner().invoke(I.install_cmd, [
+        "--model",
+        "glm-5.3-flash-warp",
+        "--warp-jobs",
+        "0",
+        "--yes",
+    ])
+    assert result.exit_code != 0
+    assert "warp-jobs" in result.output.lower()
+    assert "positive" in result.output.lower() or "at least 1" in result.output.lower()
+
+
+@pytest.mark.parametrize(
+    "args,option",
+    [
+        (
+            ["--model", "glm-5.3-flash-warp", "--quant", "Q4_K_M"],
+            "--quant",
+        ),
+        (
+            ["--model", "glm-5.3-flash-warp", "--no-mmproj"],
+            "--no-mmproj",
+        ),
+        (
+            ["--model", "glm-5.3-flash-warp", "--n-ctx", "32768"],
+            "--n-ctx",
+        ),
+        (
+            ["--model", "glm-5.3-flash-warp", "--engine", "llamacpp"],
+            "--engine",
+        ),
+        (
+            ["--model", "glm-5.3-flash-warp", "--llamacpp-variant", "cuda"],
+            "--llamacpp-variant",
+        ),
+        (
+            ["--model", "glm-5.3-flash-warp", "--llamacpp-tag", "b11005"],
+            "--llamacpp-tag",
+        ),
+        (
+            ["--model", "gemma-4-26b-a4b", "--staging-dir", "/tmp/stage"],
+            "--staging-dir",
+        ),
+        (
+            ["--model", "gemma-4-26b-a4b", "--warp-jobs", "4"],
+            "--warp-jobs",
+        ),
+        (
+            ["--model", "gemma-4-26b-a4b", "--reclaim-source"],
+            "--reclaim-source",
+        ),
+    ],
+)
+def test_install_rejects_incompatible_warp_options(monkeypatch, args, option):
+    from click.testing import CliRunner
+
+    called = []
+
+    def unexpected(*unused_args, **unused_kwargs):
+        called.append(True)
+        raise AssertionError("validation must happen before installation")
+
+    monkeypatch.setattr(I, "install_warp", unexpected)
+    monkeypatch.setattr(I, "install_warp_model", unexpected, raising=False)
+    monkeypatch.setattr(I, "install_llamacpp", unexpected)
+    monkeypatch.setattr(I, "install_ktransformers", unexpected)
+    monkeypatch.setattr(I, "download_model", unexpected)
+
+    result = CliRunner().invoke(I.install_cmd, [*args, "--yes"])
+    assert result.exit_code != 0
+    assert option in result.output
+    assert called == []
+
+
+def test_install_warp_failure_does_not_mutate_config(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    prefix = tmp_path / "prefix"
+    root = _fake_installable_warp_root(tmp_path / "runtime")
+    staging_dir = tmp_path / "staging"
+    models_dir = tmp_path / "models"
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        "host: 127.0.0.1\nport: 8080\napi_key: null\nmodels:\n"
+        "  - id: existing\n    engine: llamacpp\n"
+        "    model_path: /models/existing.gguf\n    n_ctx: 32768\n"
+        "    aliases: [keep-me]\n"
+    )
+    before = config.read_bytes()
+    partial = models_dir / "glm-5.3-flash-warp.waste" / "trunk.bin.partial"
+    events = []
+
+    def fail_model(*args, **kwargs):
+        events.append("model")
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"resume me")
+        raise RuntimeError("WARP pipeline failed at convert")
+
+    monkeypatch.setattr(
+        I.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    monkeypatch.setattr(
+        I.shutil,
+        "disk_usage",
+        lambda path: type("Usage", (), {"free": 10**15})(),
+    )
+    monkeypatch.setattr(
+        I,
+        "install_warp",
+        lambda got_prefix, **kwargs: events.append("runtime") or root,
+    )
+    monkeypatch.setattr(I, "install_warp_model", fail_model, raising=False)
+    monkeypatch.setattr(I, "get_total_memory_bytes", lambda: None)
+
+    result = CliRunner().invoke(I.install_cmd, [
+        "--model", "glm-5.3-flash-warp",
+        "--prefix", str(prefix),
+        "--staging-dir", str(staging_dir),
+        "--models-dir", str(models_dir),
+        "--config", str(config),
+        "--yes",
+    ])
+
+    assert result.exit_code != 0
+    assert events == ["runtime", "model"]
+    assert "convert" in result.output
+    assert config.read_bytes() == before
+    assert partial.read_bytes() == b"resume me"
+
+
+def test_server_context_preparation_preserves_warp_zero(tmp_path, monkeypatch):
+    config_path = tmp_path / "models.yaml"
+    container = _fake_waste_container(
+        tmp_path / "glm-5.3-flash-warp.waste",
+        "glm-5.3-flash-warp",
+    )
+    config_path.write_text(
+        "host: 127.0.0.1\nport: 8080\nmodels:\n"
+        "  - id: glm-5.3-flash-warp\n"
+        "    engine: warp\n"
+        f"    model_path: {container}\n"
+        "    n_ctx: 0\n"
+    )
+    before = config_path.read_bytes()
+    config = load_config(config_path)
+    model = config.models[0]
+    monkeypatch.setattr(
+        S,
+        "compute_memory_aware_ctx",
+        lambda *args, **kwargs: pytest.fail(
+            "generic context sizing must not inspect WARP containers"
+        ),
+    )
+
+    S.Gateway(config, config_path=str(config_path))._fix_context(model)
+
+    assert model.n_ctx == 0
+    assert config_path.read_bytes() == before

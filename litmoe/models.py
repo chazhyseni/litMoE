@@ -33,10 +33,12 @@ Sizes are decimal GB (1 GB = 1e9 bytes), matching HuggingFace and ``du --si``.
 from __future__ import annotations
 
 import math
+from types import MappingProxyType
 
 # Values of ModelSpec["format"]
 GGUF = "gguf"
 SAFETENSORS = "safetensors"
+WASTE = "waste"
 
 # RAM tiers (GB). A model's tier is the smallest that fits default_quant + KV@32K + headroom.
 TIER_LAPTOP_48 = 48
@@ -84,7 +86,44 @@ def _k(hf_repo: str, arch: str, params: str, active_b: float | None, size_gb: in
     }
 
 
-KNOWN_MODELS: dict[str, dict] = {
+def _w(
+    hf_repo: str,
+    hf_revision: str,
+    warp_profile: str,
+    arch: str,
+    params: str,
+    active_b: float,
+    source_size_gib: int,
+    size_gb: int,
+    output_workspace_gib: int,
+    tier: int,
+    notes: str,
+    *,
+    size_is_gib: bool = False,
+) -> MappingProxyType:
+    """Build an immutable WARP conversion catalog entry."""
+    size_multiplier = 1024**3 if size_is_gib else 1_000_000_000
+    return MappingProxyType({
+        "hf_repo": hf_repo,
+        "hf_revision": hf_revision,
+        "engine": "warp",
+        "format": WASTE,
+        "warp_profile": warp_profile,
+        "arch": arch,
+        "params": params,
+        "active_b": active_b,
+        "source_size_gib": source_size_gib,
+        "size_gb": size_gb,
+        "output_size_bytes": size_gb * size_multiplier,
+        "output_workspace_gib": output_workspace_gib,
+        "native_ctx": 1_048_576,
+        "tier": tier,
+        "notes": notes,
+    })
+
+
+
+KNOWN_MODELS: dict[str, dict | MappingProxyType] = {
     # ==================================================================
     # 48 GB laptop tier — fast: 3–4B active MoE or ≤31B dense
     # ==================================================================
@@ -302,6 +341,40 @@ KNOWN_MODELS: dict[str, dict] = {
         689, 163840, 70_272, "FP8",
         ["--attention-backend", "flashinfer", "--disable-shared-experts-fusion"], TIER_SERVER_768,
         "kt-kernel registry entry DeepSeek-V3.2 (kt-method FP8)."),
+    # ==================================================================
+    # WARP — source weights converted into local .waste containers.
+    # These are conversion recipes, not runtime RAM recommendations.
+    # ==================================================================
+    "glm-5.3-flash-warp": _w(
+        hf_repo="zai-org/GLM-5.3-Flash",
+        hf_revision="eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+        warp_profile="glm",
+        arch="glm5-next",
+        params="313.89B total, 17.31B active per token, WARP container",
+        active_b=17.31,
+        source_size_gib=306,
+        size_gb=112,
+        output_workspace_gib=120,
+        tier=TIER_LAPTOP_48,
+        notes="Pinned WARP conversion from the upstream GLM-5.3-Flash weights.",
+    ),
+    "deepseek-v4.1-flash-warp": _w(
+        hf_repo="deepseek-ai/DeepSeek-V4.1-Flash",
+        hf_revision="dba1be0a40aa45a94ad051997016db3960a90277",
+        warp_profile="ds41",
+        arch="deepseek-v41",
+        params=(
+            "552.37B backbone + 197B Engram/n-gram memory, "
+            "16.62B active per token, WARP container"
+        ),
+        active_b=16.62,
+        source_size_gib=475,
+        size_gb=299,
+        output_workspace_gib=310,
+        tier=TIER_LAPTOP_48,
+        notes="Pinned WARP conversion from the upstream DeepSeek-V4.1-Flash weights.",
+        size_is_gib=True,
+    ),
 }
 
 # Old ids still accepted in models.yaml and by the catalog lookup.
@@ -331,7 +404,7 @@ CLAUDE_ALIASES = (
 )
 
 
-def lookup(model_id: str) -> dict | None:
+def lookup(model_id: str) -> dict | MappingProxyType | None:
     """Catalog entry for a model id (or legacy alias), or None."""
     key = MODEL_ID_ALIASES.get(model_id, model_id)
     return KNOWN_MODELS.get(key)
@@ -350,7 +423,7 @@ def quant_size_gb(model_id: str, quant: str | None) -> float | None:
     info = lookup(model_id)
     if not info:
         return None
-    if info["format"] == SAFETENSORS:
+    if info["format"] in (SAFETENSORS, WASTE):
         return float(info["size_gb"])
     q = quant or info["default_quant"]
     val = info["quants"].get(q)
@@ -361,7 +434,7 @@ def ram_needed_gb(model_id: str, quant: str | None = None, n_ctx: int = _FIT_CTX
     """RAM (GB) to run a quant with an n_ctx context: weights*overhead + KV + OS headroom."""
     info = lookup(model_id)
     size = quant_size_gb(model_id, quant)
-    if not info or size is None:
+    if not info or size is None or info["format"] == WASTE:
         return None
     kv_gb = info["kv_bytes_per_token"] * n_ctx / 1e9
     return size * _MODEL_OVERHEAD + kv_gb + _OS_HEADROOM_GB
@@ -488,21 +561,76 @@ def validate_catalog() -> list[str]:
     """Return a list of internal-consistency problems (empty = OK). Used by tests."""
     problems: list[str] = []
     for mid, info in KNOWN_MODELS.items():
-        for key in ("hf_repo", "engine", "format", "arch", "native_ctx", "kv_bytes_per_token", "tier"):
+        for key in ("hf_repo", "engine", "format"):
+            if key not in info:
+                problems.append(f"{mid}: missing {key}")
+
+        model_format = info.get("format")
+        if model_format == WASTE:
+            if info.get("engine") != "warp":
+                problems.append(f"{mid}: waste must use warp")
+            for key in (
+                "hf_revision",
+                "warp_profile",
+                "arch",
+                "source_size_gib",
+                "size_gb",
+                "output_size_bytes",
+                "output_workspace_gib",
+                "native_ctx",
+                "active_b",
+                "tier",
+                "params",
+            ):
+                if key not in info:
+                    problems.append(f"{mid}: missing {key}")
+            revision = info.get("hf_revision")
+            if (
+                not isinstance(revision, str)
+                or len(revision) != 40
+                or any(char not in "0123456789abcdef" for char in revision)
+            ):
+                problems.append(f"{mid}: hf_revision must be a pinned commit")
+            if not isinstance(info.get("warp_profile"), str) or not info["warp_profile"]:
+                problems.append(f"{mid}: invalid warp_profile")
+            if info.get("arch") not in ("glm5-next", "deepseek-v41"):
+                problems.append(f"{mid}: invalid arch")
+            if not isinstance(info.get("source_size_gib"), int) or info["source_size_gib"] <= 0:
+                problems.append(f"{mid}: invalid source_size_gib")
+            if not isinstance(info.get("size_gb"), int) or info["size_gb"] <= 0:
+                problems.append(f"{mid}: invalid size_gb")
+            if not isinstance(info.get("output_size_bytes"), int) or info["output_size_bytes"] <= 0:
+                problems.append(f"{mid}: invalid output_size_bytes")
+            if (
+                not isinstance(info.get("output_workspace_gib"), int)
+                or info["output_workspace_gib"] <= 0
+            ):
+                problems.append(f"{mid}: invalid output_workspace_gib")
+            if not isinstance(info.get("native_ctx"), int) or info["native_ctx"] < 4096:
+                problems.append(f"{mid}: invalid native_ctx")
+            if not isinstance(info.get("active_b"), (int, float)) or info["active_b"] <= 0:
+                problems.append(f"{mid}: invalid active_b")
+            if info.get("tier") not in TIERS:
+                problems.append(f"{mid}: invalid tier")
+            if "quants" in info or "default_quant" in info:
+                problems.append(f"{mid}: waste entries must not define quants")
+            continue
+
+        for key in ("arch", "native_ctx", "kv_bytes_per_token", "tier"):
             if key not in info:
                 problems.append(f"{mid}: missing {key}")
         if info.get("engine") not in ("llamacpp", "ktransformers"):
             problems.append(f"{mid}: bad engine {info.get('engine')}")
         if info.get("tier") not in TIERS:
             problems.append(f"{mid}: bad tier {info.get('tier')}")
-        if info.get("format") == GGUF:
+        if model_format == GGUF:
             if info.get("engine") != "llamacpp":
                 problems.append(f"{mid}: gguf must use llamacpp")
             if not info.get("quants"):
                 problems.append(f"{mid}: no quants")
             elif info.get("default_quant") not in info["quants"]:
                 problems.append(f"{mid}: default_quant {info.get('default_quant')} not in quants")
-        elif info.get("format") == SAFETENSORS:
+        elif model_format == SAFETENSORS:
             if info.get("engine") != "ktransformers":
                 problems.append(f"{mid}: safetensors must use ktransformers")
             if "size_gb" not in info:
@@ -510,7 +638,7 @@ def validate_catalog() -> list[str]:
             if info.get("kt_method") not in KT_METHODS:
                 problems.append(f"{mid}: bad kt_method {info.get('kt_method')}")
         else:
-            problems.append(f"{mid}: bad format {info.get('format')}")
+            problems.append(f"{mid}: bad format {model_format}")
         if not isinstance(info.get("native_ctx"), int) or info["native_ctx"] < 4096:
             problems.append(f"{mid}: implausible native_ctx")
         if not isinstance(info.get("kv_bytes_per_token"), int) or info["kv_bytes_per_token"] <= 0:

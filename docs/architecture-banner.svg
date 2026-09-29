@@ -46,12 +46,12 @@
   <text x="930" y="190" class="section">WARP</text>
   <text x="930" y="212" class="mono">upstream serve/__main__.py</text>
   <text x="930" y="232" class="body">gateway-assigned loopback port</text>
-  <text x="930" y="252" class="body">local .waste container</text>
-  <text x="930" y="272" class="body">mmap · local-storage paging</text>
+  <text x="930" y="252" class="body">catalog or manual .waste container</text>
+  <text x="930" y="272" class="body">upstream conversion · mmap · local paging</text>
 
   <!-- Output -->
   <rect x="20" y="310" width="1160" height="70" rx="8" fill="#161b22" stroke="#30363d"/>
   <text x="40" y="335" class="section">Inference happens in the engines, not in litmoe</text>
-  <text x="40" y="355" class="body">litmoe owns: HTTP routing, config validation, CLI, process supervision, and OpenAI/Anthropic translation.</text>
-  <text x="40" y="374" class="body">llama.cpp, ktransformers, and WARP own: forward passes, kernels, expert routing, caches, quantization, and storage paging.</text>
+  <text x="40" y="355" class="body">litmoe owns: HTTP routing, config validation, CLI orchestration, manifest validation, supervision, and protocol translation.</text>
+  <text x="40" y="374" class="body">llama.cpp, ktransformers, and WARP own: forward passes, kernels, expert routing, caches, quantization/conversion, and paging.</text>
 </svg>

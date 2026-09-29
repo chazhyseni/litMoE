@@ -8,7 +8,7 @@ litmoe is not an inference engine — the forward pass runs in llama.cpp, ktrans
 
 - **One API for multiple engines.** Mix llama.cpp, ktransformers, and WARP in the same `models.yaml`. Clients see one flat model list at one endpoint.
 - **Anthropic Messages API.** `/v1/messages` (and `/v1/messages/count_tokens`) are translated to OpenAI chat completions, so Claude Code, Hermes Agent, and other Anthropic-format tools work unchanged. Model aliases (`claude-sonnet-4-5` → your local model) are built in, and `scripts/claude-local` / `scripts/hermes-local` run a harness against the gateway **without touching its normal configuration** — plain `claude` keeps using your Anthropic account.
-- **A curated, RAM-tiered model catalog.** `litmoe models` shows what fits your machine; for catalogued llama.cpp and ktransformers models, `litmoe install --model X` downloads the listed weights and writes the config entry. WARP `.waste` containers are deliberately outside this catalog and must be created or acquired with upstream WARP tooling.
+- **A curated model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` installs the listed model and writes its config entry. Downloads are RAM-tiered, while the two WARP entries are storage-sized recipes that run pinned upstream conversions into local `.waste` containers.
 - **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. For catalogued models, context size is set to the native window and reduced only when weights + KV cache would not fit the GPU budget (Metal's share of unified memory on macOS, RAM elsewhere). For WARP, `n_ctx: 0` preserves the local container's default so WARP can size its own memory budget.
 - **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual engine process.
 - **Streaming.** Raw SSE passthrough for OpenAI requests; event-by-event translation for Anthropic requests (text, thinking, tool_use).
@@ -17,7 +17,7 @@ litmoe is not an inference engine — the forward pass runs in llama.cpp, ktrans
 
 ## Which models, on what hardware
 
-Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs: on the project's 24-core AVX2 box the 4B-active default runs at 9–12.7 t/s, the same band as a 9B dense model, while being a far stronger model (numbers and raw logs in [docs/measurements/](docs/measurements/README.md)). Every entry below was verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the same table with a fits / does-not-fit column for your RAM.
+Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs: on the project's 24-core AVX2 box the 4B-active default runs at 9–12.7 t/s, the same band as a 9B dense model, while being a far stronger model (numbers and raw logs in [docs/measurements/](docs/measurements/README.md)). The GGUF entries below were verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the live catalog with a fits / does-not-fit column for your RAM.
 
 | Tier | Model (`--model`) | Total / active | Default quant | Disk | Why |
 |---|---|---|---|---|---|
@@ -40,7 +40,12 @@ Speed on CPU/Metal is governed by *active* parameters per token, so the default 
 
 ktransformers entries (Linux + NVIDIA GPU, native precision safetensors, no GGUF): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal — supported by ktransformers since 2026-08-26 and *not* by released llama.cpp), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), `deepseek-v3.2-kt` (FP8).
 
-`litmoe install --model X` picks the quant for your machine: the default above when it fits, otherwise the largest one that does (e.g. `qwen3.5-122b-a10b` with 48 GB of RAM becomes UD-IQ2_XXS, 37 GB). `--quant` overrides. On Apple Silicon, Metal can use ~75% of RAM by default; `litmoe models` and `litmoe install` both apply that budget.
+WARP conversion entries: `glm-5.3-flash-warp` (306 GiB pinned source → 112 GB
+container) and `deepseek-v4.1-flash-warp` (475 GiB pinned source → 299 GiB
+container). They are storage recipes rather than RAM-tier defaults; see the
+WARP section below for workspace requirements.
+
+For GGUF entries, `litmoe install --model X` picks the quant for your machine: the default above when it fits, otherwise the largest one that does (e.g. `qwen3.5-122b-a10b` with 48 GB of RAM becomes UD-IQ2_XXS, 37 GB). `--quant` overrides. On Apple Silicon, Metal can use ~75% of RAM by default; `litmoe models` and `litmoe install` both apply that budget.
 
 ---
 
@@ -76,13 +81,65 @@ paging them from local storage. litmoe starts WARP's upstream OpenAI-compatible
 server as a loopback subprocess; litmoe remains the gateway/supervisor and WARP
 remains the inference runtime. No remote inference API is involved.
 
-**Install:** `litmoe install --engine warp` — clones commit
-`09fcff352ca55223b08ee222d15054b90546c6a9`, builds it, runs upstream
-`make check`, and installs the source tree under `$LITMOE_PREFIX/lib/warp`
-(default `~/.local/lib/warp`). It does **not** download or convert model
-weights. WARP configurations accept local `.waste` paths only; create or
-acquire those containers with upstream WARP tooling, not
-`litmoe install --model`.
+**Catalog model install:** litmoe can build either supported WARP container from
+pinned source weights:
+
+```bash
+litmoe install --model glm-5.3-flash-warp
+litmoe install --model deepseek-v4.1-flash-warp
+
+# Keep the large source staging area separate from output on internal NVMe.
+litmoe install --model glm-5.3-flash-warp \
+  --staging-dir /mnt/bulk/warp-staging \
+  --models-dir /mnt/nvme/litmoe-models
+
+# Optional conversion concurrency and irreversible source-shard reclamation.
+litmoe install --model deepseek-v4.1-flash-warp \
+  --warp-jobs 6 --reclaim-source
+```
+
+The command requires `git`, `make`, `bash`, `curl`, and `uv`. It resolves
+absolute paths and rejects source or output paths containing a backslash,
+single quote, newline, or carriage return (the pinned upstream pipeline cannot
+represent them safely). Source, output, and run/report paths must not overlap
+or nest, including through resolved symlink aliases. litmoe then checks
+dependencies and available storage, prints the pinned revision, sizes, and
+paths, and asks for confirmation before writing. It then
+installs WARP runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9`,
+runs the upstream fetch dry-run and conversion pipeline, validates the
+resulting WARP v0 manifest and artifacts, and registers the absolute container
+path with `engine: warp` and `n_ctx: 0`. When `HF_TOKEN` is set, litmoe uses a
+private temporary curl config; the token is not printed or passed in a child
+process's arguments or environment. There are no prebuilt GLM or DeepSeek
+`.waste` release assets: litmoe orchestrates WARP's upstream conversion and
+does not implement a quantizer.
+
+| Catalog id | Pinned source revision | Source | Conversion workspace | Output |
+|---|---|---:|---:|---:|
+| `glm-5.3-flash-warp` | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` | 306 GiB | 120 GiB | 112 GB |
+| `deepseek-v4.1-flash-warp` | `dba1be0a40aa45a94ad051997016db3960a90277` | 475 GiB | 310 GiB | 299 GiB |
+
+By default, output is `<models-dir>/<model-id>.waste` and source staging is
+`<models-dir>/.staging/<model-id>`. Put `--models-dir` on fast internal NVMe;
+`--staging-dir` may point to another filesystem. On failure, partial source,
+output, and `<models-dir>/<model-id>.warp-run` reports remain in place; rerun
+the same command to resume. If the reclaim ledgers prove that all source
+shards were completed, the resumed install skips the upstream fetch dry-run
+and continues the pipeline. `--reclaim-source` deletes completed source shards
+as the pipeline progresses. That saves peak storage, but it is irreversible
+and a retry may have to download shards that were not proven complete.
+
+After installation, serve the installed entry directly:
+
+```bash
+litmoe serve glm-5.3-flash-warp
+# or: litmoe serve deepseek-v4.1-flash-warp
+```
+
+**Runtime-only/manual alternative:** `litmoe install --engine warp` installs
+only the same pinned runtime. Add an existing local `.waste` container to
+`models.yaml` yourself; manually created or acquired containers remain
+supported.
 
 Upstream WARP reports the following measurements. They are not litmoe
 benchmarks or performance guarantees:
@@ -90,12 +147,10 @@ benchmarks or performance guarantees:
 | Container | Upstream container size | Upstream resident floor | Upstream throughput |
 |---|---:|---:|---:|
 | GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s (short) and 3.86 tok/s (long) on WARP's 64 GB M5 Pro |
-| DeepSeek-V4.1-Flash | 299 GB | 4.86 GB | about 3.7 tok/s |
+| DeepSeek-V4.1-Flash | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
 Those published throughput figures assume fast internal NVMe. This
-repository's current persistent disk is not equivalent. Creating the GLM
-container also needs 306 GiB for source-weight staging plus 112 GB for the
-output container.
+repository's current persistent disk is not equivalent.
 
 ---
 
@@ -114,9 +169,11 @@ litmoe serve
 curl http://127.0.0.1:8080/v1/models
 ```
 
-To serve an existing WARP container instead, install only the runtime with
-`litmoe install --engine warp`, add a local `.waste` entry to `models.yaml`,
-then run `litmoe serve`. The engine installer never downloads a WARP model.
+To install a catalog WARP model, run `litmoe install --model
+glm-5.3-flash-warp` or `litmoe install --model
+deepseek-v4.1-flash-warp`, then `litmoe serve <id>`. To serve a container you
+already have, install only the runtime with `litmoe install --engine warp`,
+add the local `.waste` path to `models.yaml`, and run `litmoe serve`.
 
 Or skip the pre-download: `litmoe init` writes a `models.yaml` whose `model_path` entries are HuggingFace specs (`owner/repo:QUANT`); llama-server fetches them on first start.
 
@@ -161,7 +218,7 @@ models:
     n_ctx: 262144
     extra_args: ["--tool-call-parser", "glm47", "--reasoning-parser", "glm45"]
 
-  # WARP serves an existing local .waste container; it never fetches this path.
+  # Manual WARP path. Catalog installs write an absolute generated .waste path instead.
   - id: glm-5.3-flash-warp
     engine: warp
     model_path: ~/models/glm53.waste
@@ -269,9 +326,9 @@ Services: **litmoe-gateway** on port **8000** (`http://127.0.0.1:8000/v1`, loopb
 
 ## What litmoe does NOT do
 
-- No inference code, weights, kernels, or quantization — llama.cpp, ktransformers, or WARP does all compute locally; no remote inference API is involved.
+- No inference code, bundled weights, kernels, or quantizer — llama.cpp, ktransformers, and WARP own those implementations; no remote inference API is involved.
 - No multi-node distribution. Single node.
-- No model conversion. Use `llama-quantize`, Unsloth, or upstream WARP tooling. WARP containers are not in the litmoe catalog and cannot be downloaded with `litmoe install --model`.
+- No litmoe model-conversion implementation. Catalog WARP installs orchestrate pinned upstream WARP tooling and validate its WARP v0 output; other conversions use `llama-quantize`, Unsloth, or the relevant upstream tooling.
 - No fine-tuning. For LoRA on MoE experts see the ktransformers × LlamaFactory cookbook upstream.
 
 ---

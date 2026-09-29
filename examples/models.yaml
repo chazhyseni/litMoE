@@ -52,10 +52,15 @@ models:
   #   n_gpu_layers: -1
   #   n_ctx: 262144
 
-  # ── WARP local containers (not in the litmoe model catalog) ─────────────────
-  # Install the runtime with `litmoe install --engine warp`, then create or
-  # acquire these .waste containers with upstream WARP tooling. The published
-  # throughput requires internal NVMe; network/persistent disks are not equal.
+  # ── WARP catalog conversion or manual local containers ────────────────────
+  # `litmoe install --model glm-5.3-flash-warp`
+  # `litmoe install --model deepseek-v4.1-flash-warp`
+  # writes a validated generated container as an absolute path with n_ctx: 0.
+  # Use `--staging-dir /bulk/staging --models-dir /internal/nvme/models` to
+  # separate source staging from output; `--warp-jobs N` changes concurrency.
+  # `--reclaim-source` saves space by irreversibly deleting completed source
+  # shards. `litmoe install --engine warp` plus either manual entry below
+  # remains supported. Published throughput requires fast internal NVMe.
   #
   # GLM-5.3-Flash — upstream: 112 GB container, 5.14 GB resident floor,
   # 3.32 tok/s short / 3.86 tok/s long on a 64 GB M5 Pro.
@@ -65,7 +70,7 @@ models:
   #   n_ctx: 0                    # preserve container default; WARP sizes its memory budget
   #   extra_args: ["--no-thinking"]
   #
-  # DeepSeek-V4.1-Flash — upstream: 299 GB container, 4.86 GB resident floor,
+  # DeepSeek-V4.1-Flash — upstream: 299 GiB container, 4.86 GB resident floor,
   # about 3.7 tok/s.
   # - id: deepseek-v4.1-flash-warp
   #   engine: warp

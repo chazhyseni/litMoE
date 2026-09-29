@@ -132,7 +132,7 @@
 
   <rect x="950" y="570" width="380" height="160" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="1140" y="595" text-anchor="middle" class="box-title">Local storage-paged runtime</text>
-  <text x="970" y="615" class="box-text-mono">existing local .waste container</text>
+  <text x="970" y="615" class="box-text-mono">catalog-installed or manual .waste container</text>
   <text x="970" y="635" class="box-text">binds 127.0.0.1 on the assigned port</text>
   <text x="970" y="655" class="box-text">memory-mapped expert weights</text>
   <text x="970" y="675" class="box-text">paging from fast local storage</text>
@@ -140,14 +140,14 @@
   <text x="970" y="715" class="box-text">WARP owns the forward pass and storage policy</text>
 
   <rect x="950" y="745" width="380" height="185" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="1140" y="770" text-anchor="middle" class="box-title">Pinned source install</text>
-  <text x="970" y="792" class="box-text-mono">litmoe install --engine warp</text>
-  <text x="970" y="812" class="box-text">clones an exact upstream source revision</text>
-  <text x="970" y="832" class="box-text">builds with make · verifies with make check</text>
-  <text x="970" y="852" class="box-text">installs source + server + shared library</text>
-  <text x="970" y="872" class="box-text-mono">libwaste.so · libwaste.dylib · libwaste.dll</text>
-  <text x="970" y="892" class="box-text">No automatic model download or conversion</text>
-  <text x="970" y="912" class="box-text">Create or acquire containers with upstream tools</text>
+  <text x="1140" y="770" text-anchor="middle" class="box-title">Pinned WARP installs</text>
+  <text x="970" y="792" class="box-text-mono">litmoe install --model glm-5.3-flash-warp</text>
+  <text x="970" y="812" class="box-text">pins runtime + model source revisions</text>
+  <text x="970" y="832" class="box-text">runs upstream fetch dry-run + pipeline</text>
+  <text x="970" y="852" class="box-text">validates WARP v0 artifacts, then registers</text>
+  <text x="970" y="872" class="box-text-mono">manual: litmoe install --engine warp</text>
+  <text x="970" y="892" class="box-text">absolute output path · engine: warp · n_ctx: 0</text>
+  <text x="970" y="912" class="box-text">WARP owns conversion and inference code</text>
 
   <!-- Bottom: models.yaml and CLI -->
   <line x1="700" y1="950" x2="700" y2="980" class="arrow"/>
@@ -163,7 +163,7 @@
     <text x="110" y="1117">models:</text>
     <text x="130" y="1138">- id: glm-5.3-flash-warp</text>
     <text x="160" y="1159">engine: warp</text>
-    <text x="160" y="1180">model_path: ~/models/glm53.waste</text>
+    <text x="160" y="1180">model_path: /home/me/.litmoe/models/glm-5.3-flash-warp.waste</text>
     <text x="160" y="1201">n_ctx: 0  # preserve container default</text>
     <text x="160" y="1222">extra_args: ["--no-thinking"]</text>
   </g>
@@ -176,15 +176,15 @@
     <text x="750" y="1075">litmoe doctor              # hardware + all engines</text>
     <text x="750" y="1096">litmoe init                # config + catalog default</text>
     <text x="750" y="1117">litmoe install --engine warp  # pinned runtime only</text>
-    <text x="750" y="1138">litmoe install --model ID  # llama.cpp / ktransformers catalog</text>
+    <text x="750" y="1138">litmoe install --model ID  # all-engine catalog</text>
     <text x="750" y="1159">litmoe serve               # gateway + configured engines</text>
     <text x="750" y="1180">litmoe status              # poll /health</text>
     <text x="750" y="1201">litmoe stop                # stop litmoe-started engines</text>
-    <text x="750" y="1222">litmoe models              # catalog; WARP remains local-only</text>
+    <text x="750" y="1222">litmoe models              # includes two WARP recipes</text>
   </g>
 
   <!-- Legend -->
   <text x="80" y="1292" class="box-text" fill="#8b949e">Inference engines: ktransformers · llama.cpp · WARP  |  litmoe: routing, translation, configuration, and lifecycle; no forward-pass code.</text>
-  <text x="80" y="1314" class="box-text" fill="#8b949e">WARP: existing local .waste containers · pinned source runtime · no automatic model download or conversion.</text>
+  <text x="80" y="1314" class="box-text" fill="#8b949e">WARP: catalog installs orchestrate pinned upstream conversion; runtime-only installs and manual .waste paths remain supported.</text>
 
 </svg>

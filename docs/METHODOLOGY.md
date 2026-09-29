@@ -49,17 +49,31 @@ deployment shapes:
 
 litmoe is the front door: a Python package that:
 
-1. Reads a `models.yaml` config; ships a catalog (`litmoe/models.py`) tiered
-   by RAM so `litmoe init` picks something that is fast on *this* machine.
+1. Reads a `models.yaml` config; ships RAM-tiered download choices plus pinned
+   WARP conversion recipes, while `litmoe init` picks a fast default for this
+   machine.
 2. Starts the chosen engine as a subprocess (`llama-server`,
    `python -m sglang.launch_server`, or WARP's upstream `serve/__main__.py`),
    supervises it, and stops it cleanly.
 3. Exposes a single OpenAI + Anthropic-compatible API on 127.0.0.1:8080.
 4. Routes requests to the right engine by model name or alias.
-5. Connects agent harnesses (Claude Code, Hermes) **per process**, never by
+5. For the two catalog WARP models, resolves pinned source and runtime
+   revisions; rejects source or output paths containing a backslash, single
+   quote, newline, or carriage return; requires source, output, and run/report
+   paths not to overlap or nest, including through resolved symlink aliases;
+   preflights `git`, `make`, `bash`, `curl`, `uv`, and storage; invokes WARP's
+   upstream fetch/conversion scripts; validates the WARP v0 manifest and
+   artifacts; and writes the absolute container path to the config.
+6. Connects agent harnesses (Claude Code, Hermes) **per process**, never by
    rewriting their global configuration.
 
-That's it. No custom forward pass. No CUDA kernels. No safetensors or `.waste` parsing.
+That's it. No custom forward pass, CUDA kernels, or quantizer. The WARP install
+path orchestrates upstream tooling; WARP owns conversion and inference.
+
+For authenticated source fetches, litmoe puts `HF_TOKEN` in a private temporary
+curl config rather than child arguments or environment. A reclaimed resume
+whose ledgers prove all source shards complete skips the fetch dry-run and
+continues the upstream pipeline.
 
 ## Why a dispatcher is the right shape
 
@@ -80,8 +94,10 @@ they care which model responds, and that it is fast enough on the hardware
 they have. The dispatcher lets one `models.yaml` mix engines:
 gemma-4-26b-a4b → llama.cpp on a laptop, glm-5.3-flash → sglang-kt on a GPU
 server, or glm-5.3-flash-warp → a local `.waste` container. The downloadable
-catalog encodes what fits where so the default is never a 594 GB download on a
-96 GB machine; WARP containers remain explicitly outside that catalog.
+entries encode what fits where so the default is never a 594 GB download on a
+96 GB machine. The two WARP entries instead expose pinned conversion recipes
+with explicit source, workspace, and output sizes; manually configured
+`.waste` paths remain valid.
 
 **Defaults must be fast, not just fit.** A 9B dense model and a 26B MoE with
 4B active both ran at 8–13 t/s on an AVX2 DDR4 box — same speed class, but
@@ -116,15 +132,16 @@ sequential read). Raw logs: [`docs/measurements/`](measurements/README.md).
 WARP upstream reports the figures below. They were not measured by litmoe and
 are not litmoe performance guarantees:
 
-| Container | Upstream container size | Upstream resident floor | Upstream throughput |
-|---|---:|---:|---:|
-| GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
-| DeepSeek-V4.1-Flash | 299 GB | 4.86 GB | about 3.7 tok/s |
+| Catalog id | Pinned source revision | Source | Conversion workspace | Output | Upstream resident floor | Upstream throughput |
+|---|---|---:|---:|---:|---:|---:|
+| `glm-5.3-flash-warp` | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` | 306 GiB | 120 GiB | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
+| `deepseek-v4.1-flash-warp` | `dba1be0a40aa45a94ad051997016db3960a90277` | 475 GiB | 310 GiB | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
 WARP's published throughput assumes internal NVMe. This repository's current
-persistent disk is not equivalent. Building the GLM container with upstream
-tooling needs 306 GiB for source-weight staging plus a 112 GB output. litmoe
-installs and supervises WARP but does not download or convert its containers.
+persistent disk is not equivalent. There are no prebuilt `.waste` release
+assets for these models. litmoe installs WARP runtime commit
+`09fcff352ca55223b08ee222d15054b90546c6a9` and orchestrates the pinned upstream
+pipeline; it does not supply a quantizer.
 
 The C engine was ~45x slower than llama.cpp on the same Kimi-K3 weights
 (0.019 vs the 0.85 t/s llama.cpp reached in Aug 2026, recorded in commit
@@ -141,9 +158,11 @@ interactive inference on this VM.
   Qwen3.8-Flash-Next at Q4.
 - **Server with a CUDA GPU and 512 GB+:** sglang-kt with CPU expert offload
   for GLM-5.3-Flash, Kimi-K2.x, DeepSeek-V3.2, MiniMax-M3.
-- **Fast-internal-NVMe host with an existing `.waste` container:** WARP can
-  trade storage capacity for a low resident floor. Use upstream container
-  creation tooling and treat upstream throughput as hardware-specific.
+- **Fast-internal-NVMe host:** WARP can trade storage capacity for a low
+  resident floor. Install a catalog container with `litmoe install --model
+  glm-5.3-flash-warp` (or `deepseek-v4.1-flash-warp`), or configure an existing
+  local `.waste` container manually. Treat upstream throughput as
+  hardware-specific.
 - **Server, CPU only, 768 GB+:** llama.cpp with Kimi-K3 / Qwen3.8-2.4T at
   IQ1 — batch use, not chat, unless the CPU has many memory channels.
 
@@ -157,10 +176,11 @@ single-digit-millisecond range and never touches the forward pass.
   no forward-pass code. The actual inference is done by local subprocesses.
 - It does not call a remote inference API.
 - It does not optimize for specific hardware. That's the engines' job.
-- It does not quantize or convert models. That's `kt quant`,
-  `llama-quantize`, upstream WARP tooling, or third-party tooling (Unsloth,
-  MLX, etc.). WARP containers are not downloadable through
-  `litmoe install --model`.
+- It does not implement quantization or conversion. For catalog WARP models it
+  pins the source, invokes WARP's upstream conversion pipeline, validates its
+  WARP v0 output, and registers the path. WARP remains the quantizer; other
+  conversions use `kt quant`, `llama-quantize`, or third-party tooling such as
+  Unsloth and MLX.
 - It does not parallelize across machines. Single-node only.
 
 ## What's in this repo
@@ -169,7 +189,7 @@ single-digit-millisecond range and never touches the forward pass.
 litmoe/
 ├── pyproject.toml          # modern Python package
 ├── litmoe/
-│   ├── models.py           # model catalog by RAM tier (HF-verified sizes, ctx, KV)
+│   ├── models.py           # model catalog, including pinned WARP conversion recipes
 │   ├── config.py           # Pydantic models.yaml schema
 │   ├── server.py           # FastAPI OpenAI/Anthropic gateway + engine supervision
 │   ├── platform_utils.py   # RAM, physical cores, macOS quirks
@@ -180,7 +200,7 @@ litmoe/
 │   │   └── warp.py           # upstream WARP server adapter for local .waste containers
 │   └── cli/
 │       ├── main.py           # litmoe doctor|init|models|install|serve|status|stop
-│       └── install.py        # engine installers + catalog model downloader
+│       └── install.py        # engine installs, model downloads, upstream WARP orchestration/validation
 ├── scripts/
 │   ├── claude-local        # Claude Code → gateway, per-process env only
 │   └── hermes-local        # Hermes Agent → gateway, per-process env only
