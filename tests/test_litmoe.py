@@ -3514,3 +3514,65 @@ def test_failed_stop_retains_ownership_without_reopening_admission(monkeypatch, 
         await gateway.shutdown()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["ready", "failed", "shutdown"])
+def test_http_startup_does_not_wait_for_model_readiness(monkeypatch, outcome):
+    import httpx
+
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_start = gateway.runtime.start_engine
+
+        async def held_readiness(timeout):
+            entered.set()
+            await release.wait()
+            return outcome == "ready"
+
+        def start(model):
+            engine = original_start(model)
+            engine.wait_ready = held_readiness
+            return engine
+
+        gateway.runtime.start_engine = start
+        lifespan = gateway.app.router.lifespan_context(gateway.app)
+        startup = asyncio.create_task(lifespan.__aenter__())
+        closed = False
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            # ASGI startup must finish while native readiness remains blocked.
+            await asyncio.wait_for(asyncio.shield(startup), 0.5)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=gateway.app), base_url="http://gateway",
+            ) as client:
+                health = await client.get("/health")
+                assert health.status_code == 200
+                assert health.json()["runtime"]["state"] == "loading"
+                assert (await client.get("/v1/models")).json()["data"] == []
+                response = await client.post("/v1/chat/completions", json={
+                    "model": "one", "messages": [{"role": "user", "content": "hi"}],
+                })
+                assert response.status_code == 503
+                if outcome == "shutdown":
+                    await asyncio.wait_for(lifespan.__aexit__(None, None, None), 2)
+                    closed = True
+                    assert not live
+                    assert gateway.runtime.engine is None
+                    assert events == [("start", "one"), ("stop", "one")]
+                else:
+                    release.set()
+                    await _eventually(lambda: gateway.runtime.state == outcome)
+                    discovered = (await client.get("/v1/models")).json()["data"]
+                    assert {model["id"] for model in discovered} == (
+                        {"one", "alias-one"} if outcome == "ready" else set()
+                    )
+                    assert live == ({"one"} if outcome == "ready" else set())
+        finally:
+            release.set()
+            await startup
+            if not closed:
+                await lifespan.__aexit__(None, None, None)
+        assert not live
+
+    asyncio.run(scenario())

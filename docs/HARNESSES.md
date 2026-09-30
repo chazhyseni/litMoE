@@ -37,6 +37,12 @@ effective context, and cache/cancellation capabilities. `/v1/models` lists only
 the ready model and its aliases. The runtime endpoints use the same `api_key`
 authentication as inference; keep unauthenticated gateways on loopback.
 
+The HTTP listener starts **before** model loading finishes. During startup,
+`/health` and `/v1/runtime` remain available with state `loading`, model
+discovery is empty, and inference returns HTTP 503 until the engine is ready.
+Use `litmoe status` to distinguish loading or failure from an unreachable
+gateway; an open HTTP port does not itself mean inference is ready.
+
 One inference lease lasts through the whole stream. The default queue permits
 eight waiting admissions for up to 30 seconds; overflow or expiry returns 429.
 Disconnecting a queued client removes its wait without dispatching inference.

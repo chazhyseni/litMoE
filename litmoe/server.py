@@ -228,17 +228,28 @@ class Gateway:
             timeout = 3600 if any(is_hf_repo_spec(m.model_path or "") for m in config.models) else 600
         self.runtime = Runtime(config, self._start_engine, initial_model, timeout)
 
+        async def initial_load():
+            try:
+                await self.load_engines()
+            except HTTPException:
+                logger.exception("Initial model failed; use litmoe status/switch to recover")
+
         @asynccontextmanager
         async def lifespan(app):
+            # Uvicorn binds its listener only after lifespan yields. Loading
+            # weights here would otherwise hide health/status for minutes.
+            startup = asyncio.create_task(initial_load())
             try:
-                if self.runtime.selected:
-                    try:
-                        await self.load_engines()
-                    except HTTPException:
-                        logger.exception("Initial model failed; use litmoe status/switch to recover")
                 yield
             finally:
-                await self.shutdown()
+                self.runtime.closing = True
+                startup.cancel()
+                try:
+                    await startup
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    await self.shutdown()
 
         self.app = FastAPI(title="litmoe gateway", lifespan=lifespan)
         self._setup_routes()
