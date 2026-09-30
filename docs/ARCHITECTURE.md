@@ -1,85 +1,64 @@
 # Architecture
 
 The gateway combines OpenAI/Anthropic protocol handling with a single-resident
-runtime. The three backend boxes below are alternatives, not concurrent loads.
+runtime. The four backends below are alternatives, not concurrent loads.
 
+## Responsibility boundary
+
+litmoe owns the serving workflow: configuration, installation orchestration,
+admission, explicit model selection, owned-process lifecycle, API adaptation,
+isolated client launchers, and end-to-end measurements. The selected engine
+owns tensor computation, hardware kernels, expert storage/streaming, sampling,
+and the actual model-state cache. The connected agent owns planning and tool
+execution.
+
+[DwarfStar (`antirez/ds4`)](https://github.com/antirez/ds4), by antirez and its
+contributors, supplies the GLM Metal/SSD-streaming engine. Its inference and
+state-management features belong to that project, including its acknowledged
+llama.cpp/GGML foundations. litmoe's adapter and native serving patch connect
+those features to the managed gateway.
+
+See the [upstream acknowledgements](../README.md#upstream-acknowledgements)
+and [license boundaries](../THIRD_PARTY_NOTICES.md).
+
+## Serving topology
+
+```text
+Claude Code / Hermes / OMP / OpenAI and Anthropic clients
+                         |
+                         v
+litmoe gateway: authentication, explicit model selection, bounded admission
+  Messages: native DwarfStar JSON/SSE; translated OpenAI on legacy backends
+  Count tokens: native rendered count; marked estimate on legacy backends
+  Lifecycle: one owned process, one inference lease, drain/stop/start
+                         |
+             one selected adapter
+              +----------+----------------+--------------+
+              |          |                |              |
+          DwarfStar   llama.cpp      ktransformers      WARP
+          ds4-server  llama-server    SGLang/kt-kernel   WARP HTTP
+          Metal/SSD  CPU/GPU GGUF     GPU/CPU experts   .waste paging
+
+models.yaml: selected engine, local artifact, context, aliases, engine options
+litmoe/models.py: download catalog and pinned native installation recipes
 ```
-   ┌────────────────────────────────────────────────────────────────────────────────┐
-   │   CLIENTS                                                                      │
-   │   Claude Code (scripts/claude-local) · Hermes Agent (scripts/hermes-local)     │
-   │   OMP (scripts/omp-local) · Open WebUI · aider · curl · SDK clients             │
-   └─────────────────────────────────┬──────────────────────────────────────────────┘
-                                     │ HTTP, 127.0.0.1:8090
-                                     │ POST /v1/chat/completions   (OpenAI)
-                                     │ POST /v1/completions        (OpenAI)
-                                     │ POST /v1/messages           (Anthropic)
-                                     │ POST /v1/messages/count_tokens
-                                     │ GET  /v1/models · GET /health
-                                     ▼
-   ┌────────────────────────────────────────────────────────────────────────────────┐
-   │                              LITMOE GATEWAY  (litmoe/server.py)                │
-   │                                                                                │
-   │   REQUEST ROUTER                                                               │
-   │   - read `model` from the body; resolve aliases (claude-* → local id)          │
-   │   - unknown model → 404; known inactive model → 409; no implicit switching     │
-   │   - /v1/messages: Anthropic Messages → OpenAI chat (tools, images, thinking,   │
-   │     streaming SSE re-framed as Anthropic events)                               │
-   │   - stream: raw byte pass-through; non-stream: JSON relay                      │
-   │                                                                                │
-   │   ENGINE SUPERVISOR                                                            │
-   │   - one resident subprocess, own session/pgid, PID file in ~/.litmoe/run        │
-   │   - one inference lease, bounded queue, explicit drain/stop/start switching    │
-   │   - llama.cpp and WARP context fitted using their own memory models            │
-   │   - ASGI lifespan drains and stops the owned engine on graceful shutdown      │
-   └───────────────┬──────────────────────┬───────────────────────┬────────────────┘
-                   │ alternative          │ alternative           │ alternative
-                   ▼                      ▼                       ▼
-   ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
-   │ LLAMA.CPP ENGINE       │  │ KTRANSFORMERS ENGINE   │  │ WARP ENGINE            │
-   │ engines/llamacpp.py    │  │ ktransformers.py       │  │ engines/warp.py        │
-   │                        │  │                        │  │                        │
-   │ spawns llama-server    │  │ spawns python -m       │  │ spawns upstream        │
-   │ -m <gguf> or           │  │ sglang.launch_server   │  │ serve/__main__.py      │
-   │ -hf repo:QUANT         │  │ --kt-method …          │  │ <local .waste>         │
-   │                        │  │                        │  │                        │
-   │ CUDA / HIP / Metal /   │  │ CUDA attention; CPU   │  │ mmap + local storage   │
-   │ Vulkan / SYCL / CPU    │  │ experts via AMX /     │  │ paging; container      │
-   │ GGUF 1–8 bit           │  │ AVX-512 / AVX2        │  │ owns its defaults      │
-   └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
-                   │                      │                       │
-                   └──────────────────────┴───────────┬───────────┘
-                                                      ▼
-                                  ┌──────────────────────────────────────┐
-                                  │ models.yaml  (pydantic: config.py)  │
-                                  │ host / port / api_key               │
-                                  │ models:                             │
-                                  │   - id, engine, model_path          │
-                                  │     n_ctx, n_gpu_layers, extra_args │
-                                  │     env, aliases, kt_* fields       │
-                                  └──────────────────────────────────────┘
-                                                      ▲
-                                  ┌───────────────────┴──────────────────┐
-                                  │ litmoe/models.py — install catalog   │
-                                  │ downloads + pinned WARP recipes      │
-                                  │ → `models`, `install`, `init`        │
-                                  │ manual local paths supported         │
-                                  │                                      │
-                                  └──────────────────────────────────────┘
 
 ## Data flow
 
 1. Client sends `POST /v1/chat/completions` (or `/v1/messages`) with
    `model: gemma-4-26b-a4b` — or an alias such as `claude-sonnet-4-5`.
-2. Gateway resolves the id to an engine and forwards the body to that engine's
-   loopback port. For `/v1/messages` it first translates Anthropic → OpenAI.
+2. Gateway resolves the id to an engine and forwards the body to its loopback
+   port. DwarfStar owns the native Anthropic representation; other backends
+   use Anthropic-to-OpenAI translation.
 3. The selected local engine runs the forward pass (CPU, GPU, CPU experts +
    GPU attention, or WARP over a local `.waste` container).
 4. Gateway relays the response; streaming responses are passed through byte
    for byte (OpenAI) or re-framed as Anthropic SSE events.
 
-The gateway never touches the forward pass; it adds a few milliseconds and no
-compute. WARP's upstream server is a local subprocess, not a remote inference
-API.
+The gateway performs request validation, protocol translation, and proxying;
+the selected engine executes inference. Measure gateway overhead separately
+instead of assuming a fixed millisecond cost. WARP's upstream server is a
+local subprocess, not a remote inference API.
 
 ## WARP catalog installation
 
@@ -154,8 +133,45 @@ WASTE_CACHE_MB=36000 WASTE_PROFILE=1 WASTE_CHUNK=1 \
 
 Do not run timing comparisons alongside compilation or another model process.
 
+### Full-harness constraints and replacement evaluation
+
+The native patch does not implement batched GLM prefill. WARP's model code
+explicitly uses token-at-a-time evaluation when mHC or the DSA indexer is
+present, because its chunked path lacks their state bookkeeping. Its HTTP
+server resets state for every request; native save/load primitives are not
+used for cross-request prefix reuse.
+
+A fresh actual Claude launcher request contained 376 tool schemas and
+84,442 native tokens. A discovery-enabled capture contained 15,482 tokens,
+but the current translator drops typed tool references; the smaller capture
+is not proof that deferred tool execution works. Tokenization took about
+27 ms for the eager request, distinguishing prompt construction from model
+prefill as a bottleneck.
+
+DwarfStar is integrated through `engines/dwarfstar.py` and a pinned native
+serving patch. It bypasses that translator, resolves typed tool references,
+and uses native prefix state. Real-model and client-loop verification remains
+separate from implementation and compilation. See the [redesign record](plans/2026-09-30-inference-redesign.md).
+
 
 ## Engine lifecycle
+
+- DwarfStar startup requires matching source and patch markers, binds only
+  loopback, and uses one native session. The configured context is neither
+  fitted by llama.cpp's planner nor silently reduced.
+- Its private disk-cache namespace includes model-file identity, source
+  revision, and patch digest. Native strict-quant checks remain enabled.
+- `/v1/litmoe/status` samples native scheduling state without the inference
+  mutex. Counts include accepted clients still parsing/awaiting work and
+  workers finishing checkpoint housekeeping, so closed HTTP sockets do not
+  falsely acknowledge quiescence.
+- Both normal EOF and aborted requests close the upstream connection and
+  await native idle before releasing admission. The 10-second deadline or a
+  malformed/failed status response triggers an owned-process stop. Confirmed
+  cancellation preserves the resident process; switching always unloads it.
+- Native `/v1/messages/count_tokens` uses the same renderer and tokenizer as
+  inference, without generation. Legacy estimates carry
+  `x-litmoe-token-count: estimated`.
 
 - `litmoe serve` applies memory-aware context sizing to llama.cpp models.
   WARP's adapter invokes the installed `serve.engine.plan_memory` in an isolated
@@ -179,8 +195,12 @@ Do not run timing comparisons alongside compilation or another model process.
 - Cancelling an accepted WARP chat stream closes its upstream socket; the
   pinned server stops generation from its token callback and retains the
   resident engine/expert cache. Cancellation is not an immediate prefill
-  interrupt. Other paths (including blocking WARP calls and raw completions)
-  stop the native process before releasing their lease; a later request reloads.
+  interrupt. Non-cooperative paths (including blocking WARP calls and raw
+  completions) stop the process before releasing their lease; a later request
+  reloads. DwarfStar instead uses the acknowledged-quiescence path above.
+  For accepted WARP streams, socket closure can release the gateway lease
+  while native prefill is still running. This is a known ownership limitation,
+  not a verified cooperative prefill-cancellation capability.
 - WARP startup warmup shares the inference lock. It touches some experts,
   not every expert a subsequent prompt will use, and does not guarantee latency.
 - Engine stdout/stderr append to `logs/<id>.log` with a per-start header.
@@ -214,7 +234,7 @@ under `~/.litmoe/` and `models.yaml`; engine installers also write to
 
 ```
 litmoe/
-├── models.py          catalog (downloads + pinned WARP recipes, sizes, ctx, KV)
+├── models.py          downloads + pinned WARP/DwarfStar recipes, sizes, context
 ├── config.py          models.yaml schema + validation
 ├── server.py          gateway and Anthropic↔OpenAI translation
 ├── runtime.py         single-resident ownership, admission, cancellation, switching
@@ -224,7 +244,9 @@ litmoe/
 │   ├── base.py        Engine ABC: start/stop/health, PID files, log headers
 │   ├── llamacpp.py    llama-server adapter (binary discovery, -hf, mmproj, threads)
 │   ├── ktransformers.py  sglang-kt adapter (kt-method, GPU experts, cpuinfer)
-│   └── warp.py        upstream WARP server adapter for local .waste containers
+│   ├── warp.py        upstream WARP server adapter for local .waste containers
+│   └── dwarfstar.py   pinned native APIs, disk-state identity, quiescence checks
+├── patches/           upstream WARP optimizations and DwarfStar serving contract
 └── cli/
     ├── main.py        doctor · init · models · serve · switch · status · stop
     ├── benchmark.py   bench CLI

@@ -59,20 +59,30 @@ def expand_model_paths(entry_dict: dict) -> dict:
 class ModelEntry(BaseModel):
     """A model exposed via the OpenAI API."""
     id: str  # OpenAI model id (e.g. "kimi-k3")
-    engine: Literal["ktransformers", "llamacpp", "warp"]
+    engine: Literal["ktransformers", "llamacpp", "warp", "dwarfstar"]
     # llamacpp: local GGUF path, HF repo spec (owner/repo[:quant]) or URL.
     # ktransformers: local safetensors directory or HF repo id (owner/repo).
     # warp: local .waste container.
+    # dwarfstar: local GGUF served by the pinned ds4-server runtime.
     model_path: str
     # ktransformers only: GGUF directory for the LLAMAFILE CPU backend (--kt-weight-path).
     gguf_path: str | None = None
     # llamacpp: -ngl. -1 = offload as many layers as fit ("auto"), 0 = CPU only.
     n_gpu_layers: int = -1
     # llama.cpp fits zero/small values at startup. WARP uses the policy below.
+    # DwarfStar: allocated context tokens passed to ds4-server --ctx.
     n_ctx: int = 65536
     # WARP only: True re-fits native context at each startup; False fixes n_ctx.
     # None migrates the legacy unmarked defaults (0 and 65536) to automatic.
     warp_auto_context: bool | None = None
+    # DwarfStar only: opt in to SSD streaming (model larger than RAM).
+    dwarfstar_ssd_streaming: bool = False
+    # DwarfStar only: explicit expert-cache budget for SSD streaming
+    # (e.g. "32GB" or a dynamic-slot count). None uses upstream auto sizing.
+    dwarfstar_cache_experts: str | None = None
+    # DwarfStar only: disk KV cache base; artifact/runtime namespaces go below it.
+    # None uses ~/.litmoe/dwarfstar-cache.
+    dwarfstar_kv_dir: str | None = None
     extra_args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     # Alternate model IDs that route to this model's engine

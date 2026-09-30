@@ -78,6 +78,22 @@ print(context)
 MODEL="${DETAILS%%$'\n'*}"
 CONTEXT="${DETAILS#*$'\n'}"
 
+# A custom Anthropic URL disables Claude discovery by default. Opt in only
+# after the resident engine reports typed tool-reference support.
+TOOL_SEARCH="$(curl -sf --max-time 5 -H "Authorization: Bearer $KEY" "$GATEWAY/v1/runtime" \
+  | python3 -c '
+import json, sys
+runtime = json.load(sys.stdin)
+if runtime.get("state") != "ready":
+    raise SystemExit("claude-local: resident engine is not ready")
+requested = sys.argv[1]
+active = runtime.get("active_model")
+configured = runtime.get("configured_models", [])
+if not any(m["id"] == active and requested in [m["id"], *m.get("aliases", [])] for m in configured):
+    raise SystemExit("claude-local: model changed during launch; retry after litmoe switch")
+print("true" if runtime.get("capabilities", {}).get("tool_search") is True else "false")
+' "$MODEL")"
+
 mkdir -p "$CONFIG_DIR"
 
 # `env -i`-style isolation is too aggressive (breaks PATH, locale, terminal);
@@ -96,5 +112,6 @@ exec env \
   CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
   CLAUDE_CONFIG_DIR="$CONFIG_DIR" \
   CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CONTEXT" \
+  ENABLE_TOOL_SEARCH="$TOOL_SEARCH" \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   claude --model "$MODEL" "$@"

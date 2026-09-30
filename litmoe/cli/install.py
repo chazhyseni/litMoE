@@ -31,9 +31,13 @@ import yaml
 from litmoe.cli import warp_models as _warp_models
 
 from litmoe.config import default_config_path, expand_path
+from litmoe.engines.dwarfstar import (
+    DWARFSTAR_COMMIT, DWARFSTAR_PATCH, DWARFSTAR_REPO, validate_installation,
+)
 from litmoe.models import (
     CLAUDE_ALIASES,
     DEFAULT_MODEL,
+    DWARFSTAR,
     GGUF,
     KNOWN_MODELS,
     SAFETENSORS,
@@ -423,6 +427,73 @@ def _installed_warp_root(prefix: Path) -> Path | None:
     if pinned.returncode != 0:
         return None
     return root if pinned.stdout.strip() == WARP_COMMIT else None
+
+
+def install_dwarfstar(prefix: Path) -> Path:
+    """Build and atomically publish the pinned, patched Apple Silicon runtime."""
+    if not is_macos() or platform.machine().lower() not in ("arm64", "aarch64"):
+        raise RuntimeError("The managed DwarfStar build currently requires Apple Silicon macOS.")
+    destination = prefix / "lib" / "dwarfstar"
+    try:
+        validate_installation(destination)
+        click.echo(f"  DwarfStar already installed: {destination}")
+        return destination
+    except FileNotFoundError:
+        pass
+    for tool in ("git", "make"):
+        if not shutil.which(tool):
+            raise RuntimeError(f"DwarfStar requires {tool} and Xcode Command Line Tools.")
+    if not Path("/usr/bin/clang").is_file():
+        raise RuntimeError("Install Xcode Command Line Tools: xcode-select --install")
+    if _warp_models._snapshot_live_processes((destination,)):
+        raise RuntimeError("Stop the running DwarfStar process before replacing its runtime.")
+    patch_digest = hashlib.sha256(DWARFSTAR_PATCH.read_bytes()).hexdigest()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.ExitStack() as cleanup:
+        stage = Path(tempfile.mkdtemp(prefix=".dwarfstar-install-", dir=destination.parent))
+        cleanup.callback(shutil.rmtree, stage, ignore_errors=True)
+        checkout = stage / "checkout"
+        for command, label in (
+            (["git", "clone", "--filter=blob:none", "--no-checkout", DWARFSTAR_REPO, str(checkout)],
+             "DwarfStar clone"),
+            (["git", "-C", str(checkout), "fetch", "--depth", "1", "origin", DWARFSTAR_COMMIT],
+             "DwarfStar pinned fetch"),
+            (["git", "-C", str(checkout), "checkout", "--detach", DWARFSTAR_COMMIT],
+             "DwarfStar pinned checkout"),
+            (["git", "-C", str(checkout), "apply", str(DWARFSTAR_PATCH)],
+             "DwarfStar serving patch"),
+        ):
+            _run_warp_command(command, cwd=None, label=label, timeout=600)
+        click.echo("  Building DwarfStar Metal runtime and protocol checks...")
+        _run_warp_command(
+            ["/usr/bin/env", "-u", "CFLAGS", "-u", "CPPFLAGS", "-u", "CXXFLAGS",
+             "-u", "LDFLAGS", "make", f"-j{min(os.cpu_count() or 1, 8)}",
+             "CC=/usr/bin/clang", "ds4", "ds4-server", "ds4-bench", "ds4_test"],
+            cwd=checkout, label="DwarfStar build", timeout=3600,
+        )
+        _run_warp_command(
+            [str(checkout / "ds4_test"), "--server"], cwd=checkout,
+            label="DwarfStar protocol checks", timeout=300,
+        )
+        (checkout / ".litmoe-revision").write_text(DWARFSTAR_COMMIT + "\n")
+        (checkout / ".litmoe-patch-sha256").write_text(patch_digest + "\n")
+        validate_installation(checkout)
+        backup = stage / "previous"
+        had_previous = destination.exists() or destination.is_symlink()
+        try:
+            if had_previous:
+                os.replace(destination, backup)
+            os.replace(checkout, destination)
+        except BaseException:
+            if backup.exists() or backup.is_symlink():
+                try:
+                    os.replace(backup, destination)
+                except BaseException as rollback:
+                    cleanup.pop_all()
+                    raise RuntimeError(f"DwarfStar rollback failed; recovery files: {stage}") from rollback
+            raise
+    click.echo(f"  DwarfStar installed: {destination}")
+    return destination
 
 
 def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
@@ -1065,6 +1136,21 @@ def download_model(model_name: str, quant: str | None, models_dir: Path,
     api, snapshot_download = _hf_api()
     repo = info["hf_repo"]
 
+    if info["format"] == DWARFSTAR:
+        if quant not in (None, info["default_quant"]):
+            raise click.BadParameter(f"{model_name} requires --quant {info['default_quant']}")
+        dest = models_dir / model_name
+        dest.mkdir(parents=True, exist_ok=True)
+        filename = info["model_file"]
+        click.echo(f"  Downloading pinned {repo}/{filename} -> {dest}")
+        snapshot_download(repo_id=repo, revision=info["hf_revision"],
+                          allow_patterns=[filename], local_dir=str(dest))
+        model_path = dest / filename
+        with model_path.open("rb") as model_file:
+            if model_file.read(4) != b"GGUF":
+                raise RuntimeError(f"Downloaded artifact is not GGUF: {model_path}")
+        return model_path, None
+
     if info["format"] == SAFETENSORS:
         dest = models_dir / model_name
         dest.mkdir(parents=True, exist_ok=True)
@@ -1126,7 +1212,8 @@ def download_model(model_name: str, quant: str | None, models_dir: Path,
 def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: int,
                         config_path: Path, extra_args: list[str] | None = None,
                         kt_method: str | None = None, aliases: list[str] | None = None,
-                        warp_auto_context: bool | None = None) -> None:
+                        warp_auto_context: bool | None = None,
+                        dwarfstar_ssd_streaming: bool | None = None) -> None:
     """Insert or replace a model entry in models.yaml (absolute paths)."""
     model_path = expand_path(model_path)
 
@@ -1145,6 +1232,8 @@ def add_model_to_config(model_name: str, engine: str, model_path: Path, n_ctx: i
         entry["n_gpu_layers"] = -1
     if engine == "warp" and warp_auto_context is not None:
         entry["warp_auto_context"] = warp_auto_context
+    if engine == "dwarfstar" and dwarfstar_ssd_streaming is not None:
+        entry["dwarfstar_ssd_streaming"] = dwarfstar_ssd_streaming
     if kt_method:
         entry["kt_method"] = kt_method
         entry["kt_num_gpu_experts"] = 0
@@ -1178,6 +1267,10 @@ def choose_quant(model_name: str, requested: str | None, budget_gb: float | None
     let the user decide. Non-GGUF models have no quant and return None.
     """
     info = lookup(model_name)
+    if info and info["format"] == DWARFSTAR:
+        if requested and requested != info["default_quant"]:
+            raise click.BadParameter(f"{model_name} requires --quant {info['default_quant']}")
+        return info["default_quant"]
     if not info or info["format"] != GGUF:
         return None
     if requested:
@@ -1228,12 +1321,12 @@ def print_model_table(ram_gb: float | None) -> None:
     tiers = sorted({
         info["tier"]
         for info in KNOWN_MODELS.values()
-        if info["format"] != WASTE
+        if info["format"] not in (WASTE, DWARFSTAR)
     })
     for tier in tiers:
         click.echo(f"== {TIER_LABELS[tier]} ==")
         for mid, info in KNOWN_MODELS.items():
-            if info["format"] == WASTE or info.get("tier") != tier:
+            if info["format"] in (WASTE, DWARFSTAR) or info.get("tier") != tier:
                 continue
             size = quant_size_gb(mid, None)
             default = info.get("default_quant", info.get("kt_method"))
@@ -1252,18 +1345,23 @@ def print_model_table(ram_gb: float | None) -> None:
 
     warp_models = [(mid, info) for mid, info in KNOWN_MODELS.items() if info["format"] == WASTE]
     if warp_models:
-        click.echo("== WARP conversion containers ==")
+        click.echo("== WARP (pinned source conversion) ==")
         for mid, info in warp_models:
+            click.echo(f"  {mid:32s} WARP  {quant_size_gb(mid, None):.0f} GB  {info['params']}")
+        click.echo()
+
+    dwarfstar_models = [(mid, info) for mid, info in KNOWN_MODELS.items()
+                        if info["format"] == DWARFSTAR]
+    if dwarfstar_models:
+        click.echo("== DwarfStar (pinned ds4-server runtime) ==")
+        for mid, info in dwarfstar_models:
             size = quant_size_gb(mid, None)
-            unit = (
-                "GiB"
-                if info["output_size_bytes"] == info["size_gb"] * 1024**3
-                else "GB"
-            )
             click.echo(
-                f"  {mid:32s} {'WARP (.waste)':20s} {info['warp_profile']:>12s} "
-                f"{size:5.0f} {unit}  {info['params']}"
+                f"  {mid:32s} {'DwarfStar (GGUF)':20s} {'pinned':>12s} "
+                f"{size:5.0f} GB  {info['params']}"
             )
+            click.echo(f"    revision {info['hf_revision'][:12]}, file {info['model_file']}"
+                       " (SSD streaming when larger than RAM)")
         click.echo()
     click.echo("Install: litmoe install --model <name> [--quant <quant>]")
 
@@ -1287,7 +1385,7 @@ def _positive_warp_jobs(
 @click.option("--model", "model_name", type=click.Choice(sorted(KNOWN_MODELS.keys())),
               default=None, help="Model to download (see `litmoe models`)")
 @click.option("--quant", default=None, help="Quantization (default: the model's default_quant if it fits this machine's RAM, else the largest that does)")
-@click.option("--engine", type=click.Choice(["llamacpp", "ktransformers", "warp", "both", "none"]),
+@click.option("--engine", type=click.Choice(["llamacpp", "ktransformers", "warp", "dwarfstar", "both", "none"]),
               default=None, help="Which engine(s) to install (default: the model's engine, else llamacpp)")
 @click.option("--llamacpp-variant", type=click.Choice(LLAMACPP_VARIANTS), default="auto",
               help="llama.cpp release binary variant (auto = cuda if an NVIDIA GPU is visible, else cpu)")
@@ -1359,7 +1457,7 @@ def install_cmd(
     )
     positional_engine = False
     for target in targets:
-        if target in ("llamacpp", "ktransformers", "warp", "both"):
+        if target in ("llamacpp", "ktransformers", "warp", "dwarfstar", "both"):
             if engine is None:
                 engine = target
             positional_engine = True
@@ -1370,6 +1468,15 @@ def install_cmd(
 
     info = lookup(model_name) if model_name else None
     is_warp_model = bool(info and info["format"] == WASTE)
+    is_dwarfstar_model = bool(info and info["format"] == DWARFSTAR)
+    if is_dwarfstar_model:
+        if n_ctx is not None and not 0 < n_ctx <= 2**31 - 1:
+            raise click.BadParameter("must be between 1 and 2147483647", param_hint="--n-ctx")
+        if engine not in (None, "dwarfstar", "none"):
+            raise click.BadParameter("this model requires the dwarfstar engine", param_hint="--engine")
+        if llamacpp_variant_from_option or llamacpp_tag_from_option or no_mmproj:
+            raise click.BadParameter("llama.cpp/projector options do not apply to DwarfStar")
+        choose_quant(model_name, quant, None)
     if is_warp_model:
         if n_ctx is not None and not 0 <= n_ctx <= 2**31 - 1:
             raise click.BadParameter("must be between 0 and 2147483647", param_hint="--n-ctx")
@@ -1484,6 +1591,13 @@ def install_cmd(
             click.echo(f"  WARP install failed: {e}", err=True)
             sys.exit(1)
 
+    if engine == "dwarfstar":
+        click.echo("Installing DwarfStar (antirez/ds4)...")
+        try:
+            install_dwarfstar(prefix)
+        except Exception as exc:
+            raise click.ClickException(f"DwarfStar install failed: {exc}") from exc
+
     # 2. Model installation
     if not model_name:
         total = get_total_memory_bytes()
@@ -1553,7 +1667,12 @@ def install_cmd(
             models_dir,
             with_mmproj=not no_mmproj,
         )
-        if info["format"] == GGUF:
+        if info["format"] == DWARFSTAR:
+            add_model_to_config(
+                model_name, engine_for_model, path, n_ctx or info["native_ctx"],
+                config_path, dwarfstar_ssd_streaming=True,
+            )
+        elif info["format"] == GGUF:
             weights_gb = None
             try:
                 pattern = re.sub(r"-\d{5}-of-(\d{5})\.gguf$", r"-*-of-\1.gguf", path.name)

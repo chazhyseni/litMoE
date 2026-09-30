@@ -10,7 +10,7 @@
   <rect width="1200" height="400" fill="#0d1117"/>
 
   <text x="600" y="40" text-anchor="middle" class="title">litmoe: engine dispatcher for local LLM inference</text>
-  <text x="600" y="65" text-anchor="middle" class="sub">OpenAI + Anthropic gateway · three local inference engines · no inference code</text>
+  <text x="600" y="65" text-anchor="middle" class="sub">OpenAI + Anthropic gateway · four local inference engines · upstream-owned inference</text>
 
   <!-- Clients -->
   <rect x="20" y="100" width="1160" height="50" rx="8" fill="#0d2818" stroke="#2ea043"/>
@@ -18,7 +18,7 @@
   <text x="40" y="142" class="body">Hermes · Claude Code · OMP · Open WebUI · aider · curl · Python OpenAI/Anthropic SDK</text>
 
   <!-- Gateway -->
-  <rect x="20" y="165" width="330" height="125" rx="8" fill="#1c1917" stroke="#d29922"/>
+  <rect x="20" y="165" width="280" height="125" rx="8" fill="#1c1917" stroke="#d29922"/>
   <text x="40" y="190" class="section">litmoe Gateway</text>
   <text x="40" y="212" class="mono">FastAPI · OpenAI + Anthropic APIs</text>
   <text x="40" y="232" class="mono">one ready model + aliases</text>
@@ -26,32 +26,40 @@
   <text x="40" y="272" class="body">ONE resident backend from the choices →</text>
 
   <!-- Engine 1: ktransformers -->
-  <rect x="370" y="165" width="250" height="125" rx="8" fill="#1a0d1d" stroke="#a371f7"/>
-  <text x="390" y="190" class="section">ktransformers</text>
-  <text x="390" y="212" class="mono">sglang.launch_server</text>
-  <text x="390" y="232" class="body">gateway-assigned loopback port</text>
-  <text x="390" y="252" class="body">CUDA · AMX · AVX-512 · AVX2</text>
-  <text x="390" y="272" class="body">heterogeneous CPU+GPU MoE</text>
+  <rect x="320" y="165" width="205" height="125" rx="8" fill="#1a0d1d" stroke="#a371f7"/>
+  <text x="335" y="190" class="section">ktransformers</text>
+  <text x="335" y="212" class="mono">sglang.launch_server</text>
+  <text x="335" y="232" class="body">private loopback port</text>
+  <text x="335" y="252" class="body">CUDA · AMX · AVX-512</text>
+  <text x="335" y="272" class="body">CPU+GPU expert execution</text>
 
   <!-- Engine 2: llama.cpp -->
-  <rect x="640" y="165" width="250" height="125" rx="8" fill="#1a0d12" stroke="#db61a2"/>
-  <text x="660" y="190" class="section">llama.cpp</text>
-  <text x="660" y="212" class="mono">llama-server</text>
-  <text x="660" y="232" class="body">gateway-assigned loopback port</text>
-  <text x="660" y="252" class="body">CUDA · HIP · Metal · Vulkan</text>
-  <text x="660" y="272" class="body">1.5–8-bit GGUF quants</text>
+  <rect x="545" y="165" width="205" height="125" rx="8" fill="#1a0d12" stroke="#db61a2"/>
+  <text x="560" y="190" class="section">llama.cpp</text>
+  <text x="560" y="212" class="mono">llama-server</text>
+  <text x="560" y="232" class="body">private loopback port</text>
+  <text x="560" y="252" class="body">CUDA · HIP · Metal · Vulkan</text>
+  <text x="560" y="272" class="body">GGUF quantized inference</text>
 
   <!-- Engine 3: WARP -->
-  <rect x="910" y="165" width="270" height="125" rx="8" fill="#0d1f24" stroke="#39c5cf"/>
-  <text x="930" y="190" class="section">WARP</text>
-  <text x="930" y="212" class="mono">upstream serve/__main__.py</text>
-  <text x="930" y="232" class="body">gateway-assigned loopback port</text>
-  <text x="930" y="252" class="body">catalog or manual .waste container</text>
-  <text x="930" y="272" class="body">upstream conversion · mmap · local paging</text>
+  <rect x="770" y="165" width="195" height="125" rx="8" fill="#0d1f24" stroke="#39c5cf"/>
+  <text x="785" y="190" class="section">WARP</text>
+  <text x="785" y="212" class="mono">serve/__main__.py</text>
+  <text x="785" y="232" class="body">private loopback port</text>
+  <text x="785" y="252" class="body">local .waste containers</text>
+  <text x="785" y="272" class="body">conversion · mmap · paging</text>
+
+  <!-- Engine 4: DwarfStar -->
+  <rect x="985" y="165" width="195" height="125" rx="8" fill="#0a1420" stroke="#58a6ff"/>
+  <text x="1000" y="190" class="section">DwarfStar</text>
+  <text x="1000" y="212" class="mono">ds4-server · antirez/ds4</text>
+  <text x="1000" y="232" class="body">native Anthropic + OpenAI</text>
+  <text x="1000" y="252" class="body">Metal · SSD expert streaming</text>
+  <text x="1000" y="272" class="body">GLM graph · prefix state</text>
 
   <!-- Output -->
   <rect x="20" y="310" width="1160" height="70" rx="8" fill="#161b22" stroke="#30363d"/>
   <text x="40" y="335" class="section">Inference happens in the engines, not in litmoe</text>
   <text x="40" y="355" class="body">litmoe owns: HTTP routing, config validation, CLI orchestration, manifest validation, supervision, and protocol translation.</text>
-  <text x="40" y="374" class="body">llama.cpp, ktransformers, and WARP own: forward passes, kernels, expert routing, caches, quantization/conversion, and paging.</text>
+  <text x="40" y="374" class="body">DwarfStar, llama.cpp, ktransformers, and WARP own: forward passes, kernels, expert routing, caches, quantization, and paging.</text>
 </svg>

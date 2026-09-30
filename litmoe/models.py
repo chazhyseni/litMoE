@@ -39,6 +39,7 @@ from types import MappingProxyType
 GGUF = "gguf"
 SAFETENSORS = "safetensors"
 WASTE = "waste"
+DWARFSTAR = "dwarfstar"
 
 # RAM tiers (GB). A model's tier is the smallest that fits default_quant + KV@32K + headroom.
 TIER_LAPTOP_48 = 48
@@ -120,7 +121,6 @@ def _w(
         "tier": tier,
         "notes": notes,
     })
-
 
 
 KNOWN_MODELS: dict[str, dict | MappingProxyType] = {
@@ -375,6 +375,27 @@ KNOWN_MODELS: dict[str, dict | MappingProxyType] = {
         notes="Pinned WARP conversion from the upstream DeepSeek-V4.1-Flash weights.",
         size_is_gib=True,
     ),
+    # ==================================================================
+    # DwarfStar — one pinned GGUF served by the pinned ds4-server runtime.
+    # ==================================================================
+    "glm-5.3-flash-dwarfstar": {
+        "hf_repo": "antirez/glm-5.3-flash-gguf",
+        "hf_revision": "b2fa29d7a6b410db11221c904973967b80b760f5",
+        "model_file": "GLM-5.3-Flash-Q4_K.gguf",
+        "engine": "dwarfstar",
+        "format": DWARFSTAR,
+        "arch": "glm5-next",
+        "params": "320B total, 18B active MoE",
+        "active_b": 18.0,
+        "quants": {"Q4_K": 191},
+        "default_quant": "Q4_K",
+        "native_ctx": 1_048_576,
+        "tier": TIER_LAPTOP_96,
+        "notes": "Pinned DwarfStar Q4_K GGUF with explicit SSD expert streaming. "
+                 "191 GB on disk is not a resident-RAM requirement. "
+                 "Context and cache allocation are checked by the native runtime; "
+                 "no automatic quantization or context downgrade.",
+    },
 }
 
 # Old ids still accepted in models.yaml and by the catalog lookup.
@@ -419,7 +440,7 @@ def kt_models() -> list[str]:
 
 
 def quant_size_gb(model_id: str, quant: str | None) -> float | None:
-    """Catalog size in GB for a (model, quant), or the safetensors size."""
+    """Catalog size in decimal GB for a (model, quant), or the format's base size."""
     info = lookup(model_id)
     if not info:
         return None
@@ -431,8 +452,15 @@ def quant_size_gb(model_id: str, quant: str | None) -> float | None:
 
 
 def ram_needed_gb(model_id: str, quant: str | None = None, n_ctx: int = _FIT_CTX_TOKENS) -> float | None:
-    """RAM (GB) to run a quant with an n_ctx context: weights*overhead + KV + OS headroom."""
+    """RAM (GB) to run a quant with an n_ctx context: weights*overhead + KV + OS headroom.
+
+    DwarfStar SSD-streaming models are excluded: the resident footprint is
+    the bounded expert cache the runtime plans from live memory, not the full
+    weights, so a weights-based estimate would misreport the requirement.
+    """
     info = lookup(model_id)
+    if info and info["format"] == DWARFSTAR:
+        return None
     size = quant_size_gb(model_id, quant)
     if not info or size is None or info["format"] == WASTE:
         return None
@@ -586,13 +614,44 @@ def validate_catalog() -> list[str]:
                 problems.append(f"{mid}: waste entries must not define quants")
             continue
 
-        for key in ("arch", "native_ctx", "kv_bytes_per_token", "tier"):
-            if key not in info:
-                problems.append(f"{mid}: missing {key}")
-        if info.get("engine") not in ("llamacpp", "ktransformers"):
-            problems.append(f"{mid}: bad engine {info.get('engine')}")
-        if info.get("tier") not in TIERS:
-            problems.append(f"{mid}: bad tier {info.get('tier')}")
+        if model_format == DWARFSTAR:
+            if info.get("engine") != "dwarfstar":
+                problems.append(f"{mid}: dwarfstar format must use dwarfstar engine")
+            for key in (
+                "hf_revision",
+                "model_file",
+                "arch",
+                "native_ctx",
+                "active_b",
+                "tier",
+                "params",
+                "notes",
+            ):
+                if key not in info:
+                    problems.append(f"{mid}: missing {key}")
+            revision = info.get("hf_revision")
+            if (
+                not isinstance(revision, str)
+                or len(revision) != 40
+                or any(char not in "0123456789abcdef" for char in revision)
+            ):
+                problems.append(f"{mid}: hf_revision must be a pinned commit")
+            if not isinstance(info.get("model_file"), str) or not info["model_file"].endswith(".gguf"):
+                problems.append(f"{mid}: model_file must be a .gguf filename")
+            if not isinstance(info.get("native_ctx"), int) or info["native_ctx"] < 4096:
+                problems.append(f"{mid}: invalid native_ctx")
+            if not isinstance(info.get("active_b"), (int, float)) or info["active_b"] <= 0:
+                problems.append(f"{mid}: invalid active_b")
+            if info.get("tier") not in TIERS:
+                problems.append(f"{mid}: invalid tier")
+            if info.get("default_quant") not in info.get("quants", {}):
+                problems.append(f"{mid}: dwarfstar default quant is missing")
+            for quant, size in info.get("quants", {}).items():
+                if not isinstance(quant, str) or not quant:
+                    problems.append(f"{mid}: invalid quant name {quant!r}")
+                if not isinstance(size, int) or size <= 0:
+                    problems.append(f"{mid}: invalid size for quant {quant}")
+            continue
         if model_format == GGUF:
             if info.get("engine") != "llamacpp":
                 problems.append(f"{mid}: gguf must use llamacpp")

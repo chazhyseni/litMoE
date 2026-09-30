@@ -2,22 +2,54 @@
 
 **lit + MoE** — a light gateway for Mixture-of-Experts models.
 
-OpenAI- and Anthropic-compatible gateway for [llama.cpp](https://github.com/ggml-org/llama.cpp), [ktransformers](https://github.com/kvcache-ai/ktransformers), and [WARP](https://github.com/sqliteai/warp). One `models.yaml`, one port, **one resident model at a time**. Switch explicitly between configured models without competing native processes consuming the same memory budget.
+litmoe connects local model files, native inference engines, and coding agents
+through one managed service. One `models.yaml`, one endpoint, **one resident
+model at a time**—with explicit model switching and client configuration kept
+separate from your normal setup.
 
-litmoe is not an inference engine — the forward pass runs in llama.cpp, ktransformers, or WARP. What litmoe adds:
+The inference engines do the model computation. litmoe makes their setup,
+lifecycle, and agent-facing access manageable together. Integrations use
+[DwarfStar](https://github.com/antirez/ds4),
+[llama.cpp](https://github.com/ggml-org/llama.cpp),
+[ktransformers](https://github.com/kvcache-ai/ktransformers), and
+[WARP](https://github.com/sqliteai/warp).
+
+## What litmoe brings
 
 - **One API for multiple engines.** Keep different engines in `models.yaml`; `litmoe switch MODEL` drains the current request, unloads the old engine, and loads the selected model. Discovery lists only the ready resident model and its aliases.
-- **Claude Code, Hermes, and OMP.** OpenAI chat completions and translated Anthropic Messages streams support their local sessions. `scripts/claude-local`, `scripts/hermes-local`, and `scripts/omp-local` leave normal client configuration unchanged.
-- **A curated model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` installs the listed model and writes its config entry. Downloads are RAM-tiered, while the two WARP entries are storage-sized recipes that run pinned upstream conversions into local `.waste` containers.
+- **Claude Code, Hermes, and OMP.** OpenAI chat completions and Anthropic Messages provide local routing. DwarfStar handles Messages natively; other engines use the gateway's translator. Compatibility and measured latency are documented in [harness limitations](docs/HARNESSES.md). The local launchers leave normal client configuration unchanged.
+- **A curated model catalog.** `litmoe models` shows resident-memory recommendations and separate storage-sized recipes. `litmoe install --model X` installs weights and writes their config entry. DwarfStar uses its pinned compatible GGUF; WARP recipes run upstream conversions into `.waste` containers.
 - **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. llama.cpp context is fitted to the weights + KV budget (Metal's share of unified memory on macOS, RAM elsewhere). WARP fits its native context using its own resident-memory planner, not the container's disk size.
 - **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual engine process.
-- **Streaming.** Raw SSE passthrough for OpenAI requests; event-by-event translation for Anthropic requests (text, thinking, tool_use).
+- **Streaming and cancellation ownership.** Native SSE passes through without translating away thinking or typed tool references. DwarfStar leases remain occupied until native work is idle; failed acknowledgement stops the owned process before another request starts.
+
+## How the pieces fit
+
+```text
+Claude Code / Hermes / OMP
+          ↓
+litmoe: configuration → admission and lifecycle → API routing
+          ↓
+one selected native inference engine → local model weights
+```
+
+| Responsibility | Owner |
+| --- | --- |
+| Model architecture, training, and released weights | The model's authors; quantized artifacts may have a separate publisher |
+| GPU/CPU kernels, expert streaming, sampling, and model-state implementation | The selected upstream inference engine |
+| Installation orchestration, model configuration, owned-process supervision, explicit switching, API adaptation, isolated harness launchers, and end-to-end measurements | litmoe |
+| Agent planning, tool execution, and the user interaction loop | Claude Code, Hermes, OMP, or another connected client |
+
+This separation is the project's purpose: changing an execution engine should
+not require rebuilding the surrounding local-serving workflow. It is not a
+claim that every backend supports the same protocols, cache behavior, or
+latency. Those capabilities must be verified and documented per integration.
 
 ---
 
 ## Which models, on what hardware
 
-Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs: on the project's 24-core AVX2 box the 4B-active default runs at 9–12.7 t/s, the same band as a 9B dense model, while being a far stronger model (numbers and raw logs in [docs/measurements/](docs/measurements/README.md)). The GGUF entries below were verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the live catalog with a fits / does-not-fit column for your RAM.
+Active parameters per token matter for decode speed, but do not alone predict prefill latency, storage traffic, or full-agent responsiveness. The default tier is small-active MoEs: on the project's 24-core AVX2 box the 4B-active default runs at 9–12.7 t/s, the same band as a 9B dense model (numbers and raw logs in [docs/measurements/](docs/measurements/README.md)). The GGUF entries below were verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the live catalog with a fits / does-not-fit column for your RAM.
 
 | Tier | Model (`--model`) | Total / active | Default quant | Disk | Why |
 |---|---|---|---|---|---|
@@ -38,7 +70,7 @@ Speed on CPU/Metal is governed by *active* parameters per token, so the default 
 | **512 GB server** | `minimax-m3`, `glm-5.3`, `deepseek-v3.2`, `kimi-k2.5`, `kimi-k2.6` | 426B–1.03T | Q2–Q4 | 247–345 GB | |
 | **768 GB server** | `qwen3.8` (2.4T/95B), `kimi-k3` (2.78T/93B) | | UD-IQ1_S | 508 / 594 GB | 93–95B *active*: ~1 t/s on a 24-core CPU regardless of RAM |
 
-ktransformers entries (Linux + NVIDIA GPU, native precision safetensors, no GGUF): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal — supported by ktransformers since 2026-08-26 and *not* by released llama.cpp), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), `deepseek-v3.2-kt` (FP8).
+ktransformers entries (Linux + NVIDIA GPU, native precision safetensors, no GGUF): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal; this catalog entry uses ktransformers), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), `deepseek-v3.2-kt` (FP8). Support for a separately acquired GLM GGUF depends on the exact inference runtime and build; the catalog entry is not a claim that other engines cannot support the architecture.
 
 WARP conversion entries: `glm-5.3-flash-warp` (306 GiB pinned source → 112 GB
 container) and `deepseek-v4.1-flash-warp` (475 GiB pinned source → 299 GiB
@@ -50,6 +82,10 @@ For GGUF entries, `litmoe install --model X` picks the quant for your machine: t
 ---
 
 ## Engines
+
+For GLM-5.3-Flash on Apple Silicon, the replacement path is
+[DwarfStar](#dwarfstar). WARP remains available for existing installations,
+but its measured GLM full-harness failures are not treated as resolved.
 
 ### llama.cpp (default)
 
@@ -158,8 +194,52 @@ benchmarks or performance guarantees:
 | GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s (short) and 3.86 tok/s (long) on WARP's 64 GB M5 Pro |
 | DeepSeek-V4.1-Flash | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
-Those published throughput figures assume fast internal NVMe. This
-repository's current persistent disk is not equivalent.
+Those published throughput figures assume fast internal NVMe and do not
+establish full-harness performance. The 96 GiB M2 Max investigation found serial
+GLM prefill, reset-per-request state, and a fresh Claude request containing
+84,442 native tokens. See the [replacement investigation](docs/plans/2026-09-30-inference-redesign.md)
+for the measured workload and acceptance gates.
+
+### DwarfStar
+
+**Upstream:** [antirez/ds4](https://github.com/antirez/ds4), by Salvatore
+Sanfilippo and contributors. litmoe adds installation, protocol integration,
+and lifecycle management; the Metal graph, expert streaming, and model-state
+implementation are DwarfStar's work.
+
+```bash
+# Apple Silicon macOS with Xcode Command Line Tools, git, and make.
+litmoe install --model glm-5.3-flash-dwarfstar
+litmoe serve glm-5.3-flash-dwarfstar
+./scripts/claude-local --model glm-5.3-flash-dwarfstar
+./scripts/omp-local --model glm-5.3-flash-dwarfstar
+```
+
+- Installs source revision `0aaea5a238fb41a35106a551e73c8409dfb751ac`
+  with `litmoe/patches/dwarfstar-serving.patch`. Runtime-only installation:
+  `litmoe install --engine dwarfstar`.
+- Downloads `GLM-5.3-Flash-Q4_K.gguf` from `antirez/glm-5.3-flash-gguf`,
+  pinned at `b2fa29d7a6b410db11221c904973967b80b760f5`: about 191 GB
+  on disk. SSD expert streaming is explicit; disk size is not a resident-RAM
+  requirement. There is no automatic lower-precision substitution.
+- Native Anthropic Messages and exact rendered token counts bypass the
+  OpenAI translator. The native patch resolves typed discovery references.
+  Claude's launcher enables tool search only after the ready runtime advertises it.
+- The configured context is passed unchanged and checked at readiness.
+  Native allocation failure is an error, not a hidden context reduction.
+- Prefix state belongs to DwarfStar. Disk state is separated by model-file
+  identity, upstream revision, and patch, with strict quantization matching.
+- On disconnect or stream EOF, admission waits up to 10 seconds for native
+  quiescence. An unconfirmed acknowledgement stops the owned engine; the next
+  request reloads it. Native cancellation checks are chunked, not instantaneous.
+
+**Verification boundary:** the adapter and installer are implemented; real
+GLM inference and actual Claude/OMP performance are still being verified.
+No model-latency claim follows from compilation or protocol tests. See the
+[measurement record](docs/measurements/README.md) and
+[setup details](docs/SETUP.md#dwarfstar-glm-53-flash).
+Forced Anthropic tool choice (`any` or a named tool) is rejected explicitly;
+`auto` and `none` are supported. This recipe does not install the vision encoder.
 
 ---
 
@@ -354,13 +434,44 @@ Services: **litmoe-gateway** on port **8000** (`http://127.0.0.1:8000/v1`, loopb
 
 ## What litmoe does NOT do
 
-- No inference code, bundled weights, kernels, or quantizer — llama.cpp, ktransformers, and WARP own those implementations; no remote inference API is involved.
+- No independent inference engine or bundled model weights. Native runtimes own the forward pass, kernels, and quantization. litmoe carries documented WARP optimization and DwarfStar serving-contract patches; these do not make upstream inference engines litmoe implementations. No automatic remote inference fallback is enabled.
 - No multi-node distribution. Single node.
 - No litmoe model-conversion implementation. Catalog WARP installs orchestrate pinned upstream WARP tooling and validate its WARP v0 output; other conversions use `llama-quantize`, Unsloth, or the relevant upstream tooling.
 - No fine-tuning. For LoRA on MoE experts see the ktransformers × LlamaFactory cookbook upstream.
 
 ---
 
+## Upstream acknowledgements
+
+litmoe depends on the work of the projects it orchestrates:
+
+- **[DwarfStar (`antirez/ds4`)](https://github.com/antirez/ds4)**, by Salvatore
+  Sanfilippo (antirez) and the ds4.c contributors, provides the native engine
+  used by the GLM Metal/SSD-streaming integration. Its GPU execution,
+  expert streaming, model-state machinery, and native server are upstream
+  work—not litmoe inventions. DwarfStar also acknowledges its foundations in
+  llama.cpp and GGML; its MIT license retains ds4.c, ggml, and DeepSeek notices.
+- **[llama.cpp and GGML](https://github.com/ggml-org/llama.cpp)** provide the
+  GGUF execution runtime, quantization ecosystem, and hardware kernels used by
+  litmoe's llama.cpp integration.
+- **[KTransformers](https://github.com/kvcache-ai/ktransformers)** and
+  **[SGLang](https://github.com/sgl-project/sglang)** provide the heterogeneous
+  CPU/GPU execution and serving stack used by the ktransformers adapter.
+- **[WARP](https://github.com/sqliteai/warp)** provides `.waste` conversion,
+  expert paging, and inference; litmoe orchestrates its pinned tooling and
+  documents its own small patch separately.
+- **Model authors, [Hugging Face](https://huggingface.co/), and quantization
+  publishers such as [Unsloth](https://huggingface.co/unsloth)** provide the
+  weights, distribution infrastructure, and artifacts referenced by the catalog.
+
+These are dependencies and independently developed projects, not claims of
+affiliation or endorsement. Upstream software and model artifacts retain their
+own licenses. DwarfStar is an implemented integration; implementation checks
+and pending real-model verification are distinguished above.
+
 ## License
 
-Apache 2.0.
+litmoe's own code is licensed under [Apache 2.0](LICENSE). That license does
+not relicense upstream engines, their incorporated third-party code, or model
+weights. Preserve the applicable upstream copyright and license notices when
+redistributing them; see [third-party acknowledgements](THIRD_PARTY_NOTICES.md).

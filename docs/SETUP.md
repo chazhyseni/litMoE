@@ -165,8 +165,65 @@ guarantees:
 | GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
 | DeepSeek-V4.1-Flash | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
-The published throughput assumes internal NVMe; this repository's current
-persistent disk is not equivalent.
+The published throughput assumes internal NVMe and is not a cold-prefill or
+full-agent latency guarantee. Current WARP GLM serving remains serial during
+prefill and resets model state per request; the [full-harness investigation](plans/2026-09-30-inference-redesign.md)
+records the observed limits.
+
+### DwarfStar GLM-5.3-Flash
+
+The managed DwarfStar integration targets **Apple Silicon macOS**, using
+[antirez/ds4](https://github.com/antirez/ds4)'s Metal graph and SSD expert
+streaming. Install Xcode Command Line Tools, `git`, and `make`, then:
+
+```bash
+litmoe install --model glm-5.3-flash-dwarfstar
+litmoe serve glm-5.3-flash-dwarfstar
+```
+
+The command builds source revision
+`0aaea5a238fb41a35106a551e73c8409dfb751ac`, applies the packaged native
+serving patch, runs its protocol checks, and retains upstream licenses and
+Metal sources. A failed build/publication preserves a previous runtime.
+Runtime-only installation is `litmoe install --engine dwarfstar`.
+The default location is `~/.local/lib/dwarfstar`; `LITMOE_PREFIX` changes
+the install prefix, and `LITMOE_DWARFSTAR_DIR` selects an existing managed
+runtime. Stale source/patch markers are rejected.
+
+The pinned recipe downloads `GLM-5.3-Flash-Q4_K.gguf` from
+`antirez/glm-5.3-flash-gguf` revision
+`b2fa29d7a6b410db11221c904973967b80b760f5`: approximately 191 GB
+(177.8 GiB) on disk. It cannot reuse a WARP `.waste` container. The source
+FP8 artifact is not the executable GGUF; this recipe does not download it or
+the separate vision encoder. Downloads resume through Hugging Face.
+
+For an already downloaded compatible file:
+
+```yaml
+models:
+  - id: glm-5.3-flash-dwarfstar
+    engine: dwarfstar
+    model_path: ~/.litmoe/models/glm-5.3-flash-dwarfstar/GLM-5.3-Flash-Q4_K.gguf
+    n_ctx: 1048576
+    dwarfstar_ssd_streaming: true
+    # Optional explicit expert cache; otherwise upstream chooses its size:
+    # dwarfstar_cache_experts: 32GB
+```
+
+Context is passed unchanged and confirmed at readiness; native allocation
+failure is not hidden by reducing the window. The GGUF resident-memory
+formula below does not apply to this streamed recipe. Capacity is not a
+prefill-latency guarantee.
+
+`dwarfstar_kv_dir` or `LITMOE_DWARFSTAR_CACHE` selects the disk-cache base
+(default `~/.litmoe/dwarfstar-cache`). Private per-artifact/runtime namespaces
+and native strict-quant matching prevent cross-model state reuse. KV files
+can contain private conversation state; protect them like model-session data.
+
+The adapter, native tool-reference support, exact count endpoint, and
+acknowledged cancellation are implemented. Real GLM and Claude/OMP
+performance verification is recorded separately in
+[measurements](measurements/README.md); build success is not inference proof.
 
 ## Step 3: Pick a model for your RAM
 
@@ -175,13 +232,14 @@ For llama.cpp, `litmoe install --model <id>` downloads the default quant when
 it fits your RAM budget, otherwise the largest quant that does (`--quant <Q>`
 overrides), and adds it to `models.yaml` with a memory-aware context size.
 ktransformers entries download their native weight repositories. The two
-`*-warp` entries instead describe pinned source-to-`.waste` conversions; use
-the storage requirements above rather than the GGUF RAM formula below.
+`*-warp` entries describe pinned source-to-`.waste` conversions; the DwarfStar
+entry downloads a pinned streaming GGUF. Use their storage requirements rather
+than the resident-GGUF RAM formula below.
 
 The RAM column below = weights × 1.10 (mmap + compute buffers) + KV cache at
 32K tokens + 6 GB headroom. macOS gets 75 % of physical RAM as its budget
 (unified memory shared with the OS/GPU). This formula does not describe WARP's
-storage-paged containers. The llama.cpp laptop-tier choices are MoEs with
+storage-paged containers or DwarfStar's streamed recipe. The llama.cpp laptop-tier choices are MoEs with
 3–5 B active parameters or ≤ 31 B dense — the ones that are actually fast on
 CPU/Metal.
 

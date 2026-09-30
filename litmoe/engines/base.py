@@ -34,6 +34,14 @@ class Engine(abc.ABC):
     just forwards requests to them. This is the simplest possible architecture.
     """
 
+    # Conservative capability defaults. An engine sets these True only when its
+    # installed runtime actually implements them; the gateway reads them to
+    # decide request routing (native Anthropic passthrough, tool search,
+    # cooperative cancellation). Never override them without the implementation.
+    supports_native_messages = False
+    supports_tool_search = False
+    supports_cooperative_cancel = False
+
     def __init__(self, model: ModelEntry):
         self.model = model
         self.process: subprocess.Popen | None = None
@@ -142,7 +150,7 @@ class Engine(abc.ABC):
         import httpx
         url = self.health_url()
         loop = asyncio.get_running_loop()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             start = loop.time()
             while True:
                 if self.process and self.process.poll() is not None:
@@ -159,3 +167,11 @@ class Engine(abc.ABC):
                     print(f"  {self.model.id}: timeout waiting for {url}")
                     return False
                 await asyncio.sleep(2.0)
+
+    async def wait_idle(self, timeout: float = 10) -> bool:
+        """Confirm quiescence before releasing an acknowledged-cancellation lease.
+
+        EOF alone is not proof that native work has stopped. Without an engine
+        acknowledgement, only process exit proves it safe to release admission.
+        """
+        return not self.is_running()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from contextlib import suppress
@@ -13,6 +14,8 @@ from fastapi.responses import StreamingResponse
 
 from litmoe.config import GatewayConfig, ModelEntry
 from litmoe.engines import Engine
+
+logger = logging.getLogger(__name__)
 
 
 async def disconnected(request: Request, stopped: asyncio.Event) -> None:
@@ -62,10 +65,28 @@ class Lease:
         self.closed = True
         with anyio.CancelScope(shield=True):
             try:
-                if abandoned and self.restart_on_abandon:
-                    await self.runtime._stop()
+                if getattr(self.engine, "supports_cooperative_cancel", False):
+                    # EOF is not an acknowledgement: a transport error can end
+                    # an iterator while the native prefill is still running.
+                    try:
+                        idle = await asyncio.wait_for(self.engine.wait_idle(timeout=10), timeout=10)
+                    except asyncio.CancelledError:
+                        await self._stop_with_reset("quiescence wait interrupted; cache reset")
+                        raise
+                    except Exception:
+                        idle = False
+                    if not idle:
+                        await self._stop_with_reset("native quiescence unconfirmed; cache reset")
+                elif abandoned and self.restart_on_abandon:
+                    await self._stop_with_reset("stream abandoned by the client")
             finally:
                 self.runtime.lock.release()
+
+    async def _stop_with_reset(self, reason: str) -> None:
+        logger.warning("engine %s: %s; stopping the owned process",
+                       self.engine.model.id, reason)
+        await self.runtime._stop()
+
 
 
 class LeasedStream(StreamingResponse):
@@ -95,6 +116,10 @@ class LeasedStream(StreamingResponse):
                         await self.response.aclose()
                         await self.client.aclose()
                     finally:
+                        # finished==True is NOT evidence the backend is idle:
+                        # an in-band error event can end the iterator while
+                        # native generation continues. The lease decides via
+                        # quiescence/restart, not the stream's own view.
                         await self.lease.close(abandoned=not self.finished)
 
 
@@ -121,6 +146,13 @@ class Runtime:
                 return model
         raise HTTPException(404, f"unknown configured model: {model_id}")
 
+    def _cancellation_mode(self, engine: Engine | None) -> str:
+        if engine is not None and getattr(engine, "supports_cooperative_cancel", False):
+            return "prefill-chunked"
+        if engine is not None and engine.model.engine == "warp":
+            return "stream-disconnect"
+        return "restart"
+
     def status(self) -> dict:
         engine = self.engine
         if self.state == "ready" and (engine is None or not engine.is_running()):
@@ -133,6 +165,8 @@ class Runtime:
             value = engine.model.env.get("LLAMA_ARG_CACHE_PROMPT", os.environ.get("LLAMA_ARG_CACHE_PROMPT", "")).lower()
             if not disabled and value not in ("0", "false", "off"):
                 cache = "backend"
+        if engine is not None and getattr(engine, "supports_native_messages", False):
+            cache = "backend"
         return {
             "selected_model": self.selected.id if self.selected else None,
             "active_model": engine.model.id if ready else None,
@@ -143,8 +177,14 @@ class Runtime:
             "queue_depth": self.queue_depth,
             "context_window": engine.model.n_ctx if ready else None,
             "capabilities": {
+                "native_messages": bool(engine is not None
+                                        and getattr(engine, "supports_native_messages", False)),
+                "tool_search": bool(engine is not None
+                                    and getattr(engine, "supports_tool_search", False)),
+                "count_tokens": bool(engine is not None
+                                     and getattr(engine, "supports_native_messages", False)),
                 "prompt_cache": cache,
-                "cancellation": "stream-disconnect" if engine and engine.model.engine == "warp" else "restart",
+                "cancellation": self._cancellation_mode(engine),
             },
         }
 

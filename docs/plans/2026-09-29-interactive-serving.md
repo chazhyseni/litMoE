@@ -1,5 +1,13 @@
 # Interactive Serving Implementation Plan
 
+**Status:** Historical implementation plan. Transport and lifecycle changes
+shipped, but the later real-model M2 Max checks did not establish interactive
+GLM latency or immediate prefill cancellation. Accepted WARP streams currently
+close the socket without waiting for native prefill quiescence. The
+[replacement investigation](2026-09-30-inference-redesign.md) records those
+gaps and supersedes the performance strategy; the acceptance criteria below
+must not be read as all having passed.
+
 **Goal:** Make litmoe a single-interactive-model service shared by Claude Code, Hermes, and OMP, with observable latency and explicit model switching.
 
 **Architecture:** One gateway owns at most one live inference engine. Configured models remain selectable, but inactive models are not advertised as ready. Requests never silently substitute models or cause background model switches. Backend-specific prefix caching is reported honestly; unsupported WARP caching is not emulated by caching answers.

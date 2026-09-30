@@ -1,0 +1,486 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index 20fba30..02d8777 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -2191,13 +2191,16 @@ static bool parse_anthropic_image_source(const char **p,
+     return true;
+ }
+ 
+-static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_tools);
++static bool resolve_tool_reference(buf *out, const char *schemas, const char *name);
++static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_tools,
++                                    const char *tool_schemas);
+ 
+ /* Anthropic content is block-structured, while the engine consumes one compact
+  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
+  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
+  * escaped text because DS4 sees tool results in its chat template. */
+-static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat_msg *msg) {
++static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat_msg *msg,
++                                          const char *tool_schemas) {
+     if (**p != '{') return false;
+     (*p)++;
+     char *type = NULL;
+@@ -2241,7 +2244,7 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
+                 free(key);
+                 goto bad;
+             }
+-        } else if (!strcmp(key, "name")) {
++        } else if (!strcmp(key, "name") || !strcmp(key, "tool_name")) {
+             if (!json_string_replace(p, &name)) {
+                 free(key);
+                 goto bad;
+@@ -2279,9 +2282,21 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
+      * caller may not know the enclosing role yet while parsing content blocks.
+      * Classify protocol blocks by their own "type" field; later rendering and
+      * validation use the final message role. */
+-    if (!allow_tools && (!type || (strcmp(type, "text") && strcmp(type, "image"))))
++    if (!allow_tools && (!type || (strcmp(type, "text") && strcmp(type, "image") &&
++                                   strcmp(type, "tool_reference"))))
+         goto bad;
+-    if (type && !strcmp(type, "tool_use")) {
++    if (type && !strcmp(type, "tool_reference")) {
++        /* References are definitions returned by discovery, never tool calls.
++         * Resolve from this request's catalog, not from mutable global state. */
++        if (allow_tools) goto bad;
++        buf resolved = {0};
++        if (!resolve_tool_reference(&resolved, tool_schemas, name)) {
++            buf_free(&resolved);
++            goto bad;
++        }
++        append_owned_text(&msg->content, resolved.ptr);
++        buf_free(&resolved);
++    } else if (type && !strcmp(type, "tool_use")) {
+         tool_call tc = {0};
+         tc.id = id ? xstrdup(id) : NULL;
+         tc.name = name ? xstrdup(name) : xstrdup("");
+@@ -2290,7 +2305,7 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
+     } else if (type && !strcmp(type, "tool_result")) {
+         chat_msg nested = {0};
+         const char *content = tool_result ? tool_result : "\"\"";
+-        if (!parse_anthropic_content(&content, &nested, false)) {
++        if (!parse_anthropic_content(&content, &nested, false, tool_schemas)) {
+             chat_msg_free(&nested);
+             goto bad;
+         }
+@@ -2369,7 +2384,8 @@ bad:
+     return false;
+ }
+ 
+-static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_tools) {
++static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_tools,
++                                    const char *tool_schemas) {
+     json_ws(p);
+     if (**p == '"') return json_string(p, &msg->content);
+     if (json_lit(p, "null")) {
+@@ -2390,7 +2406,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_to
+             msg->content = buf_take(&b);
+             free(s);
+         } else if (**p == '{') {
+-            if (!parse_anthropic_content_block(p, allow_tools, msg)) return false;
++            if (!parse_anthropic_content_block(p, allow_tools, msg, tool_schemas)) return false;
+         } else if (!json_skip_value(p)) {
+             return false;
+         }
+@@ -2404,7 +2420,8 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_to
+     return true;
+ }
+ 
+-static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
++static bool parse_anthropic_messages(const char **p, chat_msgs *msgs,
++                                      const char *tool_schemas) {
+     json_ws(p);
+     if (**p != '[') return false;
+     (*p)++;
+@@ -2436,7 +2453,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+                     free(key);
+                     goto fail;
+                 }
+-                if (!parse_anthropic_content(p, &msg, true)) {
++                if (!parse_anthropic_content(p, &msg, true, tool_schemas)) {
+                     free(key);
+                     goto fail;
+                 }
+@@ -2685,14 +2702,14 @@ bad:
+ }
+ 
+ static bool append_glm_tool_schema_json(buf *b, const char *json,
+-                                        bool *emitted) {
++                                        bool *emitted, bool include_deferred) {
+     json_args args = {0};
+     *emitted = false;
+     if (!json_args_parse(json, &args)) return false;
+ 
+     for (int i = 0; i < args.len; i++) {
+         const json_arg *arg = &args.v[i];
+-        if (!strcmp(arg->key, "defer_loading") &&
++        if (!include_deferred && !strcmp(arg->key, "defer_loading") &&
+             !arg->is_string && !strcmp(arg->value, "true")) {
+             json_args_free(&args);
+             return true;
+@@ -2718,6 +2735,31 @@ static bool append_glm_tool_schema_json(buf *b, const char *json,
+     return true;
+ }
+ 
++static bool resolve_tool_reference(buf *out, const char *schemas, const char *name) {
++    if (!schemas || !name || !name[0]) return false;
++    const char *p = schemas;
++    json_ws(&p);
++    while (*p) {
++        char *raw = NULL;
++        if (!json_raw_value(&p, &raw)) return false;
++        json_args args = {0};
++        bool matched = false;
++        if (json_args_parse(raw, &args)) {
++            for (int i = 0; i < args.len; i++) {
++                if (!strcmp(args.v[i].key, "name") && args.v[i].is_string &&
++                    !strcmp(args.v[i].value, name)) matched = true;
++            }
++        }
++        json_args_free(&args);
++        bool emitted = false;
++        bool ok = !matched || append_glm_tool_schema_json(out, raw, &emitted, true);
++        free(raw);
++        if (matched) return ok && emitted;
++        json_ws(&p);
++    }
++    return false;
++}
++
+ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
+     if (!tool_schemas || !tool_schemas[0]) return;
+     buf_puts(b,
+@@ -2733,7 +2775,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
+         char *raw = NULL;
+         if (!json_raw_value(&p, &raw)) break;
+         bool emitted = false;
+-        if (!append_glm_tool_schema_json(b, raw, &emitted)) {
++        if (!append_glm_tool_schema_json(b, raw, &emitted, false)) {
+             buf_puts(b, raw);
+             emitted = true;
+         }
+@@ -3450,7 +3492,7 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
+         if (!json_raw_value(&p, &raw)) break;
+         buf inner = {0};
+         bool emitted = false;
+-        if (!append_glm_tool_schema_json(&inner, raw, &emitted)) {
++        if (!append_glm_tool_schema_json(&inner, raw, &emitted, false)) {
+             buf_puts(&inner, raw);
+             emitted = true;
+         }
+@@ -4307,6 +4349,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body,
+     chat_msgs msgs = {0};
+     char *system = NULL;
+     char *tool_schemas = NULL;
++    const char *messages_json = NULL;
++    if (errlen) err[0] = '\0';
+ 
+     json_ws(&p);
+     if (*p != '{') goto bad;
+@@ -4322,8 +4366,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body,
+         }
+         p++;
+         if (!strcmp(key, "messages")) {
+-            chat_msgs_free(&msgs);
+-            if (!parse_anthropic_messages(&p, &msgs)) {
++            messages_json = p;
++            if (!json_skip_value(&p)) {
+                 free(key);
+                 goto bad;
+             }
+@@ -4368,6 +4412,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body,
+                             free(key);
+                             goto bad;
+                         }
++                        if (strcmp(choice, "auto") && strcmp(choice, "none")) {
++                            snprintf(err, errlen, "tool_choice supports auto or none; forced calls are not supported");
++                            free(choice);
++                            free(ckey);
++                            free(key);
++                            goto bad;
++                        }
+                         tool_choice_none = !strcmp(choice, "none");
+                         free(choice);
+                     } else if (!json_skip_value(&p)) {
+@@ -4458,6 +4509,14 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body,
+         json_ws(&p);
+     }
+     if (*p != '}') goto bad;
++    if (messages_json) {
++        const char *messages = messages_json;
++        bool valid = parse_anthropic_messages(&messages, &msgs, tool_schemas);
++        if (!valid) {
++            snprintf(err, errlen, "invalid messages: malformed content or unknown tool_reference");
++            goto bad;
++        }
++    }
+     if (!got_messages) {
+         snprintf(err, errlen, "missing messages");
+         chat_msgs_free(&msgs);
+@@ -4518,7 +4577,7 @@ bad:
+     chat_msgs_free(&msgs);
+     free(system);
+     free(tool_schemas);
+-    snprintf(err, errlen, "invalid JSON request");
++    if (errlen && !err[0]) snprintf(err, errlen, "invalid JSON request");
+     request_free(r);
+     return false;
+ }
+@@ -14931,6 +14990,7 @@ static job *dequeue(server *s) {
+     job *j = s->head;
+     s->head = j->next;
+     if (!s->head) s->tail = NULL;
++    s->slots[0].busy = true;
+     pthread_mutex_unlock(&s->mu);
+     j->next = NULL;
+     return j;
+@@ -14948,6 +15008,9 @@ static void *worker_main(void *arg) {
+          * tiers read the slot's rendered-text cache and activity stamp. */
+         slot_refresh_live_text(s, &s->slots[0]);
+         s->slots[0].last_used = time(NULL);
++        pthread_mutex_lock(&s->mu);
++        s->slots[0].busy = false;
++        pthread_mutex_unlock(&s->mu);
+     }
+     return NULL;
+ }
+@@ -15267,6 +15330,28 @@ static void wait_for_job_or_disconnect(server *s, job *j) {
+     pthread_mutex_unlock(&j->mu);
+ }
+ 
++/* The scheduler mutex is never held over prefill. Include accepted clients
++ * still parsing/awaiting a job, and slots finishing checkpoint housekeeping.
++ * A closed socket alone therefore cannot acknowledge model quiescence. */
++static void send_litmoe_status(server *s, int fd) {
++    int queued = 0, busy = 0;
++    pthread_mutex_lock(&s->mu);
++    for (job *j = s->head; j; j = j->next) queued++;
++    for (int i = 0; i < s->slot_count; i++) busy += s->slots[i].busy;
++    int active = s->clients - 1 - queued;
++    if (active < busy) active = busy;
++    pthread_mutex_unlock(&s->mu);
++    buf body = {0};
++    buf_printf(&body,
++        "{\"status\":\"ok\",\"active_requests\":%d,\"queued_requests\":%d,"
++        "\"context_window\":%d,\"capabilities\":{\"native_messages\":true,"
++        "\"tool_search\":true,\"count_tokens\":true,\"prompt_cache\":\"backend\","
++        "\"cancellation\":\"prefill-chunked\"}}",
++        active, queued, s->ctx_size);
++    http_response(fd, s->enable_cors, 200, "application/json", body.ptr);
++    buf_free(&body);
++}
++
+ static void *client_main(void *arg) {
+     client_arg *ca = arg;
+     server *s = ca->srv;
+@@ -15285,6 +15370,12 @@ static void *client_main(void *arg) {
+         goto done;
+     }
+ 
++    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/litmoe/status")) {
++        send_litmoe_status(s, fd);
++        http_request_free(&hr);
++        goto done;
++    }
++
+     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
+         send_models(s, fd);
+         http_request_free(&hr);
+@@ -15305,6 +15396,20 @@ static void *client_main(void *arg) {
+     char err[160];
+     bool ok = false;
+     const int ctx_size = s->ctx_size;
++    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages/count_tokens")) {
++        ok = parse_anthropic_request(s->engine, s, hr.body, 0,
++                                     ctx_size, &req, err, sizeof(err));
++        http_request_free(&hr);
++        if (ok) {
++            char body[80];
++            snprintf(body, sizeof(body), "{\"input_tokens\":%d}", req.prompt.len);
++            http_response(fd, s->enable_cors, 200, "application/json", body);
++            request_free(&req);
++        } else {
++            http_error(fd, s->enable_cors, 400, err);
++        }
++        goto done;
++    }
+     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                      ctx_size, &req, err, sizeof(err));
+@@ -20008,7 +20113,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
+         "]";
+     const char *p = json;
+     chat_msgs msgs = {0};
+-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
++    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL));
+     TEST_ASSERT(msgs.len == 2);
+     TEST_ASSERT(msgs.v[1].tool_call_id && !strcmp(msgs.v[1].tool_call_id, "toolu_exact"));
+ 
+@@ -20177,7 +20282,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
+         "]";
+     const char *p = json;
+     chat_msgs msgs = {0};
+-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
++    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL));
+     TEST_ASSERT(msgs.len == 3);
+     TEST_ASSERT(msgs.v[0].calls.len == 1);
+     TEST_ASSERT(msgs.v[0].calls.v[0].id &&
+@@ -20856,7 +20961,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
+         "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+         "\"text\":\"hello\",\"text\":\"bad\\q\"}]}]";
+     chat_msgs msgs = {0};
+-    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
++    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs, NULL));
+     chat_msgs_free(&msgs);
+ 
+     p =
+@@ -22569,7 +22674,7 @@ static void test_anthropic_inline_image_content(void) {
+     buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\"describe\"}]}]");
+     const char *p = json.ptr;
+     chat_msgs msgs = {0};
+-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
++    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL));
+     TEST_ASSERT(msgs.len == 1);
+     TEST_ASSERT(msgs.v[0].images.len == 1);
+     TEST_ASSERT(strstr(msgs.v[0].content, "describe") != NULL);
+@@ -22639,7 +22744,7 @@ static void test_anthropic_tool_image_output(void) {
+     buf_puts(&json, "\"}}]}],\"role\":\"user\"}]");
+     const char *p = json.ptr;
+     chat_msgs msgs = {0};
+-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
++    TEST_ASSERT(parse_anthropic_messages(&p, &msgs, NULL));
+     TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == 1);
+     TEST_ASSERT(strstr(msgs.v[0].content, "<tool_result>read image") != NULL);
+     TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+@@ -22653,7 +22758,7 @@ static void test_anthropic_tool_image_output(void) {
+     };
+     for (size_t i = 0; i < 2; i++) {
+         p = invalid[i];
+-        TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
++        TEST_ASSERT(!parse_anthropic_messages(&p, &msgs, NULL));
+         chat_msgs_free(&msgs);
+     }
+ }
+@@ -22851,7 +22956,7 @@ static void test_deepseek41_anthropic_results(void) {
+         "{\"role\":\"assistant\",\"content\":\"Done\"},"
+         "{\"role\":\"user\",\"content\":\"Continue\"}]";
+     chat_msgs msgs = {0};
+-    TEST_ASSERT(parse_anthropic_messages(&json, &msgs));
++    TEST_ASSERT(parse_anthropic_messages(&json, &msgs, NULL));
+     TEST_ASSERT(msgs.len == 5 && msgs.v[2].tool_results_len == 2);
+     if (msgs.len != 5) { chat_msgs_free(&msgs); return; }
+     char *source = xstrdup(msgs.v[2].content);
+@@ -22873,7 +22978,7 @@ static void test_deepseek41_anthropic_results(void) {
+     chat_msgs_free(&msgs);
+     json = "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+            "\"tool_use_id\":\"x\",\"content\":\"old\"}],\"content\":\"new\"}]";
+-    TEST_ASSERT(!parse_anthropic_messages(&json, &msgs));
++    TEST_ASSERT(!parse_anthropic_messages(&json, &msgs, NULL));
+     chat_msgs_free(&msgs);
+ }
+ 
+@@ -22899,7 +23004,7 @@ static void test_deepseek41_live_result_order(void) {
+             "[{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"SECOND\"},"
+             "{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"FIRST\"}]";
+         chat_msgs msgs = {0};
+-        TEST_ASSERT(anthropic ? parse_anthropic_messages(&json, &msgs) : parse_messages(&json, &msgs));
++        TEST_ASSERT(anthropic ? parse_anthropic_messages(&json, &msgs, NULL) : parse_messages(&json, &msgs));
+         if (anthropic) anthropic_prepare_live_continuation(&s, &r, &msgs);
+         else responses_prepare_live_continuation(&s, &r, &msgs);
+         const char *tail = anthropic ? r.anthropic_live_suffix_text : r.responses_live_suffix_text;
+@@ -22917,7 +23022,82 @@ static void test_deepseek41_live_result_order(void) {
+     pthread_mutex_destroy(&s.tool_mu);
+ }
+ 
++static void test_anthropic_deferred_tool_references(void) {
++    const char *schemas =
++        "{\"name\":\"ToolSearch\",\"input_schema\":{\"type\":\"object\"}}\n"
++        "{\"name\":\"read_file\",\"description\":\"Read a file\","
++        "\"defer_loading\":true,\"input_schema\":{\"type\":\"object\","
++        "\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n";
++    const char *name_keys[] = {"name", "tool_name"};
++    for (size_t i = 0; i < 2; i++) {
++        buf json = {0};
++        buf_printf(&json,
++            "[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\","
++            "\"id\":\"search1\",\"name\":\"ToolSearch\",\"input\":{}}]},"
++            "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
++            "\"tool_use_id\":\"search1\",\"content\":[{\"type\":\"text\",\"text\":\"found\"},"
++            "{\"type\":\"tool_reference\",\"%s\":\"read_file\"}]}]}]", name_keys[i]);
++        const char *p = json.ptr;
++        chat_msgs msgs = {0};
++        TEST_ASSERT(parse_anthropic_messages(&p, &msgs, schemas));
++        char *prompt = render_chat_prompt_text_for_syntax(
++            SERVER_MODEL_SYNTAX_GLM, &msgs, schemas, NULL, DS4_THINK_HIGH);
++        const char *observation = strstr(prompt, "<|observation|>");
++        const char *definition = strstr(prompt, "\"name\": \"read_file\"");
++        TEST_ASSERT(observation && definition && definition > observation);
++        TEST_ASSERT(definition && strstr(definition, "\"required\":[\"path\"]"));
++        TEST_ASSERT(!strstr(prompt, "\"defer_loading\""));
++        TEST_ASSERT(strstr(prompt, "<|assistant|><think>"));
++        free(prompt);
++        chat_msgs_free(&msgs);
++        buf_free(&json);
++    }
++    /* Missing catalog entries must fail, not disappear from the prompt. */
++    const char *unknown =
++        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
++        "\"tool_use_id\":\"s\",\"content\":[{\"type\":\"tool_reference\","
++        "\"tool_name\":\"not_in_catalog\"}]}]}]";
++    chat_msgs msgs = {0};
++    TEST_ASSERT(!parse_anthropic_messages(&unknown, &msgs, schemas));
++    chat_msgs_free(&msgs);
++    request req;
++    char error[160] = {0};
++    TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
++        "{\"messages\":[],\"tool_choice\":{\"type\":\"any\"}}",
++        1, 4096, &req, error, sizeof(error)));
++}
++
++static void test_litmoe_status_waits_for_native_housekeeping(void) {
++    server s;
++    test_cancel_server_init(&s);
++    server_slot slot = {0};
++    s.slots = &slot;
++    s.slot_count = 1;
++    s.ctx_size = 8192;
++    job queued = {0};
++    for (int state = 0; state < 4; state++) {
++        int sv[2] = {-1, -1};
++        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
++        if (sv[0] < 0) break;
++        /* Parsing, disconnected-but-busy, queued, then fully idle. */
++        s.clients = state == 0 || state == 2 ? 2 : 1;
++        slot.busy = state == 1;
++        s.head = state == 2 ? &queued : NULL;
++        send_litmoe_status(&s, sv[0]);
++        shutdown(sv[0], SHUT_WR);
++        char *out = read_socket_text(sv[1]);
++        TEST_ASSERT(strstr(out, state < 2 ? "\"active_requests\":1" : "\"active_requests\":0"));
++        TEST_ASSERT(strstr(out, state == 2 ? "\"queued_requests\":1" : "\"queued_requests\":0"));
++        free(out);
++        close(sv[0]);
++        close(sv[1]);
++    }
++    test_cancel_server_destroy(&s);
++}
++
+ static void ds4_server_unit_tests_run(void) {
++    test_anthropic_deferred_tool_references();
++    test_litmoe_status_waits_for_native_housekeeping();
+     test_deepseek41_server_stream();
+     test_deepseek41_server_tools();
+     test_deepseek41_anthropic_results();
+diff --git a/tests/ds4_test.c b/tests/ds4_test.c
+index 4966537..6402849 100644
+--- a/tests/ds4_test.c
++++ b/tests/ds4_test.c
+@@ -7299,7 +7299,7 @@ int main(int argc, char **argv) {
+         const char *json = argv[3];
+         chat_msgs msgs = {0};
+         const bool anthropic = !strcmp(argv[1], "--ds41-render-anthropic");
+-        if (!(anthropic ? parse_anthropic_messages(&json, &msgs) : parse_messages(&json, &msgs))) {
++        if (!(anthropic ? parse_anthropic_messages(&json, &msgs, NULL) : parse_messages(&json, &msgs))) {
+             chat_msgs_free(&msgs);
+             return 2;
+         }

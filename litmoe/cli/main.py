@@ -14,7 +14,7 @@ import yaml
 from litmoe import __version__
 from litmoe.cli.install import install_cmd, print_model_table
 from litmoe.config import default_config_path, expand_path, load_config
-from litmoe.engines import kt_installed, llama_installed, warp_installed
+from litmoe.engines import dwarfstar_installed, kt_installed, llama_installed, warp_installed
 from litmoe.models import (CLAUDE_ALIASES, DEFAULT_MODEL, KNOWN_MODELS,
                            quant_size_gb, recommended_for_ram, smallest_gguf_model)
 from litmoe.platform_utils import (
@@ -89,7 +89,7 @@ def doctor():
         for g in gpus:
             click.echo(f"  {g}")
     elif is_macos():
-        click.echo("  Apple GPU (Metal) via llama.cpp")
+        click.echo("  Apple GPU (Metal) via llama.cpp or DwarfStar")
     else:
         click.echo("  No NVIDIA GPU detected")
 
@@ -109,6 +109,10 @@ def doctor():
         click.echo("  WARP: installed (serves local .waste containers)")
     else:
         click.echo("  WARP: NOT installed (litmoe install --engine warp)")
+    if dwarfstar_installed():
+        click.echo("  DwarfStar: installed (pinned native Metal server)")
+    else:
+        click.echo("  DwarfStar: NOT installed (litmoe install --engine dwarfstar)")
 
     click.echo()
     click.echo("=== Recommendation ===")

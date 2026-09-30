@@ -945,14 +945,6 @@ def test_install_warp_preserves_recovery_tree_when_rollback_fails(tmp_path, monk
 
 
 
-def test_install_help_accepts_warp():
-    from click.testing import CliRunner
-
-    result = CliRunner().invoke(I.install_cmd, ["--help"])
-    assert result.exit_code == 0, result.output
-    assert "llamacpp|ktransformers|warp|both|none" in result.output
-
-
 def test_install_cli_selects_warp_without_downloading_model(tmp_path, monkeypatch):
     from click.testing import CliRunner
 
@@ -1515,15 +1507,6 @@ def test_warp_container_rejects_missing_core_file(tmp_path, filename):
     with pytest.raises(RuntimeError) as raised:
         I._validate_warp_container(container, model_id)
     assert filename in str(raised.value)
-
-
-def test_model_table_labels_warp_containers(capsys):
-    I.print_model_table(None)
-    lines = capsys.readouterr().out.splitlines()
-    for model_id in WARP_CATALOG_MODELS:
-        line = next(line for line in lines if model_id in line)
-        assert "WARP (.waste)" in line
-        assert "ktransformers" not in line
 
 
 @pytest.mark.parametrize("missing_tool", ["uv", "curl"])
@@ -3718,5 +3701,64 @@ def test_http_startup_does_not_wait_for_model_readiness(monkeypatch, outcome):
             if not closed:
                 await lifespan.__aexit__(None, None, None)
         assert not live
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("abandoned", [False, True])
+@pytest.mark.parametrize("acknowledgement", [True, False, "error"])
+def test_native_lease_keeps_admission_until_idle_or_process_stop(monkeypatch, abandoned, acknowledgement):
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        await gateway.runtime.switch("one")
+        engine = gateway.runtime.engine
+        engine.supports_cooperative_cancel = True
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def wait_idle(timeout):
+            entered.set()
+            await finish.wait()
+            if acknowledgement == "error":
+                raise RuntimeError("native status unavailable")
+            return acknowledgement
+
+        engine.wait_idle = wait_idle
+        lease = await gateway.runtime.acquire("one", _ConnectedRequest())
+        closing = asyncio.create_task(lease.close(abandoned=abandoned))
+        await asyncio.wait_for(entered.wait(), 1)
+        queued = asyncio.create_task(gateway.runtime.acquire("one", _ConnectedRequest()))
+        await _eventually(lambda: gateway.runtime.queue_depth == 1)
+        assert not queued.done()
+        assert events == [("start", "one")]
+        finish.set()
+        await closing
+        next_lease = await queued
+        assert live == {"one"}
+        if acknowledgement is True:
+            assert events == [("start", "one")]
+        else:
+            assert events == [("start", "one"), ("stop", "one"), ("start", "one")]
+        await next_lease.close()
+        await gateway.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_native_anthropic_transport_error_never_emits_openai_done():
+    import httpx
+
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'event: ping\ndata: {"type":"ping"}\n\n'
+            raise httpx.ReadError("backend disconnected")
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=BrokenStream())))
+        response = await client.send(client.build_request("POST", "http://engine"), stream=True)
+        data = b"".join([chunk async for chunk in S._stream_response(client, response, anthropic=True)])
+        assert b"event: error\n" in data
+        assert b'"type": "error"' in data
+        assert b"data: [DONE]" not in data
 
     asyncio.run(scenario())

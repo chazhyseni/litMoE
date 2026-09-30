@@ -82,14 +82,16 @@ if directory.exists() and not marker.exists() and any(directory.iterdir()):
 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 marker.touch(mode=0o600)
 selector = 'litmoe/' + model
+native_reasoning = runtime.get('capabilities', {}).get('native_messages') is True
 provider = {'providers': {'litmoe': {
     'baseUrl': base + '/v1', 'api': 'openai-completions',
     'apiKey': 'LITMOE_API_KEY', 'auth': 'apiKey', 'authHeader': True,
     'models': [{'id': model, 'name': model + ' (litmoe)', 'input': ['text'],
+                'reasoning': native_reasoning,
                 'contextWindow': context, 'maxTokens': min(4096, context),
                 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
                 'compat': {'supportsStore': False, 'supportsDeveloperRole': False,
-                           'supportsReasoningEffort': False, 'maxTokensField': 'max_tokens'}}],
+                           'supportsReasoningEffort': native_reasoning, 'maxTokensField': 'max_tokens'}}],
 }}}
 roles = ('default', 'smol', 'slow', 'plan', 'commit', 'task', 'tiny', 'memory', 'advisor', 'judge', 'vision')
 settings = {

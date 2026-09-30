@@ -1,14 +1,17 @@
 # Methodology
 
-This document explains why litmoe is structured the way it is: a thin Python
-dispatcher over llama.cpp, ktransformers, and WARP, with no custom inference
-code.
+This document explains why litmoe is structured as a Python dispatcher over
+native inference engines. The gateway does not execute the forward pass;
+the WARP installer does apply a narrowly scoped native optimization patch.
 
-## The problem
+## The serving workflow
 
-Open MoE deployments span 17 GB GGUFs through 600 GB+ checkpoints and
-storage-paged `.waste` containers. Three engines cover different hardware and
-storage tradeoffs:
+litmoe's role is to make native engines usable as one managed local service.
+Model artifacts, hardware budgets, backend flags, process ownership, API
+formats, and agent configuration have to agree before a coding session works.
+Those are the integration responsibilities this project takes on.
+
+The shipped adapters cover different hardware and storage arrangements:
 
 1. **llama.cpp** — GGUF, every quant from 1.5 to 8 bit, CUDA/HIP/Metal/Vulkan/
    SYCL/CPU. The right tool from a 48 GB laptop up to a many-core server.
@@ -16,36 +19,37 @@ storage tradeoffs:
    experts on the CPU with AMX/AVX-512 kernels. The right tool for the
    200 GB–1 TB models on a single-GPU box with lots of RAM.
 3. **WARP** — local `.waste` containers whose expert weights are memory-mapped
-   and paged from fast local storage. The right tool when resident RAM is much
-   smaller than the container and internal NVMe can sustain the paging load.
+   and paged from fast local storage. It can run models whose complete weights
+   exceed resident RAM, but that capacity does not establish interactive
+   latency. The current GLM prefill and HTTP state-reset behavior are
+   documented limitations.
 
-None of these engines needs help with inference. What users lack is one
-endpoint, one config, sane defaults, and a way to point their agent harnesses
-at it without breaking those harnesses.
+Users need one endpoint, one config, correct protocol handling, and verified
+performance with their actual agent workloads. Backend support alone does not
+establish that performance; an inadequate execution path may need replacement.
 
-The previous version of litmoe tried to be its own inference engine: a custom
-CPU-only C99 forward pass. It was 0.019 t/s on a 24-core EPYC. The math:
+The design delegates model computation to upstream engines instead of making
+litmoe another inference implementation. Its contribution is the surrounding
+workflow: reproducible setup, explicit lifecycle decisions, isolated client
+configuration, correct supported protocol semantics, and measurements of the
+actual user-facing path. This boundary also makes backend replacement
+possible without asking every client to manage native processes itself.
 
-- 67 prompt tokens × 92 MoE layers × 16 experts = 98,496 expert lookups
-- Each expert is 17.55 MB; ~50% dedup = ~859 GB to read from disk
-- At 379 MB/s disk: 38 minutes minimum
-- 24 cores × ~50 ms per expert compute: 82 minutes compute floor
+## How litmoe uses upstream tools
 
-No software optimization closes a 1000x gap to mature inference runtimes.
-We tried AVX2 matmul, mmap, cross-layer prefetch, 2-bit quantization — all
-shipped but all irrelevant. The bandwidth doesn't exist.
+| Upstream component | What it supplies | What litmoe does around it |
+| --- | --- | --- |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) / GGML ecosystem | GGUF execution, quantization formats, hardware kernels, native server | Installs the runtime/artifact, fits context, supervises one server slot, routes requests |
+| [KTransformers](https://github.com/kvcache-ai/ktransformers) + [SGLang](https://github.com/sgl-project/sglang) | Heterogeneous CPU/GPU inference and serving | Configures the native serving stack and owns its process lifecycle |
+| [WARP](https://github.com/sqliteai/warp) | `.waste` conversion, expert paging, native inference and HTTP serving | Orchestrates pinned conversion, validates artifacts, applies its documented patch, plans context, supervises serving |
+| [DwarfStar](https://github.com/antirez/ds4), by antirez and contributors | Model-specific native GPU execution, expert streaming, state handling, and server | Installs pinned runtime/GGUF, patches native discovery/count/status contracts, routes native APIs, and supervises cancellation and lifecycle |
+| Model authors and artifact publishers | Trained weights, model/tokenizer metadata, quantized releases | Records source/artifact choices and installation recipes; does not claim authorship of the models |
 
-## What the dispatcher does instead
-
-The dispatcher acknowledges that other people have spent years building
-inference engines and uses them. Three open-source projects cover distinct
-deployment shapes:
-
-| Engine | Hardware / storage | Strength |
-|---|---|---|
-| **llama.cpp** | CUDA + HIP + Metal + Vulkan + SYCL + CPU | Mature cross-platform runtime, every quant format, every model tier |
-| **ktransformers** (Tsinghua MADSys Lab, SOSP 2025) — served via sglang-kt | CUDA GPU + AMX / AVX-512 / AVX2 CPU | Heterogeneous CPU+GPU MoE, expert offloading, INT4/INT8/FP8/RAWINT4 experts |
-| **WARP** | Supported local host with fast internal NVMe | `.waste` containers, low resident floor, storage-paged expert weights |
+Native engine features remain upstream work. DwarfStar's own acknowledgement
+of llama.cpp and GGML is part of that attribution chain; see
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). Project identity comes from
+the responsibilities litmoe implements, not from claiming those engines'
+algorithms or comparing itself against them.
 
 litmoe is the front door: a Python package that:
 
@@ -65,11 +69,13 @@ litmoe is the front door: a Python package that:
    upstream fetch/conversion scripts in a litmoe-owned session; validates the
    WARP v0 manifest and artifacts; and writes the absolute container path to
    the config.
-6. Connects agent harnesses (Claude Code, Hermes) **per process**, never by
+6. Connects agent harnesses (Claude Code, Hermes, OMP) **per process**, never by
    rewriting their global configuration.
 
-That's it. No custom forward pass, CUDA kernels, or quantizer. The WARP install
-path orchestrates upstream tooling; WARP owns conversion and inference.
+The gateway has no custom forward pass or quantizer. The WARP install path
+orchestrates upstream conversion and applies the bundled ARM Q4/prefill patch
+described in [ARCHITECTURE.md](ARCHITECTURE.md#native-prefill-optimization).
+Its measured 5.7% short-prefill improvement did not fix full-harness latency.
 
 For authenticated source fetches, litmoe puts `HF_TOKEN` in a private temporary
 curl config rather than child arguments or environment.
@@ -87,17 +93,21 @@ counter remains in the download log.
 
 ## Why a dispatcher is the right shape
 
-**Inference engines are mature.** ktransformers hit SOSP 2025 with a
-heterogeneous-expert scheduler; llama.cpp ships 1.5-bit to 8-bit quantization
-across every GPU vendor; WARP pages expert weights from local containers.
-The optimization space is enormous and competition between these engines is
-healthy. Reimplementing kernels or storage scheduling loses to them.
+**Reuse engines, but verify the model-specific path.** ktransformers supports
+heterogeneous CPU/GPU execution; llama.cpp offers broad quantization and
+hardware coverage; WARP pages experts from local containers. None of that
+proves fast prefill for a particular architecture. Prefer a measured upstream
+implementation over recreating an entire GPU graph in the gateway project.
+The [GLM replacement investigation](plans/2026-09-30-inference-redesign.md)
+therefore selects DwarfStar's existing model-specific Metal graph for integration
+instead of another substantial WARP rewrite. Real workload measurements remain
+the test of performance, not the existence of an adapter.
 
-**Engines already speak HTTP.** `llama-server`, `sglang.launch_server` (the
-ktransformers serving stack since v0.4), and WARP's upstream server expose
-OpenAI-compatible loopback services. The litmoe gateway is a pass-through plus
-an Anthropic translation layer; WARP is a local subprocess, not a remote
-inference API.
+**Engines already speak HTTP.** `ds4-server`, `llama-server`,
+`sglang.launch_server` (the ktransformers serving stack since v0.4), and
+WARP's upstream server expose local HTTP services. litmoe passes native
+protocols through where supported and adapts Anthropic to OpenAI on other
+backends. None of these subprocess integrations is a remote inference API.
 
 **Configuration is the hard part.** Users don't care which engine is running;
 they care which model responds, and that it is fast enough on the hardware
@@ -147,18 +157,12 @@ are not litmoe performance guarantees:
 | `glm-5.3-flash-warp` | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` | 306 GiB | 120 GiB | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
 | `deepseek-v4.1-flash-warp` | `dba1be0a40aa45a94ad051997016db3960a90277` | 475 GiB | 310 GiB | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
-WARP's published throughput assumes internal NVMe. This repository's current
-persistent disk is not equivalent. There are no prebuilt `.waste` release
-assets for these models. litmoe installs WARP runtime commit
-`09fcff352ca55223b08ee222d15054b90546c6a9` and orchestrates the pinned upstream
-pipeline; it does not supply a quantizer.
+WARP's published throughput assumes internal NVMe and is hardware-specific.
+There are no prebuilt `.waste` release assets for these models. litmoe installs
+WARP runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9` with its bundled
+native patch and orchestrates the pinned upstream pipeline; it does not supply
+a quantizer.
 
-The C engine was ~45x slower than llama.cpp on the same Kimi-K3 weights
-(0.019 vs the 0.85 t/s llama.cpp reached in Aug 2026, recorded in commit
-`cd9e97e`/`21819c5`; that llama.cpp log was later overwritten, so the K3
-figure comes from the commit history rather than a shipped log). The gap to
-GPU serving is 100–1000x. There is no path from a custom C engine to
-interactive inference on this VM.
 
 ## What you get
 

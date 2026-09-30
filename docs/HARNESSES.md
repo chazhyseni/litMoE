@@ -49,14 +49,22 @@ Disconnecting a queued client removes its wait without dispatching inference.
 For accepted WARP chat streams, cancellation closes the upstream connection:
 the native token callback stops generation without reloading the engine.
 This does not interrupt prefill immediately. Blocking WARP requests, raw
-completions, and other adapters still terminate the owned process on active
+completions, and non-cooperative adapters terminate the owned process on active
 cancellation; the next request reloads the selected model.
+
+DwarfStar closes the upstream connection, then waits for native work and its
+queue to become idle before releasing admission. This also covers apparent
+normal EOF after a transport failure. Confirmed quiescence preserves the
+process; failure or the 10-second deadline stops it and resets live cache.
+Cancellation is checked between native prefill chunks, not instantaneously.
 
 WARP reports no reusable prompt cache: the pinned server resets state for each
 HTTP request. Its expert-weight cache is not a conversation-prefix cache.
 llama.cpp may retain a prefix in its single backend slot; this is backend
 capability, not a claim that a particular request hit cache. Switches and
-cancellation clear it. No hidden prompt pruning or gateway cloud fallback.
+cancellation clear llama.cpp's live state. DwarfStar owns its native live and
+disk prefix cache; artifact/runtime-separated disk namespaces retain the
+native strict-quant guard. No hidden prompt pruning or gateway cloud fallback.
 
 ## Claude Code
 
@@ -106,6 +114,41 @@ afterwards plain `claude auth status` still showed the Enterprise login and the
 shell had no `ANTHROPIC_*` / `CLAUDE_*` variables. Claude Code prints a
 one-line `[claude-code:unrecognized_model]` notice on stderr for non-Anthropic
 model ids; it is harmless.
+
+### MCP tool loading and large greetings
+
+[Claude Code disables tool search by default for custom API endpoints](https://code.claude.com/docs/en/mcp#scale-with-mcp-tool-search)
+because many proxies do not support typed tool references. In a fresh
+print-mode request from this project's launcher, a greeting carried 376 tool
+schemas, including 353 Claude Flow MCP tools. Existing gateway translation
+and native WARP tokenization produced **84,442 tokens**; tokenization itself
+took approximately 27 ms.
+
+A request-only capture with `ENABLE_TOOL_SEARCH=true` reduced that to
+**15,482 tokens**, retaining thinking and the discovery catalog. The capture
+deliberately returned HTTP 400 without inference. It did **not** establish a
+working search/call/result loop or DwarfStar token counts.
+
+The DwarfStar path now forwards native Anthropic requests and SSE without
+the lossy OpenAI translation. Its patch resolves `tool_reference` blocks
+(`name` or `tool_name`) from the request's tool catalog, leaves deferred
+schemas out of the eager tool header, and rejects unresolved references.
+`claude-local` checks the ready runtime's capabilities and enables
+`ENABLE_TOOL_SEARCH=true` only for this supported path. Other backends retain
+`false`; this never changes global Claude configuration.
+
+Native count requests use the backend renderer/tokenizer without generation.
+Legacy counts remain estimates, marked `x-litmoe-token-count: estimated`.
+Native reasoning controls remain native; forced tool choice (`any` or a
+named tool) is explicitly rejected rather than silently treated as `auto`.
+`auto` and `none` work. The catalog recipe does not install a vision encoder.
+The legacy translator still has feature limitations; native support is not a
+claim that every backend supports every Anthropic request.
+
+OMP uses DwarfStar's native OpenAI endpoint through the gateway. Its isolated
+provider enables reasoning-effort controls when native capability is present.
+These protocol changes are separate from the [real-client verification record](measurements/README.md)
+and the historical full-OMP timeout below.
 
 ### What NOT to do
 
@@ -306,7 +349,9 @@ tokens divided by total response time is not decode-only speed. Record exact
 model artifact/quantization and backend build separately; the report does not
 fingerprint weights or binaries. Also record the Mac chip, macOS, memory
 pressure, swap, disk I/O, and native prefill/decode/cache statistics before
-choosing WARP versus an equivalent llama.cpp/Metal or MLX candidate.
+interpreting results. DwarfStar is now an implemented integration; real-model
+latency and actual client-loop success still require separate evidence.
+Do not substitute its published DeepSeek throughput for GLM-5.3-Flash results.
 
 ## Checklist before you say "it's broken"
 

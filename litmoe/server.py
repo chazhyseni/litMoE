@@ -325,25 +325,13 @@ class Gateway:
 
         @self.app.post("/v1/messages")
         async def messages(request: Request):
-            """Anthropic Messages API → forward to OpenAI Chat Completions."""
+            """Use native Messages when supported; otherwise translate to OpenAI."""
             return await self._proxy(request, "messages", anthropic=True)
 
         @self.app.post("/v1/messages/count_tokens")
         async def count_tokens(request: Request):
-            """Anthropic token-count endpoint (Claude Code calls it before requests).
-
-            Engines expose no cross-model tokenizer, so this returns an estimate
-            (~4 characters per token over the serialized prompt).
-            """
-            self._check_api_key(request)
-            body = await request.body()
-            try:
-                payload = json.loads(body) if body else {}
-            except json.JSONDecodeError:
-                raise HTTPException(400, "invalid JSON body")
-            text = json.dumps(payload.get("system", "")) + json.dumps(payload.get("messages", []))
-            text += json.dumps(payload.get("tools", []))
-            return {"input_tokens": max(1, len(text) // 4)}
+            """Native exact rendered counts, or explicitly marked legacy estimates."""
+            return await self._proxy(request, "messages/count_tokens")
 
     def _check_api_key(self, request: Request) -> None:
         if not self.config.api_key:
@@ -401,13 +389,23 @@ class Gateway:
     async def _forward(self, payload: dict, endpoint: str, anthropic: bool, lease):
         model_id = payload["model"]
         model, engine = self._resolve(model_id)
+        native_messages = getattr(engine, "supports_native_messages", False)
+        if endpoint == "messages/count_tokens" and not native_messages:
+            text = json.dumps(payload.get("system", "")) + json.dumps(payload.get("messages", []))
+            text += json.dumps(payload.get("tools", []))
+            return JSONResponse(
+                content={"input_tokens": max(1, len(text) // 4)},
+                headers={"x-litmoe-token-count": "estimated"},
+            )
+        native_anthropic = anthropic and native_messages
+        anthropic = anthropic and not native_anthropic
         if anthropic:
             payload = _anthropic_to_openai(payload)
             endpoint = "chat/completions"
         target_url = f"{engine.base_url}/v1/{endpoint}"
         payload["model"] = model.id
         send_body = json.dumps(payload).encode()
-        stream = bool(payload.get("stream", False))
+        stream = bool(payload.get("stream", False)) and endpoint != "messages/count_tokens"
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
         logger.info("%s: %s request, %s payload bytes%s", model.id, endpoint,
                     f"{len(send_body):,}", " (stream)" if stream else "")
@@ -440,10 +438,10 @@ class Gateway:
             if model.engine == "warp" and endpoint == "chat/completions":
                 lease.restart_on_abandon = False
             iterator = (_stream_anthropic_response(client, response, model_id) if anthropic
-                        else _stream_response(client, response))
+                        else _stream_response(client, response, anthropic=native_anthropic))
             return LeasedStream(iterator, lease, client, response)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 response = await client.post(target_url, content=send_body, headers=headers)
         except httpx.RequestError as exc:
             raise HTTPException(502, f"engine for {model.id} unreachable: {exc}")
@@ -480,7 +478,7 @@ class Gateway:
             "max_tokens": 4,
         }
         try:
-            async with httpx.AsyncClient(timeout=600.0) as client:
+            async with httpx.AsyncClient(timeout=600.0, trust_env=False) as client:
                 response = await client.post(
                     f"{engine.base_url}/v1/chat/completions",
                     json=payload,
@@ -581,7 +579,7 @@ async def _connect_stream(url: str, body: bytes, timeout: httpx.Timeout,
     The caller inspects the status before deciding whether to stream, and owns
     closing both. Raises httpx.RequestError if the engine is unreachable.
     """
-    client = httpx.AsyncClient(timeout=timeout)
+    client = httpx.AsyncClient(timeout=timeout, trust_env=False)
     try:
         req = client.build_request("POST", url, content=body, headers=headers)
         r = await client.send(req, stream=True)
@@ -609,7 +607,7 @@ def _upstream_error_message(raw: bytes) -> str:
     return json.dumps(data)[:500]
 
 
-async def _stream_response(client: httpx.AsyncClient, r: httpx.Response):
+async def _stream_response(client: httpx.AsyncClient, r: httpx.Response, *, anthropic: bool = False):
     """Relay an already-open upstream SSE response byte for byte.
 
     Raw passthrough (aiter_bytes) preserves llama-server's exact SSE framing;
@@ -621,9 +619,13 @@ async def _stream_response(client: httpx.AsyncClient, r: httpx.Response):
             yield chunk
     except httpx.RequestError as e:
         logger.error("Stream error: %s", e)
-        error_data = {"error": {"message": str(e), "type": "connection_error"}}
-        yield f"data: {json.dumps(error_data)}\n\n".encode()
-        yield b"data: [DONE]\n\n"
+        error_data = {"error": {"message": str(e), "type": "api_error" if anthropic else "connection_error"}}
+        if anthropic:
+            error_data["type"] = "error"
+            yield f"event: error\ndata: {json.dumps(error_data)}\n\n".encode()
+        else:
+            yield f"data: {json.dumps(error_data)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
     finally:
         await r.aclose()
         await client.aclose()

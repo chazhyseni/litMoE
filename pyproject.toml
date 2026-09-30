@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "litmoe"
 version = "0.2.0"
-description = "OpenAI- and Anthropic-compatible gateway for llama.cpp, ktransformers, and WARP. Fast local MoE inference from laptops to servers."
+description = "Local OpenAI- and Anthropic-compatible serving for DwarfStar, llama.cpp, ktransformers, and WARP."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
     {name = "Chaz Hyseni", email = "chaz.hyseni@gmail.com"},
 ]
-keywords = ["llm", "moe", "gemma-4", "qwen3.6", "gpt-oss", "kimi-k3", "ktransformers", "llama.cpp", "warp", "waste", "inference", "openai-api", "anthropic-api"]
+keywords = ["llm", "moe", "gemma-4", "qwen3.6", "gpt-oss", "kimi-k3", "ktransformers", "llama.cpp", "dwarfstar", "warp", "waste", "inference", "openai-api", "anthropic-api"]
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.6",
