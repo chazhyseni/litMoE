@@ -7,35 +7,56 @@ in those documents are separately attributed and are not measured by these
 logs. Extract the local timing lines with:
 
 ```bash
-grep -oE "eval time =.*tokens per second" docs/measurements/*.log
+grep -E '\|[[:space:]]+eval time =' docs/measurements/*.log
 grep -oE "n_threads = [0-9]+" docs/measurements/*.log
 ```
 
-All runs: one machine — AMD EPYC 7B13, 24 physical cores / 48 threads, AVX2
-only (no AVX-512, no AMX), DDR4-3200, Google Cloud persistent disk
-(~400 MB/s), no GPU, llama.cpp CPU build. Home directory paths are replaced
-with `~`.
+These four logs are the only retained measurement provenance in the
+repository. The machine metadata used elsewhere in the docs — AMD EPYC 7B13,
+24 physical cores / 48 threads, AVX2 only (no AVX-512, no AMX), DDR4-3200, a
+Google Cloud persistent disk, no GPU, llama.cpp CPU build — is recorded project
+setup, not something these logs establish; the logs themselves only record
+that no usable GPU was found. Only the Gemma log carries its own dated session
+headers (2026-09-16); the other three logs carry no date. Home directory paths
+are replaced with `~`.
 
-| Log | Model / quant | Date | Threads | Generation t/s (all requests, in order) |
-|---|---|---|---|---|
-| `gemma-4-26b-a4b.log` | Gemma-4-26B-A4B-it UD-Q4_K_XL (17 GB), `--mmproj` loaded | 2026-09-16 | 24 | 4.3, 1.6, 2.2, 2.0, 5.6, 9.0, 10.6, 11.6, 4.6, 10.2, 10.5, 12.7 |
-| `qwen3.8-9b-distill.log` | Qwen3.8-9B-Distill Q4_K_M (6 GB) | 2026-09-01 | 8 | 8.3, 8.5 |
-| `kimi-linear-48b.log` | Kimi-Linear-48B-A3B Q4_K_M (30 GB) | 2026-08-20 | 48 | 0.44, 0.42, 0.58, 0.05, 0.45, 0.03, … |
-| `deepseek-v4-flash.log` | DeepSeek-V4-Flash-0731 UD-IQ1_S (83 GB) | 2026-08-20 | 48 | 0.33, 0.34, 0.32, 0.11 |
+| Log | Model / quant | Threads | Generation t/s (completed timing records, in log order) |
+|---|---|---|---|
+| `gemma-4-26b-a4b.log` | Gemma-4-26B-A4B-it UD-Q4_K_XL (17 GB), `--mmproj` loaded | 24 | 4.29, 1.56, 2.15, 2.02, 5.59, 9.03, 10.62, 11.62, 4.61, 10.21, 10.50, 12.68 |
+| `qwen3.8-9b-distill.log` | Qwen3.8-9B-Distill Q4_K_M (6 GB) | 8 | 8.33, 8.48 |
+| `kimi-linear-48b.log` | Kimi-Linear-48B-A3B Q4_K_M (30 GB) | 48 | 0.03, 0.03, 0.05, 0.42, 0.44, 0.58, 0.45 |
+| `deepseek-v4-flash.log` | DeepSeek-V4-Flash-0731 UD-IQ1_S (83 GB) | 48 | 0.32, 0.34, 0.33, 0.11 |
 
-How to read the gemma sequence: the engine was restarted seven times during
-the end-to-end test session (seven `===== litmoe session` headers), so the
-dips (1.6, 2.0, 4.6) are the first requests after a restart while the 17 GB
-of weights were still being paged in from disk; the plateau once resident is
-9–12.7 t/s. Requests were short (5–974 prompt tokens), so prompt-eval numbers
-(4–34 t/s) are dominated by per-request overhead and are not a useful
-prompt-processing benchmark.
+Each value is the `eval time` line of one request that ran to completion, in
+the order the lines appear. A request canceled mid-generation logs
+`stop: cancel task` and no `eval time` line, so it does not appear: the Gemma
+log has no cancellations, while the Qwen, Kimi-Linear, and DeepSeek logs have
+1, 4, and 4 respectively.
 
-The Kimi-Linear and V4-Flash runs used 48 threads on 24 physical cores (SMT
-oversubscription, since fixed — litmoe now defaults to physical cores) and,
-more importantly, never had their expert weights resident: 30 GB on a machine
-that was also holding other models, and 83 GB with a cold page cache. Their
-numbers measure the disk, not the models.
+Thread counts differ (8, 24, 48). The Kimi-Linear and DeepSeek runs used 48
+threads on the 24-physical-core machine. All four servers were configured with
+four slots, and some logs show more than one request in flight, so concurrency
+is not the same in every run. Each figure is a per-request generation (decode)
+rate and excludes prompt processing, so it is not full-response throughput.
+
+What the logs do not contain: resident memory, page-cache state, disk
+throughput, or other processes on the machine. The spread between requests
+within one log therefore cannot be attributed to a particular cause. Prompt
+sizes also varied — 5–974 prompt tokens in the Gemma log — so the
+`prompt eval time` lines are not a controlled prefill benchmark.
+
+## Gemma session headers
+
+`gemma-4-26b-a4b.log` contains seven `===== litmoe session` headers. One of
+them (2026-09-16 18:02:42) failed to bind port 8081 and served no requests, and
+four others loaded the model but served no request. The twelve completed
+records come from the first session (17:41:08) and the last (18:22:12); the
+last session used `-c 32768` where the first used `-c 262144`. Within the first
+session the low values 1.56 and 2.02 are the second and fourth requests, not
+first requests after a restart.
+
+The DeepSeek log is truncated: it ends on a `prompt processing` line for a
+later request, with no completion and no shutdown line.
 
 Not included: the Aug-2026 Kimi-K3 (0.85 t/s) and Qwen3.8-9B (0.69 t/s at 48
 threads) runs cited in earlier revisions of SETUP.md. Those log files were

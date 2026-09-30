@@ -4,7 +4,7 @@
 #
 # Gateway listens on 8000 inside the compose network; the host sees it on
 # 127.0.0.1:8000 only (no auth by default → never expose to the LAN).
-# Open WebUI is published on :8080.
+# Open WebUI is published on all host interfaces at :8080 with authentication disabled.
 
 host: 0.0.0.0
 port: 8000
@@ -24,11 +24,11 @@ models:
       - claude-haiku-4-5
       - claude-opus-4-1
 
-  # Qwen3.6-35B-A3B — 3B active; strong coding. 22 GB.
+  # Qwen3.6-35B-A3B — MoE, 3B active, 256K ctx. 22 GB.
   # - id: qwen3.6-35b-a3b
   #   engine: llamacpp
   #   model_path: /models/qwen3.6-35b-a3b/UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
   #   n_gpu_layers: 0
   #   n_ctx: 262144
 
-  # Empty list = gateway starts with no models loaded.
+  # At least one model is required by `litmoe serve`.

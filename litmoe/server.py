@@ -484,7 +484,7 @@ class Gateway:
                     json=payload,
                 )
             logger.info("warmup %s: status %s", model.id, response.status_code)
-        except Exception as exc:  # warmup is best-effort; serving still works
+        except Exception as exc:  # warmup failure does not abort gateway startup
             logger.warning("warmup %s skipped: %s", model.id, exc)
 
     def _start_engine(self, model: ModelEntry) -> Engine:

@@ -70,7 +70,7 @@ Acceptance: deterministic timing edge tests; HTTP and stream errors remain error
 
 ## 5. Integration evidence and publication
 
-All permanent tests stay in `tests/test_litmoe.py`. Add behavioral regressions for lifecycle boundaries, cancellation, and metric semantics rather than launcher-string or mock-forwarding assertions. Writing workers do not run builds/tests during integration; the integration owner runs focused checks and the full suite afterward.
+All permanent tests stay in `tests/test_litmoe.py`. Add behavioral regressions for lifecycle boundaries, cancellation, and metric semantics rather than launcher-string or mock-forwarding assertions.
 
 Verification:
 
@@ -79,6 +79,6 @@ Verification:
 - `bash -n scripts/claude-local scripts/hermes-local scripts/omp-local`
 - Real HTTP SDK streaming through pinned WARP with synthetic weights, explicitly labelled as protocol-only evidence.
 - Real launcher/client checks for Claude Code, Hermes, and OMP where installed, using isolated configurations and bounded executions. Report bootstrap/runtime blockers rather than replacing them with mocked success.
-- Target-Mac benchmarks with real weights are required before choosing a faster backend or claiming a latency improvement. No Mac access is currently available in this environment.
+- Target-Mac benchmarks with real weights are required before choosing a faster backend or claiming a latency improvement.
 
 Update existing architecture, setup, and harness documentation to match shipped behavior. Remove temporary smoke artifacts. Publish only exercised correctness claims; distinguish those from unmeasured performance outcomes.

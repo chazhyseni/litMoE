@@ -24,7 +24,7 @@
   <rect x="80" y="120" width="1240" height="80" rx="12" fill="#0d2818" stroke="#2ea043" stroke-width="2"/>
   <text x="700" y="155" text-anchor="middle" class="section-title">Clients</text>
   <text x="700" y="180" text-anchor="middle" class="box-text">
-    Hermes Agent · Claude Code · OMP · Open WebUI · aider · curl · Python · any OpenAI/Anthropic SDK
+    Hermes Agent · Claude Code · OMP · Open WebUI · aider · curl · Python · OpenAI/Anthropic SDKs
   </text>
 
   <!-- Vertical arrow down to gateway -->
@@ -149,7 +149,7 @@
 
   <g font-family="SF Mono, Monaco, Consolas, monospace" font-size="13" fill="#c9d1d9">
     <text x="110" y="1075">host: 127.0.0.1</text>
-    <text x="110" y="1096">port: 8080</text>
+    <text x="110" y="1096">port: 8090</text>
     <text x="110" y="1117">models:</text>
     <text x="130" y="1138">- id: glm-5.3-flash-dwarfstar</text>
     <text x="160" y="1159">engine: dwarfstar</text>
@@ -168,7 +168,7 @@
     <text x="750" y="1117">litmoe install --engine dwarfstar  # runtime only</text>
     <text x="750" y="1138">litmoe install --model ID  # all-engine catalog</text>
     <text x="750" y="1159">litmoe serve ID            # one resident engine</text>
-    <text x="750" y="1180">litmoe status              # poll /health</text>
+    <text x="750" y="1180">litmoe status              # resident state + context</text>
     <text x="750" y="1201">litmoe stop                # stop litmoe-started engines</text>
     <text x="750" y="1222">litmoe models              # pinned recipes + catalog</text>
   </g>

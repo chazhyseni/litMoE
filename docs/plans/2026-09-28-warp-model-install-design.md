@@ -1,5 +1,7 @@
 # WARP Model Installation Parity Design
 
+> **Archived planning record.** This is retained for design history, not as current operating instructions. Shipped behavior is documented in [SETUP](../SETUP.md), [ARCHITECTURE](../ARCHITECTURE.md), and [HARNESSES](../HARNESSES.md).
+
 > Context correction (2026-09-29): the zero-context policy below is historical and superseded. WARP installs now write `n_ctx: 0` with `warp_auto_context: true`; startup fits native context using WARP's planner and persists both the result and policy. A positive `--n-ctx` selects fixed mode. Unmarked legacy 0/65536 entries migrate to auto. WARP remains excluded from llama.cpp's full-weight fitter; see [SETUP](../SETUP.md).
 
 ## Goal
@@ -22,7 +24,7 @@ WARP v0.8.1 at commit `09fcff352ca55223b08ee222d15054b90546c6a9` supports both t
 | GLM-5.3-Flash | `zai-org/GLM-5.3-Flash` | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` | 306 GiB | 112 GB |
 | DeepSeek-V4.1-Flash | `deepseek-ai/DeepSeek-V4.1-Flash` | `dba1be0a40aa45a94ad051997016db3960a90277` | 475 GiB | 299 GiB |
 
-The pinned upstream `tools/pipeline.sh` expects `model.safetensors.index.json` to exist before its download loop. litMoE will first invoke `tools/fetch_weights.sh --dry-run` with the pinned source revision, which seeds and checks the index without downloading shards, then invoke the upstream pipeline.
+The pinned upstream `tools/pipeline.sh` expects `model.safetensors.index.json` to exist before its download loop. litMoE runs upstream `tools/fetch_weights.sh` with the pinned source revision and destination to perform the full shard download, then invokes `tools/pipeline.sh`; the fetch stage is skipped only when the staging directory's reclaim ledger proves every expected shard was downloaded and subsequently reclaimed.
 
 ## Catalog model
 
@@ -46,14 +48,14 @@ Catalog validation rejects a WARP entry missing conversion metadata and continue
 The existing positional and `--model` forms both resolve the new catalog IDs. WARP model installation follows this sequence:
 
 1. Resolve the model and output paths. The default output is `<models-dir>/<model-id>.waste`; the default staging root is `<models-dir>/.staging`, with one model-specific child directory.
-2. Require `git`, `make`, `bash`, and `uv` before network or large writes. `HF_TOKEN` passes through to upstream tooling without logging.
+2. Require `git` and `make` for runtime installation, and `bash`, `uv`, and `curl` for conversion. `HF_TOKEN` is not propagated in the child environment: when set, it is written to a private temporary curl config (`0600` inside a `0700` directory) exposed through `CURL_HOME`, and the token is redacted from failure output.
 3. Preflight source and output storage with `shutil.disk_usage`. When both paths share a filesystem, require their combined peak size; otherwise validate each filesystem separately. Account for resumable bytes already present.
 4. Report immutable source revision, source size, output size, paths, and destructive reclaim behavior before confirmation.
 5. Install or refresh the pinned WARP runtime using the existing transactional installer.
-6. Run `fetch_weights.sh --dry-run --repo ... --revision ... --dest ...` to seed the source index and execute upstream download preflight.
-7. Run `pipeline.sh` with an explicit environment: `MODEL`, `REPO`, `REVISION`, `SRC`, `OUT`, `JOBS`, `RECLAIM`, and a report directory beside the output.
+6. Run `bash tools/fetch_weights.sh` with `REPO`, `REVISION`, and `DEST` supplied through the environment to download the pinned source shards (skipped when the reclaim ledger proves all shards were downloaded and reclaimed).
+7. Run `bash tools/pipeline.sh` with `MODEL`, `REPO`, `REVISION`, `SRC`, `DEST`, `OUT`, `JOBS`, `RECLAIM`, `RUN_DIR`, and `MIN_FREE_GB` in the environment. `RUN_DIR` points to the report directory beside the output.
 8. Validate required container artifacts after the upstream pipeline succeeds.
-9. Write or replace the model entry in `models.yaml` with `engine: warp`, an absolute container path, and `n_ctx: 0`.
+9. Write or replace the model entry in `models.yaml` with `engine: warp`, an absolute container path, and either automatic sizing (`n_ctx: 0`, `warp_auto_context: true`) or a positive fixed `n_ctx` with `warp_auto_context: false`.
 
 New options:
 
@@ -73,7 +75,7 @@ Errors name the failed upstream stage and retain the exact paths needed to resum
 
 ## Serving behavior
 
-WARP containers intentionally use `n_ctx: 0`, which tells the adapter to preserve the container/runtime default. The generic server context fitter must not rewrite this value for WARP models.
+WARP models register with `n_ctx: 0` and `warp_auto_context: true`; at serve preparation the runtime fits a positive native context window with WARP's memory planner and persists the resolved window alongside that policy. A positive `--n-ctx` registers fixed mode (`warp_auto_context: false`), which preserves the chosen limit. llama.cpp's generic full-weight fitter does not apply to WARP entries.
 
 Existing manually configured `.waste` containers remain supported. llama.cpp and ktransformers installation behavior remains unchanged.
 
@@ -89,7 +91,7 @@ Automated tests use fake upstream executables and tiny synthetic artifact trees;
 - successful registration only after required artifacts exist;
 - failure preservation and non-mutation of config;
 - resume-compatible paths and explicit reclaim forwarding;
-- `n_ctx: 0` preservation during serve preparation;
+- automatic native-context fitting at serve preparation for WARP entries, with fixed positive `n_ctx` honoured;
 - help text, docs, and examples.
 
-A local smoke test exercises the installer against fake WARP tooling and the real CLI. The full test suite and Python compilation run before commit and push.
+A local smoke test exercises the installer against fake WARP tooling and the real CLI.

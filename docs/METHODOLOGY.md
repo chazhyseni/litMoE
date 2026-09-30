@@ -2,7 +2,7 @@
 
 This document explains why litmoe is structured as a Python dispatcher over
 native inference engines. The gateway does not execute the forward pass;
-the WARP installer does apply a narrowly scoped native optimization patch.
+it applies documented WARP optimization and DwarfStar serving-contract patches.
 
 ## The serving workflow
 
@@ -23,6 +23,10 @@ The shipped adapters cover different hardware and storage arrangements:
    exceed resident RAM, but that capacity does not establish interactive
    latency. The current GLM prefill and HTTP state-reset behavior are
    documented limitations.
+4. **DwarfStar** — the managed Apple Silicon GLM path uses its native Metal
+   graph and SSD-streamed GGUF experts. Native Anthropic/OpenAI routing,
+   deferred references, token counts, and acknowledged quiescence are
+   integrated; real-model/client latency remains a separate verification step.
 
 Users need one endpoint, one config, correct protocol handling, and verified
 performance with their actual agent workloads. Backend support alone does not
@@ -51,16 +55,19 @@ of llama.cpp and GGML is part of that attribution chain; see
 the responsibilities litmoe implements, not from claiming those engines'
 algorithms or comparing itself against them.
 
-litmoe is the front door: a Python package that:
+The gateway:
 
-1. Reads a `models.yaml` config; ships RAM-tiered download choices plus pinned
-   WARP conversion recipes, while `litmoe init` picks a fast default for this
-   machine.
-2. Starts the chosen engine as a subprocess (`llama-server`,
+1. Reads a `models.yaml` config; ships RAM-tiered download choices, a pinned
+   DwarfStar streaming GGUF, and WARP conversion recipes. `litmoe init`
+   chooses a default using its RAM-fit estimate.
+2. Starts the chosen engine as a subprocess (`ds4-server`, `llama-server`,
    `python -m sglang.launch_server`, or WARP's upstream `serve/__main__.py`),
    supervises it, and stops it cleanly.
-3. Exposes a single OpenAI + Anthropic-compatible API on 127.0.0.1:8090.
-4. Routes requests to the right engine by model name or alias.
+3. Exposes one OpenAI- and Anthropic-compatible API. `litmoe init` writes
+   `host: 127.0.0.1`; when `host` is omitted, the schema default is `0.0.0.0`.
+   One model is resident at a time.
+4. Resolves the active model's name or alias and rejects inactive selections
+   until the operator explicitly switches models.
 5. For the two catalog WARP models, resolves pinned source and runtime
    revisions; rejects source or output paths containing a backslash, single
    quote, newline, or carriage return; requires source, output, and run/report
@@ -77,11 +84,11 @@ orchestrates upstream conversion and applies the bundled ARM Q4/prefill patch
 described in [ARCHITECTURE.md](ARCHITECTURE.md#native-prefill-optimization).
 Its measured 5.7% short-prefill improvement did not fix full-harness latency.
 
-For authenticated source fetches, litmoe puts `HF_TOKEN` in a private temporary
-curl config rather than child arguments or environment.
+For authenticated WARP source fetches, litmoe puts `HF_TOKEN` in a private
+temporary curl config rather than child arguments or environment.
 
-The CLI owns every stage process group it starts: an interrupt stops the whole
-download/conversion tree, and a concurrent install of the same model is
+The WARP conversion CLI owns every stage process group it starts: an interrupt
+stops the whole download/conversion tree, and a concurrent install of the same model is
 refused. Resuming the same command continues from the on-disk shard ledger —
 nothing already downloaded is refetched.
 
@@ -109,9 +116,7 @@ WARP's upstream server expose local HTTP services. litmoe passes native
 protocols through where supported and adapts Anthropic to OpenAI on other
 backends. None of these subprocess integrations is a remote inference API.
 
-**Configuration is the hard part.** Users don't care which engine is running;
-they care which model responds, and that it is fast enough on the hardware
-they have. The dispatcher lets one `models.yaml` mix engines:
+**Configuration spans engines.** One `models.yaml` can contain:
 gemma-4-26b-a4b → llama.cpp on a laptop, glm-5.3-flash → sglang-kt on a GPU
 server, or glm-5.3-flash-warp → a local `.waste` container. The downloadable
 entries encode what fits where so the default is never a 594 GB download on a
@@ -119,55 +124,66 @@ entries encode what fits where so the default is never a 594 GB download on a
 with explicit source, workspace, and output sizes; manually configured
 `.waste` paths remain valid.
 
-**Defaults must be fast, not just fit.** A 9B dense model and a 26B MoE with
-4B active both ran at 8–13 t/s on an AVX2 DDR4 box — same speed class, but
-the MoE is a far stronger model (and multimodal). Speed on CPU tracks *active*
-parameters, so small-active MoEs are the laptop tier; dense models and big
-MoEs are listed, not defaulted.
-
-**Inference is hardware-bound, not software-bound.** The previous "optimization"
-work (cross-layer prefetch, 2-bit quantization, mmap advisor, fused matmul)
-was a series of single-digit-percent improvements on a fundamentally
-bandwidth-limited problem. The dispatcher makes that work unnecessary: pick
-the right engine for the hardware and let it do what it's good at.
+**Defaults must fit before they are fast.** The tier list groups entries by
+active parameters per token, a proxy for CPU generation speed, and records the
+storage and RAM each entry needs; `litmoe init` chooses among entries that fit
+this machine. Dense models and big MoEs are listed, not defaulted.
 
 ## What was measured
 
-Hardware: AMD EPYC 7B13 (24 physical cores, AVX2 only, 377–406 GB DDR4-3200,
-no GPU, Google Cloud PersistentDisk at ~379 MB/s random / ~778 MB/s
-sequential read). Raw logs: [`docs/measurements/`](measurements/README.md).
+The local llama.cpp rows below are litmoe measurements: each value is a
+generation (`eval time`) line in one of the four retained `llama-server` logs
+under [`docs/measurements/`](measurements/README.md). That directory documents
+the exact per-request values, the grep commands, and what the logs do and do
+not record. Values are requests that ran to completion; requests canceled
+mid-generation produce no timing line and are not listed. The upstream WARP
+figures further down are quoted from upstream and are not in these logs.
 
-| Engine | Model | Threads | Tokens/sec | Notes |
+| Engine | Model | Threads | Tokens/sec (completed records) | Log |
 |---|---|---|---|---|
-| Previous C99 AVX2 forward pass | Kimi-K3 | 24 | 0.019 | 158s TTFT for 4-token prompt; thread stuck in DISK SLEEP (Aug 2026, log not retained) |
-| llama.cpp | Gemma-4-26B-A4B UD-Q4_K_XL (17 GB) | 24 | 9.0–12.7 resident; 1.6–4.6 while paging in | 2026-09-16, `gemma-4-26b-a4b.log` |
-| llama.cpp | Qwen3.8-9B dense Q4_K_M (6 GB) | 8 | 8.3–8.5 | 2026-09-01, `qwen3.8-9b-distill.log` |
-| llama.cpp | Kimi-Linear-48B-A3B Q4_K_M (30 GB) | 48 | 0.03–0.58 | disk-bound, `kimi-linear-48b.log` |
-| llama.cpp | DeepSeek-V4-Flash UD-IQ1_S (83 GB) | 48 | 0.11–0.34 | disk-bound, `deepseek-v4-flash.log` |
-| ktransformers sglang-kt | large MoEs, GPU attention + CPU experts | — | 5–50 typical | upstream tutorials; needs a CUDA GPU, not measured here |
+| llama.cpp | Gemma-4-26B-A4B-it UD-Q4_K_XL (17 GB), `--mmproj` loaded | 24 | 4.29, 1.56, 2.15, 2.02, 5.59, 9.03, 10.62, 11.62, 4.61, 10.21, 10.50, 12.68 | `gemma-4-26b-a4b.log` |
+| llama.cpp | Qwen3.8-9B-Distill Q4_K_M (6 GB) | 8 | 8.33, 8.48 | `qwen3.8-9b-distill.log` |
+| llama.cpp | Kimi-Linear-48B-A3B Q4_K_M (30 GB) | 48 | 0.03, 0.03, 0.05, 0.42, 0.44, 0.58, 0.45 | `kimi-linear-48b.log` |
+| llama.cpp | DeepSeek-V4-Flash-0731 UD-IQ1_S (83 GB) | 48 | 0.32, 0.34, 0.33, 0.11 | `deepseek-v4-flash.log` |
 
+These runs differ in thread count (8, 24, 48), and the servers were configured
+with four slots. The logs record per-request prompt and generation timings plus
+server events (model loads, session headers, cancellations); they contain no
+memory-residency, page-cache, disk-throughput, or competing-process data, so
+the spread between requests in one log cannot be attributed to a specific
+cause. Prompt sizes varied (5–974 prompt tokens in the Gemma log), so the
+`prompt eval time` lines are not a controlled prefill benchmark. There is no
+measured ktransformers row; WARP's own figures are below and are not litmoe
+measurements.
 
 ### Upstream WARP measurements
 
-WARP upstream reports the figures below. They were not measured by litmoe and
-are not litmoe performance guarantees:
+The two catalog WARP entries are conversion recipes, not litmoe benchmarks.
+The figures below are WARP's own, published at the pinned runtime revision
+`09fcff352ca55223b08ee222d15054b90546c6a9`:
 
-| Catalog id | Pinned source revision | Source | Conversion workspace | Output | Upstream resident floor | Upstream throughput |
-|---|---|---:|---:|---:|---:|---:|
-| `glm-5.3-flash-warp` | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` | 306 GiB | 120 GiB | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
-| `deepseek-v4.1-flash-warp` | `dba1be0a40aa45a94ad051997016db3960a90277` | 475 GiB | 310 GiB | 299 GiB | 4.86 GB | about 3.7 tok/s |
+- [README.md](https://github.com/sqliteai/warp/blob/09fcff352ca55223b08ee222d15054b90546c6a9/README.md) — performance table and container sizes
+- [docs/GLM.md](https://github.com/sqliteai/warp/blob/09fcff352ca55223b08ee222d15054b90546c6a9/docs/GLM.md) — GLM-5.3-Flash download, trunk, expert, and floor sizes
+- [docs/DS41.md](https://github.com/sqliteai/warp/blob/09fcff352ca55223b08ee222d15054b90546c6a9/docs/DS41.md) — DeepSeek-V4.1-Flash container and floor sizes
 
-WARP's published throughput assumes internal NVMe and is hardware-specific.
+| Catalog id | Pinned source revision (HuggingFace) | Source | Conversion workspace (litmoe) | Output container | Upstream resident floor | Upstream throughput |
+|---|---|---:|---:|---:|---:|---|
+| `glm-5.3-flash-warp` | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` | 306 GiB | 120 GiB | 112 GB | 5.14 GB | 3.32 tok/s over 64 tokens; 3.86 over 200 |
+| `deepseek-v4.1-flash-warp` | `dba1be0a40aa45a94ad051997016db3960a90277` | 475 GiB (510 GB as published) | 310 GiB | 299 GiB | 4.86 GB | 3.77 tok/s over 64 tokens; 3.71 over 200 |
+
+Upstream measured these on a 64 GB MacBook Pro with an M5 Pro, container on
+the internal SSD. The workspace figures are litmoe's own free-space
+requirement for the conversion, not upstream numbers.
+
 There are no prebuilt `.waste` release assets for these models. litmoe installs
 WARP runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9` with its bundled
 native patch and orchestrates the pinned upstream pipeline; it does not supply
 a quantizer.
 
-
 ## What you get
 
 - **Laptop, 48–96 GB (Apple Silicon or x86):** llama.cpp with a 3–5B-active
-  MoE from the default tier. Interactive.
+  MoE from the default tier.
 - **Workstation, 192 GB:** llama.cpp with DeepSeek-V4-Flash / MiniMax-M2.7 /
   Qwen3.8-Flash-Next at Q4.
 - **Server with a CUDA GPU and 512 GB+:** sglang-kt with CPU expert offload
@@ -178,7 +194,7 @@ a quantizer.
   local `.waste` container manually. Treat upstream throughput as
   hardware-specific.
 - **Server, CPU only, 768 GB+:** llama.cpp with Kimi-K3 / Qwen3.8-2.4T at
-  IQ1 — batch use, not chat, unless the CPU has many memory channels.
+  IQ1.
 
 Pick the engine per model in `models.yaml`; only one is resident. All three
 engines expose local OpenAI HTTP services. litmoe does not execute the forward
@@ -186,25 +202,26 @@ pass, but gateway overhead must be measured, not assumed. `litmoe bench`
 alternates direct-engine and gateway requests with identical payloads and
 records time to headers, generated delta, visible text, and completion.
 
-On the target 96 GB Apple Silicon Mac, compare the same model artifact,
-quantization, context, prompt, generation limit, and backend build. Record
-memory pressure, swap growth, disk I/O, and native prefill/decode/cache counters.
-Repeated prompts alone do not prove cache hits; alternating order alone does
-not establish matched cold/warm state. Output tokens divided by total response
-time is end-to-end throughput, not decode-only speed.
+On a target host, compare the same model artifact, quantization, context,
+prompt, generation limit, and backend build. Record memory pressure, swap
+growth, disk I/O, and native prefill/decode/cache counters. Repeated prompts
+alone do not prove cache hits; alternating order alone does not establish
+matched cold/warm state. Output tokens divided by total response time is
+end-to-end throughput, not decode-only speed.
 
-Retain WARP for its supported `.waste` containers until target-machine evidence
-justifies replacing it. A llama.cpp/Metal or MLX comparison needs compatible
-model architecture and weights, equivalent prompting/tool behavior, and actual
-Mac measurements. Linux synthetic-weight protocol checks cannot select the
-fastest Apple Silicon backend.
+WARP remains the path for its supported `.waste` containers; replacing it needs
+measurements on the target host. A llama.cpp/Metal or MLX comparison needs
+compatible model architecture and weights, equivalent prompting/tool behavior,
+and actual measurements there. Linux synthetic-weight protocol checks do not
+establish backend performance on Apple Silicon.
 
 ## What litmoe does NOT do
 
 - It is not an inference engine. There are no model weights in this repo and
   no forward-pass code. The actual inference is done by local subprocesses.
 - It does not call a remote inference API.
-- It does not optimize for specific hardware. That's the engines' job.
+- Native engines own their hardware implementations; litmoe carries the
+  documented upstream patches rather than a separate compute backend.
 - It does not implement quantization or conversion. For catalog WARP models it
   pins the source, invokes WARP's upstream conversion pipeline, validates its
   WARP v0 output, and registers the path. WARP remains the quantizer; other
@@ -214,50 +231,37 @@ fastest Apple Silicon backend.
 
 ## What's in this repo
 
+Selected paths, not a complete file inventory:
+
 ```
 litmoe/
-├── pyproject.toml          # modern Python package
+├── pyproject.toml
 ├── litmoe/
-│   ├── models.py           # model catalog, including pinned WARP conversion recipes
-│   ├── config.py           # Pydantic models.yaml schema
-│   ├── server.py           # FastAPI OpenAI/Anthropic gateway + engine supervision
+│   ├── models.py           # model catalog + pinned WARP/DwarfStar recipes
+│   ├── config.py           # Pydantic models.yaml schema (host defaults to 0.0.0.0)
+│   ├── runtime.py          # one resident engine and one inference lease, incl. streams
+│   ├── server.py           # FastAPI OpenAI/Anthropic gateway
+│   ├── benchmark.py        # paired direct-engine vs gateway latency measurement
 │   ├── platform_utils.py   # RAM, physical cores, macOS quirks
 │   ├── engines/
-│   │   ├── base.py         # Engine abstract base, PID files, log headers
-│   │   ├── ktransformers.py  # sglang-kt subprocess adapter
-│   │   ├── llamacpp.py       # llama-server subprocess adapter
-│   │   └── warp.py           # upstream WARP server adapter for local .waste containers
+│   │   ├── base.py         # engine ABC: start/stop/health, PID files, log headers
+│   │   ├── llamacpp.py     # llama-server adapter
+│   │   ├── ktransformers.py  # sglang-kt adapter
+│   │   ├── dwarfstar.py    # pinned native APIs, state identity, quiescence
+│   │   ├── warp.py         # upstream WARP server adapter for local .waste containers
+│   │   └── warp_context.py # fits WARP's native context via its memory planner
 │   └── cli/
-│       ├── main.py           # litmoe doctor|init|models|install|serve|status|stop
-│       └── install.py        # engine installs, model downloads, upstream WARP orchestration/validation
+│       ├── main.py         # litmoe doctor|init|models|install|serve|status|stop|bench
+│       ├── install.py      # engine installs, model downloads, upstream WARP orchestration
+│       ├── warp_models.py  # WARP conversion planning, install locks, manifest validation
+│       └── benchmark.py    # `litmoe bench` entry point
 ├── scripts/
 │   ├── claude-local        # Claude Code → gateway, per-process env only
-│   └── hermes-local        # Hermes Agent → gateway, per-process env only
+│   ├── hermes-local        # Hermes Agent → gateway, per-process env only
+│   └── omp-local           # OMP → gateway, per-process env only
 ├── tests/test_litmoe.py    # unit tests (no network, no engines)
 ├── examples/models.yaml    # tiered example config
-├── deploy/                 # docker-compose: gateway (CPU llama.cpp) + Open WebUI
-└── docs/
-    ├── SETUP.md            # install, tiers, models.yaml reference
-    ├── HARNESSES.md        # Claude Code / Hermes isolation and revert
-    ├── METHODOLOGY.md      # this file
-    ├── ARCHITECTURE.md     # architecture diagram
-    ├── architecture.svg    # rendered diagram
-    └── measurements/       # raw llama-server logs behind every t/s figure
+├── deploy/                 # docker-compose (gateway + Open WebUI), caddy/Caddyfile, gateway/
+└── docs/                   # SETUP, HARNESSES, METHODOLOGY, ARCHITECTURE, plans/, measurements/
 ```
 
-## What was learned along the way
-
-Engineering lessons from building the previous C engine (kept for honesty, not for re-use):
-
-1. **Don't compete with mature engines.** llama.cpp, ktransformers, and WARP
-   already specialize in compute kernels and storage-aware inference.
-2. **Hardware bottlenecks don't yield to software.** A 50x compute gap to
-   llama.cpp on identical hardware means your optimization is wrong, not
-   the hardware.
-3. **"Measure" beats "design".** The CPU floor we calculated (82 min/response)
-   was confirmed by actual wall-clock measurement (158s TTFT) only after we'd
-   shipped several rounds of unmeasured "optimizations".
-4. **The real product is integration.** Users want OpenAI-format APIs over
-   multiple models on multiple hardware. That is what this dispatcher does.
-
-These lessons apply generally. The repo is the artifact that follows from them.
