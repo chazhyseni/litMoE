@@ -461,9 +461,10 @@ class Gateway:
             await self._warmup(self.runtime.selected)
 
     async def _warmup(self, model: ModelEntry) -> None:
-        """One tiny generation after load so the first real request does not
-        pay the cold-expert paging cost (WARP reads ~28 GB from disk when its
-        expert cache is empty)."""
+        """Attempt a short WARP generation after initial readiness.
+
+        This bypasses admission and does not guarantee warm experts for later prompts.
+        """
         if model.engine != "warp":
             return
         engine = self.runtime.engine
@@ -481,7 +482,7 @@ class Gateway:
                     json=payload,
                 )
             logger.info("warmup %s: status %s", model.id, response.status_code)
-        except Exception as exc:  # warmup is best-effort; serving still works
+        except Exception as exc:  # warmup failure does not abort gateway startup
             logger.warning("warmup %s skipped: %s", model.id, exc)
 
     def _start_engine(self, model: ModelEntry) -> Engine:

@@ -65,6 +65,7 @@ runtime. The three backend boxes below are alternatives, not concurrent loads.
                                   │ manual local paths supported         │
                                   │                                      │
                                   └──────────────────────────────────────┘
+```
 
 ## Data flow
 
@@ -77,9 +78,16 @@ runtime. The three backend boxes below are alternatives, not concurrent loads.
 4. Gateway relays the response; streaming responses are passed through byte
    for byte (OpenAI) or re-framed as Anthropic SSE events.
 
-The gateway never touches the forward pass; it adds a few milliseconds and no
-compute. WARP's upstream server is a local subprocess, not a remote inference
-API.
+The gateway never touches the forward pass; it relays the request to the
+resident engine and returns the response. WARP's upstream server is a local
+subprocess, not a remote inference API.
+
+The Anthropic translation covers the Claude Code subset: text and image blocks,
+`tool_use`/`tool_result`, and tools plus `tool_choice`. Anthropic image blocks
+become textual `[image: <source type>]` placeholders rather than forwarded
+image data; assistant `thinking`/`redacted_thinking` blocks are dropped from
+outgoing requests; and a named `tool_choice` is sent as `required`, which forces
+some tool call rather than that specific tool.
 
 ## WARP catalog installation
 
@@ -131,10 +139,17 @@ containers remain valid alternatives.
   runtime on uvicorn's event loop. The active lease covers upstream connection
   establishment and the complete downstream stream. Switches drain first;
   stop failures retain ownership and prevent another engine from starting.
+- Initial startup loads the selected model and, for WARP only, then sends one
+  best-effort warmup request (`Hello`, `max_tokens: 4`) directly to the engine's
+  loopback `/v1/chat/completions` with a 600 s timeout. Readiness is reported
+  before warmup runs; the warmup holds no runtime lease, and a switch,
+  cancellation, or reload does not repeat it. A failed warmup is logged and
+  ignored, so it is not a warm-cache or latency guarantee.
 - Active-request cancellation stops the native process before releasing its
   lease; a later request reloads the same model. This intentionally loses
   cache state rather than assuming a closed HTTP connection stopped inference.
-- Engine stdout/stderr append to `logs/<id>.log` with a per-start header.
+- Engine stdout/stderr append to `logs/<id>.log` (relative to the working
+  directory; `litmoe serve --log-dir` overrides) with a per-start header.
   ASGI lifespan cleanup handles uvicorn's graceful Ctrl-C/SIGTERM shutdown.
 - `litmoe stop` signals only the process groups in the PID files; `--all`
   additionally matches by name. Nothing else on the machine is touched.
@@ -148,18 +163,26 @@ containers remain valid alternatives.
 
 ## Ports and isolation
 
-| Service | Default | Configurable |
+| Service | Binding | Configuration |
 |---|---|---|
-| Gateway | 127.0.0.1:8090 | `host`/`port` in models.yaml |
-| Engines | 8081, 8082, … (skips gateway port and busy ports) | `DEFAULT_ENGINE_PORT` |
+| Gateway, generated config | 127.0.0.1:8090 | `host`/`port` in models.yaml |
+| Gateway, omitted `host` | 0.0.0.0:8090 | Set `host: 127.0.0.1` for local-only use |
+| Resident engine | Loopback port starting at 8081, skipping gateway and busy ports | Allocated at startup |
 | Docker gateway | 127.0.0.1:8000 (host) | `deploy/docker-compose.yml` |
-| Open WebUI (Docker) | 8080 | `deploy/docker-compose.yml` |
+| Open WebUI (Docker) | All host interfaces, port 8080; authentication disabled | Restrict binding and enable authentication before exposure |
 
-At runtime litmoe reads only `LITMOE_*` environment variables and writes only
-under `~/.litmoe/` and `models.yaml`; engine installers also write to
-`$LITMOE_PREFIX` (default `~/.local`). It never sets
-`ANTHROPIC_*`/`OPENAI_*` or edits harness configuration; see
-[HARNESSES.md](HARNESSES.md).
+Omitting `api_key` disables gateway authentication. Set both the host binding
+and authentication policy explicitly before network deployment.
+
+litmoe commands use `LITMOE_*` settings, including configuration, install paths,
+runtime timeouts, and CLI gateway credentials. The prompt-cache capability
+report also reads `LLAMA_ARG_CACHE_PROMPT` from the process or model `env`.
+Engine logs default to `logs/` relative to the working directory (`--log-dir`
+overrides); PID files default to `~/.litmoe/run` (`LITMOE_RUN_DIR` overrides).
+Context sizing may rewrite the selected configuration file. Installers write
+to the selected model/staging paths and `$LITMOE_PREFIX` (default `~/.local`).
+The gateway does not configure harness credentials or global client state;
+the process-scoped launchers are documented in [HARNESSES.md](HARNESSES.md).
 
 ## Source map
 

@@ -1,8 +1,8 @@
 # WARP Engine Integration Implementation Plan
 
-> Context correction (2026-09-29): this historical plan's “0 preserves the container default” assumption is superseded. Upstream `waste_open` maps zero to 4096. litmoe now fits native context using WARP's memory planner, always passes a positive `--ctx`, and persists the result with `warp_auto_context: true`. Unmarked legacy 0/65536 values migrate to auto; `warp_auto_context: false` preserves an intentional positive limit. See [SETUP](../SETUP.md).
+> **Archived planning record.** This is retained for design history, not as current operating instructions. Shipped behavior is documented in [SETUP](../SETUP.md), [ARCHITECTURE](../ARCHITECTURE.md), and [HARNESSES](../HARNESSES.md).
 
-> **For Claude:** REQUIRED SUB-SKILL: Use subagent-driven development and test-driven development to implement this plan task-by-task.
+> Context correction (2026-09-29): this historical plan's “0 preserves the container default” assumption is superseded. Upstream `waste_open` maps zero to 4096. litmoe now fits native context using WARP's memory planner, always passes a positive `--ctx`, and persists the result with `warp_auto_context: true`. Unmarked legacy 0/65536 values migrate to auto; `warp_auto_context: false` preserves an intentional positive limit. See [SETUP](../SETUP.md).
 
 **Goal:** Add a first-class local WARP engine so litMoE can serve existing `.waste` containers—especially GLM-5.3-Flash and DeepSeek-V4.1-Flash—through its OpenAI and Anthropic endpoints without a remote inference API.
 
@@ -10,7 +10,7 @@
 
 **Tech Stack:** Python 3.10+, Pydantic, Click, FastAPI/httpx, pytest, Git/Make, upstream SQLiteAI WARP.
 
-**Repository policy:** Do not commit, push, or release without explicit user authorization. Use working-tree checkpoints instead of the commit steps normally prescribed by the planning workflow.
+**Repository policy:** Do not commit, push, or release without explicit user authorization.
 
 ---
 
@@ -148,20 +148,22 @@ Expected: pass.
   engine: warp
   model_path: ~/models/glm53.waste
   n_ctx: 0
-  extra_args: ["--no-thinking"]
+  warp_auto_context: true
 ```
 
-Explain that `n_ctx: 0` preserves the container default and WARP sizes its own memory budget. `extra_args` accepts upstream flags such as `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`.
+For current configuration, `n_ctx: 0` with `warp_auto_context: true` requests native-context fitting at startup; the adapter passes a positive resolved window. `extra_args` accepts upstream flags such as `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`.
 
 **Step 2: State the storage and performance boundary accurately**
 
 Document primary-source WARP figures as upstream measurements, not litMoE measurements:
 
 - GLM-5.3-Flash: 112 GB container, 5.14 GB resident floor, 3.32 tok/s short / 3.86 tok/s long on the upstream 64 GB M5 Pro host;
-- DeepSeek-V4.1-Flash: 299 GB container, 4.86 GB floor, about 3.7 tok/s;
-- GLM conversion needs 306 GiB staging plus 112 GB output; litMoE does not auto-download or convert model weights.
+- DeepSeek-V4.1-Flash: 299 GiB container, 4.86 GB floor, about 3.7 tok/s.
 
-State that internal NVMe is required for the published throughput and this repository's current persistent disk is not equivalent.
+Current catalog installation orchestrates pinned downloads and conversion;
+see [SETUP](../SETUP.md) for source and workspace requirements. Upstream
+throughput was measured using internal NVMe and is not a guarantee for other
+storage or hardware.
 
 **Step 3: Update diagrams only when their source text explicitly claims two engines**
 

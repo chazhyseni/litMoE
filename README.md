@@ -10,35 +10,35 @@ litmoe is not an inference engine — the forward pass runs in llama.cpp, ktrans
 - **Claude Code, Hermes, and OMP.** OpenAI chat completions and translated Anthropic Messages streams support their local sessions. `scripts/claude-local`, `scripts/hermes-local`, and `scripts/omp-local` leave normal client configuration unchanged.
 - **A curated model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` installs the listed model and writes its config entry. Downloads are RAM-tiered, while the two WARP entries are storage-sized recipes that run pinned upstream conversions into local `.waste` containers.
 - **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. llama.cpp context is fitted to the weights + KV budget (Metal's share of unified memory on macOS, RAM elsewhere). WARP fits its native context using its own resident-memory planner, not the container's disk size.
-- **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual engine process.
+- **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, and per-model CLI flag and environment passthrough. By default, `litmoe stop` targets engines litmoe started (PID files); `--all` also matches engine processes by name.
 - **Streaming.** Raw SSE passthrough for OpenAI requests; event-by-event translation for Anthropic requests (text, thinking, tool_use).
 
 ---
 
 ## Which models, on what hardware
 
-Speed on CPU/Metal is governed by *active* parameters per token, so the default tier is small-active MoEs: on the project's 24-core AVX2 box the 4B-active default runs at 9–12.7 t/s, the same band as a 9B dense model, while being a far stronger model (numbers and raw logs in [docs/measurements/](docs/measurements/README.md)). The GGUF entries below were verified against the HuggingFace file listing and llama.cpp's architecture table on 2026-09-16; `litmoe models` prints the live catalog with a fits / does-not-fit column for your RAM.
+The default recommendations favor small-active-parameter MoEs. Actual throughput depends on the engine, quantization, prompt, hardware, and memory pressure; retained CPU timing records are in [docs/measurements/](docs/measurements/README.md). The tiers below organize the catalog by approximate model size. `litmoe models` reports its RAM-fit estimate; startup also checks runtime memory requirements.
 
-| Tier | Model (`--model`) | Total / active | Default quant | Disk | Why |
+| Tier | Model (`--model`) | Total / active | Default quant | Disk | Notes |
 |---|---|---|---|---|---|
-| **48 GB laptop** | `gemma-4-26b-a4b` **(default)** | 26B / 4B | UD-Q4_K_XL | 17 GB | Fast, multimodal (vision), 256K ctx |
-| | `qwen3.6-35b-a3b` | 35B / 3B | UD-Q4_K_XL | 22 GB | Fast, strong coder |
+| **48 GB laptop** | `gemma-4-26b-a4b` **(default)** | 26B / 4B | UD-Q4_K_XL | 17 GB | Multimodal (vision), 256K ctx |
+| | `qwen3.6-35b-a3b` | 35B / 3B | UD-Q4_K_XL | 22 GB | 256K ctx |
 | | `nemotron-3.5-lightning-30b-a3b` | 30B / 3B | UD-Q4_K_XL | 26 GB | Hybrid Mamba-MoE, 1M ctx |
 | | `gpt-oss-20b` | 21B / 3.6B | UD-Q4_K_XL | 12 GB | Native MXFP4 |
 | | `kimi-linear-48b` | 48B / 3B | Q4_K_M | 30 GB | KDA linear attention, 1M ctx |
 | | `gemma-4-12b`, `qwen3.8-9b-distill` | dense 12B / 9B | Q4_K_M | 7 / 6 GB | Small dense |
-| | `qwen3.8-27b`, `gemma-4-31b` | dense 27B / 31B | UD-Q4_K_XL | 18 / 19 GB | Strongest small models; 7–9× the active params of the MoEs above, so expect a fraction of their speed |
-| **96 GB laptop / desktop** | `gpt-oss-120b` | 117B / 5.1B | UD-Q4_K_XL | 63 GB | Native MXFP4, fast |
+| | `qwen3.8-27b`, `gemma-4-31b` | dense 27B / 31B | UD-Q4_K_XL | 18 / 19 GB | Dense alternatives |
+| **96 GB laptop / desktop** | `gpt-oss-120b` | 117B / 5.1B | UD-Q4_K_XL | 63 GB | Native MXFP4 |
 | | `qwen3.5-122b-a10b` | 122B / 10B | UD-IQ4_XS | 60 GB | |
 | | `nemotron-3-super-120b-a12b` | 120B / 12B | UD-IQ4_XS | 64 GB | 1M ctx |
 | | `llama-4-scout` | 109B / 17B | UD-Q4_K_XL | 62 GB | 10M ctx |
-| **192 GB workstation** | `qwen3.8-flash-next` | 177B MoE | UD-Q4_K_XL | 111 GB | Sep 2026; needs a Sep-2026+ llama.cpp |
+| **192 GB workstation** | `qwen3.8-flash-next` | 177B MoE | UD-Q4_K_XL | 111 GB | Requires llama.cpp support for `qwen4exp` |
 | | `minimax-m2.7` | 229B / 10B | UD-Q4_K_XL | 141 GB | |
 | | `deepseek-v4-flash` | 284B MoE | UD-Q4_K_XL | 155 GB | 1M ctx |
 | **512 GB server** | `minimax-m3`, `glm-5.3`, `deepseek-v3.2`, `kimi-k2.5`, `kimi-k2.6` | 426B–1.03T | Q2–Q4 | 247–345 GB | |
-| **768 GB server** | `qwen3.8` (2.4T/95B), `kimi-k3` (2.78T/93B) | | UD-IQ1_S | 508 / 594 GB | 93–95B *active*: ~1 t/s on a 24-core CPU regardless of RAM |
+| **768 GB server** | `qwen3.8` (2.4T/95B), `kimi-k3` (2.78T/93B) | | UD-IQ1_S | 508 / 594 GB | 93–95B active; no retained local timing logs |
 
-ktransformers entries (Linux + NVIDIA GPU, native precision safetensors, no GGUF): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal — supported by ktransformers since 2026-08-26 and *not* by released llama.cpp), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), `deepseek-v3.2-kt` (FP8).
+ktransformers entries (Linux + NVIDIA GPU, native-precision safetensors): `glm-5.3-flash` (FP8, 328 GB, 1M ctx, multimodal), `deepseek-v4-flash-kt` (MXFP4), `kimi-k2-thinking` (RAWINT4), `minimax-m3-kt` (MXFP8), `minimax-m2.7-kt` (FP8), and `deepseek-v3.2-kt` (FP8). These are separate from the llama.cpp GGUF entries and WARP conversion recipes.
 
 WARP conversion entries: `glm-5.3-flash-warp` (306 GiB pinned source → 112 GB
 container) and `deepseek-v4.1-flash-warp` (475 GiB pinned source → 299 GiB
@@ -57,20 +57,20 @@ For GGUF entries, `litmoe install --model X` picks the quant for your machine: t
 
 - CUDA, HIP (AMD), Metal (Apple), Vulkan, SYCL, OpenCL, CANN — and plain CPU
 - 1–8-bit GGUF quantization; pre-quantized GGUFs from [Unsloth](https://huggingface.co/unsloth)
-- Every model in the catalog above has its architecture in `src/llama-arch.cpp` (`gemma4`, `qwen35moe`, `qwen35`, `qwen4exp`, `nemotron_h_moe`, `gpt-oss`, `kimi-k3`, `kimi-linear`, `deepseek2`, `deepseek4`, `glm-dsa`, `minimax-m2`, `minimax-m3`, `llama4`); `qwen4exp` (Qwen3.8-Flash-Next) needs a build from September 2026 or later
-- `--jinja` chat templates (tool calling) are on by default in current builds
+- Catalog entries identify the required model architecture; the installed llama.cpp build must support it.
+- The adapter enables `--jinja` for chat-template processing.
 
 **Install:** `litmoe install --engine llamacpp` — downloads the matching release binary (`--llamacpp-variant cpu|cuda|cuda13|vulkan|rocm`, auto-selects CUDA when an NVIDIA GPU is visible) or builds from source when glibc < 2.34.
 
 ### ktransformers
 
-**Repo:** https://github.com/kvcache-ai/ktransformers · MADSys Lab @ Tsinghua + Approaching.AI · SOSP 2025
+**Repo:** https://github.com/kvcache-ai/ktransformers
 
-Since v0.4 the serving stack is **SGLang + kt-kernel** (`python -m sglang.launch_server --kt-method …`): attention and dense layers on the GPU, MoE experts on the CPU in their native precision.
+litmoe uses **SGLang + kt-kernel** (`python -m sglang.launch_server --kt-method …`): GPU attention with CPU expert offload.
 
-- **Requirements:** Linux x86-64, NVIDIA GPU (SM 8.0+), Python 3.11/3.12. PyPI wheels need glibc ≥ 2.35; otherwise `litmoe install --engine ktransformers` runs the upstream source build.
+- **Requirements:** Linux x86-64 and an NVIDIA GPU compatible with the selected model/backend. The installer uses PyPI wheels on Python 3.11/3.12 with glibc ≥ 2.35; otherwise it attempts the upstream source build, which requires a compatible build toolchain.
 - **CPU expert backends (`kt_method`):** FP8, FP8_PERCHANNEL, BF16, RAWINT4, MXFP4, MXFP8 need **AVX-512**; AMXINT4/AMXINT8 need Intel AMX; LLAMAFILE (GGUF weights) runs on AVX2.
-- **Models:** registry entries (DeepSeek-V3.x/V4-Flash, Kimi-K2-Thinking, MiniMax-M2.x/M3) plus tutorial-launched models (GLM-5.3-Flash, Kimi-K2.5/K2.6, Qwen3-Next). 2026 additions upstream: GLM-5.3-Flash native FP8 (Aug 26), LoRA fine-tuning on AVX-512 CPUs incl. AMD (Aug 17), Kimi K2.5/K2.6 RAWINT4 fine-tuning (Sep 13), DeepSeek-V4-Flash on Ascend NPU (Aug 16) — fine-tuning and NPU paths are outside litmoe's scope.
+- **Models:** see the ktransformers catalog entries above. Fine-tuning and NPU serving are outside litmoe's scope.
 
 ### WARP
 
@@ -147,16 +147,15 @@ only the same pinned runtime. Add an existing local `.waste` container to
 `models.yaml` yourself; manually created or acquired containers remain
 supported.
 
-Upstream WARP reports the following measurements. They are not litmoe
-benchmarks or performance guarantees:
+The [pinned upstream WARP documentation](https://github.com/sqliteai/warp/blob/09fcff352ca55223b08ee222d15054b90546c6a9/README.md) reports the following measurements. They are not litmoe benchmarks or performance guarantees:
 
 | Container | Upstream container size | Upstream resident floor | Upstream throughput |
 |---|---:|---:|---:|
 | GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s (short) and 3.86 tok/s (long) on WARP's 64 GB M5 Pro |
 | DeepSeek-V4.1-Flash | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
-Those published throughput figures assume fast internal NVMe. This
-repository's current persistent disk is not equivalent.
+These measurements used a 64 GB M5 Pro with internal NVMe. The resident floor
+is not total serving memory; context, caches, and optional vision add memory.
 
 ---
 
@@ -183,7 +182,7 @@ add the local `.waste` path to `models.yaml`, and run `litmoe serve`.
 
 Or skip the pre-download: `litmoe init` writes a `models.yaml` whose `model_path` entries are HuggingFace specs (`owner/repo:QUANT`); llama-server fetches them on first start.
 
-> **macOS with several Pythons:** install and run litmoe with the same interpreter (`/path/to/python -m pip install -e .` / `/path/to/python -m litmoe serve`). Homebrew Python 3.14 has TCC file-access restrictions on `~/.litmoe/models`; conda/miniforge Python does not.
+> **Multiple Python installations:** install and run litmoe from the same environment. For example, run `/path/to/python -m pip install -e .`, then use that environment's `litmoe` executable. `litmoe doctor` prints the interpreter in use; it does not check model-file permissions.
 
 Full guide: [docs/SETUP.md](docs/SETUP.md)
 
@@ -191,13 +190,17 @@ Full guide: [docs/SETUP.md](docs/SETUP.md)
 
 ## models.yaml
 
+Set `host: 127.0.0.1` explicitly for local use. Generated configurations use
+loopback, but a hand-written configuration that omits `host` defaults to
+`0.0.0.0` (all interfaces) and omitting `api_key` disables authentication.
+
 ```yaml
 host: 127.0.0.1
 port: 8090
 api_key: null            # or a string to require Bearer / x-api-key auth
 
 models:
-  # Laptop default: fast MoE with vision. HF spec -> llama-server downloads on first start.
+  # Default MoE with vision. HF spec -> llama-server downloads on first start.
   - id: gemma-4-26b-a4b
     engine: llamacpp
     model_path: unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL
@@ -230,7 +233,6 @@ models:
     model_path: ~/models/glm53.waste
     n_ctx: 0
     warp_auto_context: true              # fit native context at each startup
-    extra_args: ["--no-thinking"]
 
   - id: deepseek-v4.1-flash-warp
     engine: warp
@@ -246,6 +248,17 @@ For WARP, `model_path` must be a local `.waste` container. With `warp_auto_conte
 The adapter always passes a positive `--ctx` and persists the selected `n_ctx` **with automatic mode still enabled**. Unmarked legacy `n_ctx: 0` and `65536` entries migrate to automatic sizing. An old intentional 65536 is indistinguishable from the shipped default: set `warp_auto_context: false` alongside a positive `n_ctx` to keep any fixed window. Other unmarked positive limits remain fixed. Changing context requires a gateway restart, not a download or conversion.
 
 WARP `extra_args` supports `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`; conflicting `--ctx` flags are rejected. The planning ceiling measures RAM **capacity**, not currently free RAM. litmoe owns one resident model; leave room for other applications and independently launched inference servers. An oversized explicit `--budget` still passes upstream unchanged. Unknown manual model IDs need `config.max_position_embeddings` in the container manifest or an explicit fixed context.
+
+A fixed WARP budget is opt-in, for example `extra_args: ["--budget", "64G"]`;
+choose it for the host's capacity and other workloads. Catalog installation
+does not set a fixed 64G budget. The pinned GLM chat format always opens a
+reasoning channel; `--no-thinking` does not disable it.
+
+On initial gateway startup, WARP receives a best-effort four-token `Hello`
+request after the engine becomes ready. This warmup bypasses gateway admission
+and may overlap client arrivals; readiness does not mean warmup has finished.
+Explicit switches and cancellation reloads do not repeat it. It does not
+guarantee that a later prompt's experts are cached or that latency improves.
 
 llama-server gets one slot and `-t <physical cores>` unless `extra_args` sets `-t`. Configure context through `n_ctx`, not `-c`/`--ctx-size`; slot/context overrides in `extra_args` are rejected. Context corrections are written back into `models.yaml` (comments are not preserved by that rewrite). Requests are serialized with up to `max_queue_size: 8` waiting admissions and `queue_timeout: 30` seconds; overflow/expiry returns HTTP 429.
 
@@ -300,7 +313,7 @@ Design rule: **using a local model must never change what a harness does when yo
 ./scripts/claude-local --model qwen3.6-35b-a3b -p "explain this repo"
 claude                                              # normal Claude Code, still your Anthropic account
 ```
-`claude-local` sets `ANTHROPIC_BASE_URL`, a dummy `ANTHROPIC_AUTH_TOKEN`, the model-alias variables, and a separate `CLAUDE_CONFIG_DIR` **only for that one process**, then execs `claude`. Do not `export ANTHROPIC_BASE_URL` in your shell — that redirects every Claude Code session and every Anthropic SDK client until you undo it.
+`claude-local` sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the gateway key, or a dummy when authentication is disabled), the model-alias variables, and a separate `CLAUDE_CONFIG_DIR` **only for that one process**, then execs `claude`. Do not `export ANTHROPIC_BASE_URL` in your shell; clients that read it will use that endpoint.
 
 ### Hermes Agent
 ```bash
@@ -346,6 +359,10 @@ docker compose up
 ```
 
 Services: **litmoe-gateway** on port **8000** (`http://127.0.0.1:8000/v1`, loopback only — no auth by default) and **openwebui** on port **8080**. Model files are mounted read-only from `$LITMOE_MODELS_DIR` (default `~/.litmoe/models`). `deploy/caddy/Caddyfile` is an optional reverse-proxy front; it is not started by the compose file.
+
+The Compose example publishes Open WebUI on **all host interfaces** at port
+8080 with `WEBUI_AUTH=false`. Restrict its port binding and enable WebUI
+authentication before exposing it beyond a trusted local environment.
 
 ---
 

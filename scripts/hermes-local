@@ -2,11 +2,11 @@
 # hermes-local — run Hermes Agent against a litmoe gateway for ONE session,
 # without changing the model/provider your normal `hermes` uses.
 #
-# Hermes reads its default model/provider from ~/.hermes/config.yaml; the
-# `hermes config set model.*` commands in older litmoe docs REWROTE that file,
-# so every later `hermes` session was silently pointed at the local model.
-# This wrapper instead uses per-invocation flags, which Hermes honours above
-# the config file and does not persist:
+# Uses per-invocation provider flags instead of changing ~/.hermes/config.yaml.
+# Endpoint and credential variables apply only to the child process:
+#
+# For authenticated gateways, pass --model and --key (or LITMOE_API_KEY).
+# Automatic model discovery does not send an authorization header.
 #
 #   hermes chat --provider custom -m <model>     with CUSTOM_BASE_URL,
 #     OPENAI_BASE_URL and OPENAI_API_KEY set only in this process's environment

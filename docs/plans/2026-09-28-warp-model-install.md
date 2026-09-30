@@ -1,8 +1,8 @@
 # WARP Model Installation Parity Implementation Plan
 
-> Context correction (2026-09-29): the zero-preservation tests and `--n-ctx` rejection in this historical plan are superseded. Installs default to automatic native-context fitting via WARP's memory planner; a positive `--n-ctx` selects fixed mode. Startup migrates unmarked legacy 0/65536 entries and persists the resolved window with its auto/fixed policy. Tests cover both WARP catalog models, restart sizing, and explicit overrides; see [SETUP](../SETUP.md).
+> **Archived planning record.** This is retained for design history, not as current operating instructions. Shipped behavior is documented in [SETUP](../SETUP.md), [ARCHITECTURE](../ARCHITECTURE.md), and [HARNESSES](../HARNESSES.md).
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
+> Context correction (2026-09-29): the zero-preservation tests and `--n-ctx` rejection in this historical plan are superseded. Installs default to automatic native-context fitting via WARP's memory planner; a positive `--n-ctx` selects fixed mode. Startup migrates unmarked legacy 0/65536 entries and persists the resolved window with its auto/fixed policy. Tests cover both WARP catalog models, restart sizing, and explicit overrides; see [SETUP](../SETUP.md).
 
 **Goal:** Make GLM-5.3-Flash and DeepSeek-V4.1-Flash WARP models installable, convertible, validated, and configurable through `litmoe install --model`.
 
@@ -294,15 +294,3 @@ Expected: command exits 0 and the model is ready for `litmoe serve`.
 **Step 4: Run specification and quality reviews**
 
 Review against `docs/plans/2026-09-28-warp-model-install-design.md`, then review maintainability, security, subprocess/environment safety, disk arithmetic, platform behavior, and regression risk. Resolve all important findings and rerun affected checks.
-
-**Step 5: Commit and push**
-
-```bash
-git config --local user.name chazhyseni
-git config --local user.email chaz.hyseni@gmail.com
-git add -A
-git commit -m "feat(warp): install catalog models locally"
-git push -u origin feature/warp-model-install
-```
-
-Verify the local commit author and remote branch hash match.

@@ -12,21 +12,17 @@ storage requirements. Run `litmoe models` for the live catalog.
 - Linux or macOS (Apple Silicon: Metal). Windows via WSL2.
 - Disk: 20–70 GB for a laptop-tier catalog model; hundreds of GB for server tiers or WARP containers.
 
-> **macOS with several Pythons (Homebrew + conda):** install and run litmoe
-> with the *same* interpreter, or the entry point may start under a Python
-> that cannot read `~/.litmoe/models/` (TCC). `litmoe doctor` checks this.
-
 ## Step 1: Install litmoe
 
 ```bash
 git clone https://github.com/chazhyseni/litMoE && cd litMoE
 pip install -e .
-litmoe doctor          # Python, RAM, CPU cores, engines found, config sanity
+litmoe doctor          # Python, RAM, CPU cores, engines found
 ```
 
 ## Step 2: Install an engine
 
-### llama.cpp (default; every model in the catalog has a GGUF)
+### llama.cpp (default; catalog GGUF models)
 
 ```bash
 litmoe install --engine llamacpp                            # prebuilt release binary (auto: cuda if NVIDIA visible, else cpu)
@@ -34,8 +30,9 @@ litmoe install --engine llamacpp --llamacpp-variant vulkan  # or cpu | cuda | cu
 ```
 
 The prebuilt path downloads the current `ggml-org/llama.cpp` release asset for
-your OS/arch/variant, verifies it runs, and symlinks `llama-server` into
-`~/.local/bin/`. On Linux the release binaries need glibc ≥ 2.34 — older
+your OS/arch/variant and writes a `llama-server` wrapper into `~/.local/bin/`
+(the wrapper sets `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` so the binary finds its
+`.so`/`.dylib` files). On Linux the release binaries need glibc ≥ 2.34 — older
 distros fall back to a source build automatically. Metal on macOS is in the
 standard macOS asset; no variant flag needed.
 
@@ -49,8 +46,11 @@ This is the engine for the big MoEs on a single-GPU box with lots of RAM.
 litmoe install --engine ktransformers     # PyPI wheels for kt-kernel + sglang-kt
 ```
 
-Not available on macOS (triton/CUDA dependency). Requires a CUDA GPU; the
-upstream tutorials target SM90 (H100/H20) but SM80/SM86 work for most models.
+PyPI wheels exist only for Linux x86-64, Python 3.11/3.12, glibc ≥ 2.35
+(manylinux_2_35); elsewhere litmoe falls back to an upstream source build
+(`git clone --recursive` + `install.sh`, needing a C++ toolchain, CMake, and
+the CUDA toolkit). macOS is unsupported by this installer. Use a CUDA GPU
+compatible with the selected model, precision, and installed backend.
 
 ### WARP (catalog conversion or an existing local `.waste` container)
 
@@ -159,9 +159,6 @@ guarantees:
 | GLM-5.3-Flash | 112 GB | 5.14 GB | 3.32 tok/s short; 3.86 tok/s long on WARP's 64 GB M5 Pro |
 | DeepSeek-V4.1-Flash | 299 GiB | 4.86 GB | about 3.7 tok/s |
 
-The published throughput assumes internal NVMe; this repository's current
-persistent disk is not equivalent.
-
 ## Step 3: Pick a model for your RAM
 
 `litmoe models` prints the complete catalog and marks what fits this machine.
@@ -212,14 +209,14 @@ unchanged. `litmoe serve ID` selects one initial model; multiple IDs are rejecte
 | Model | Type | Native ctx | Default quant | Size | RAM | Notes |
 |---|---|---|---|---|---|---|
 | **gemma-4-26b-a4b** (default) | MoE, 4B active | 256K | UD-Q4_K_XL | 17 GB | ~26 GB | Vision (mmproj included). `litmoe init` picks this. |
-| qwen3.6-35b-a3b | MoE, 3B active | 256K | UD-Q4_K_XL | 22 GB | ~31 GB | Strong coding/agentic; thinking on by default |
-| nemotron-3.5-lightning-30b-a3b | hybrid MoE, 3B active | 1M | UD-Q4_K_XL | 26 GB | ~35 GB | Mamba-2 hybrid, tiny KV |
+| qwen3.6-35b-a3b | MoE, 3B active | 256K | UD-Q4_K_XL | 22 GB | ~31 GB | Thinking on by default |
+| nemotron-3.5-lightning-30b-a3b | hybrid MoE, 3B active | 1M | UD-Q4_K_XL | 26 GB | ~35 GB | Mamba-2 hybrid |
 | gpt-oss-20b | MoE, 3.6B active | 128K | UD-Q4_K_XL | 12 GB | ~20 GB | Native MXFP4; Harmony format |
-| gemma-4-12b | dense | 256K | Q4_K_M | 7 GB | ~16 GB | Vision; fits 16 GB |
+| gemma-4-12b | dense | 256K | Q4_K_M | 7 GB | ~16 GB | Vision; this default is not admitted on a 16 GB host by the serving memory gate |
 | qwen3.8-9b-distill | dense | 256K | Q4_K_M | 6 GB | ~14 GB | Reasoning distill; emits `reasoning_content` |
-| qwen3.8-27b | dense | 256K | UD-Q4_K_XL | 18 GB | ~28 GB | Slower than the MoEs (27B active) |
-| gemma-4-31b | dense | 256K | UD-Q4_K_XL | 19 GB | ~32 GB | Vision; slower than the MoEs |
-| kimi-linear-48b | MoE, 3B active | 1M | Q4_K_M | 30 GB | ~39 GB | KDA linear attention: 1M ctx cheap |
+| qwen3.8-27b | dense | 256K | UD-Q4_K_XL | 18 GB | ~28 GB | Dense architecture |
+| gemma-4-31b | dense | 256K | UD-Q4_K_XL | 19 GB | ~32 GB | Vision |
+| kimi-linear-48b | MoE, 3B active | 1M | Q4_K_M | 30 GB | ~39 GB | KDA linear attention |
 
 ### 96 GB laptop / desktop
 
@@ -237,13 +234,13 @@ unchanged. `litmoe serve ID` selects one initial model; multiple IDs are rejecte
 | qwen3.8-flash-next | llama.cpp | MoE | UD-Q4_K_XL | 111 GB | ~129 GB |
 | minimax-m2.7 | llama.cpp | MoE, 10B active | UD-Q4_K_XL | 141 GB | ~169 GB |
 | deepseek-v4-flash | llama.cpp | MoE (MLA) | UD-Q4_K_XL | 155 GB | ~179 GB |
-| deepseek-v4-flash-kt | sglang-kt | FP8 safetensors | — | 160 GB | ~185 GB + GPU |
+| deepseek-v4-flash-kt | sglang-kt | MXFP4 safetensors | — | 160 GB | ~185 GB + GPU |
 
 ### 512 GB server
 
 | Model | Engine | Type | Default | Size | RAM |
 |---|---|---|---|---|---|
-| minimax-m3 | llama.cpp | 428B MoE, 23B active | UD-Q4_K_XL | 265 GB | ~302 GB |
+| minimax-m3 | llama.cpp | 426B MoE, 23B active | UD-Q4_K_XL | 265 GB | ~302 GB |
 | glm-5.3 | llama.cpp | MoE | UD-Q2_K_XL | 254 GB | ~288 GB |
 | deepseek-v3.2 | llama.cpp | 671B MoE, 37B active | UD-Q2_K_XL | 247 GB | ~280 GB |
 | kimi-k2.6 / kimi-k2.5 | llama.cpp | 1T MoE, 32B active | UD-Q2_K_XL / UD-IQ2_M | 340 / 345 GB | ~382 / ~388 GB |
@@ -262,39 +259,23 @@ unchanged. `litmoe serve ID` selects one initial model; multiple IDs are rejecte
 
 ## Speed: what to expect
 
-Throughput on CPU is bounded by memory bandwidth × active parameters, so a
-26B MoE with 4B active runs about as fast as a 9B dense model while being a
-much stronger model — that is the whole reason the default tier is
-small-active MoEs. Rough rules from community numbers (not measured here):
+Active parameter count, memory bandwidth, compute, quantization, context,
+thread count, and concurrent requests all affect throughput. Benchmark the
+intended workload on the target host.
 
-- **3–5 B active MoE, Q4** (the 48 GB tier): tens of t/s on Apple M-series
-  Max/Ultra, 10–25 t/s on a DDR5 desktop, high single digits on an AVX2-only
-  DDR4 cloud VM.
-- **10–17 B active** (96 GB tier): roughly a third of the above.
-- **≥ 23 B active** (server tiers): needs a GPU for attention (sglang-kt) or a
-  many-channel EPYC/Xeon to be interactive; otherwise batch-only.
+The following generation-rate ranges come from the retained local CPU logs
+under [`docs/measurements/`](measurements/README.md). These are not controlled
+cross-model comparisons and do not establish model quality or paging behavior.
 
-Measured in this project — every number below is a `print_timing` line in a
-log shipped under [`docs/measurements/`](measurements/README.md). Machine: AMD
-EPYC 7B13, 24 physical cores, AVX2 only (no AVX-512), DDR4-3200, Google Cloud
-persistent disk (~400 MB/s), no GPU, llama.cpp CPU build.
-
-| Model | Quant / size | Threads | Generation t/s | Log |
+| Model | Quant / size | Threads | Generation t/s (min–max) | Log |
 |---|---|---|---|---|
-| gemma-4-26b-a4b (MoE, 4B active) | UD-Q4_K_XL, 17 GB | 24 | 9.0–12.7 once weights are resident; 1.6–4.6 for the first requests after each (re)start | `gemma-4-26b-a4b.log`, 2026-09-16 |
-| Qwen3.8-9B-Distill (dense) | Q4_K_M, 6 GB | 8 | 8.3–8.5 | `qwen3.8-9b-distill.log`, 2026-09-01 |
-| Kimi-Linear-48B-A3B (MoE, 3B active) | Q4_K_M, 30 GB | 48 | 0.4–0.6 (0.03–0.05 on cold requests) — disk-bound | `kimi-linear-48b.log`, 2026-08-20 |
-| DeepSeek-V4-Flash | UD-IQ1_S, 83 GB | 48 | 0.32–0.34 (0.11 cold) — disk-bound | `deepseek-v4-flash.log`, 2026-08-20 |
+| gemma-4-26b-a4b (MoE, 4B active) | UD-Q4_K_XL, 17 GB | 24 | 1.56–12.68 | `gemma-4-26b-a4b.log` |
+| Qwen3.8-9B-Distill (dense) | Q4_K_M, 6 GB | 8 | 8.33–8.48 | `qwen3.8-9b-distill.log` |
+| Kimi-Linear-48B-A3B (MoE, 3B active) | Q4_K_M, 30 GB | 48 | 0.03–0.58 | `kimi-linear-48b.log` |
+| DeepSeek-V4-Flash | UD-IQ1_S, 83 GB | 48 | 0.11–0.34 | `deepseek-v4-flash.log` |
 
-Reading these: the two MoEs whose experts never became resident (Kimi-Linear
-at 30 GB on a box also holding other models, V4-Flash at 83 GB cold) were
-paging from a ~400 MB/s disk — those are storage numbers, not model numbers.
-Gemma hit double digits only after its 17 GB were paged in. The 9B dense and
-the 26B-A4B MoE land in the same ~8–13 t/s band, which is the memory-bandwidth
-argument in one row: same speed class, much stronger model. Earlier versions
-of this file quoted 0.69 t/s for the 9B model and 0.85 t/s for Kimi-K3 from
-Aug-2026 runs whose logs were overwritten before append-only logging existed;
-those figures are not reproducible from the repo and are no longer cited.
+[`docs/measurements/README.md`](measurements/README.md) records the per-request
+sequences, the run conditions, and how to read these numbers.
 
 ## Step 4: models.yaml
 
@@ -303,7 +284,8 @@ writes a generated WARP container as an absolute `engine: warp`, `n_ctx: 0`,
 `warp_auto_context: true` entry. Existing WARP containers can still be added
 manually, as shown below.
 `litmoe init` creates the file with the default catalog model and Claude-name
-aliases.
+aliases. It writes `host: 127.0.0.1`; the schema default for a hand-written
+file that omits `host` is `0.0.0.0`, which binds all interfaces.
 
 ```yaml
 host: 127.0.0.1
@@ -332,7 +314,6 @@ models:
     model_path: ~/models/glm53.waste
     n_ctx: 0
     warp_auto_context: true    # fit native context at each startup
-    extra_args: ["--no-thinking"]
 
   - id: deepseek-v4.1-flash-warp
     engine: warp
@@ -372,10 +353,18 @@ curl http://127.0.0.1:8090/v1/models
 ```
 
 The resident engine takes a free loopback port starting at 8081, skipping the
-gateway port and occupied ports. Logs append to `logs/<model-id>.log`.
+gateway port and occupied ports. Logs append to `logs/<model-id>.log` relative
+to the working directory; `litmoe serve --log-dir DIR` overrides that.
 Switching waits for the active request and prevents new admission during the
 transition. A failed switch leaves an explicit failed state, never the old
 model masquerading as the requested one. Retry with `litmoe switch ID`.
+
+Initial WARP startup attempts a four-token `Hello` warmup after the engine
+reports ready. It bypasses admission and is not repeated by switches or
+cancellation reloads; see [Engine lifecycle](ARCHITECTURE.md#engine-lifecycle).
+Readiness does not establish a warm cache. A fixed WARP `--budget` is opt-in;
+catalog installation does not impose 64G. GLM's pinned chat format requires
+reasoning, so `--no-thinking` does not disable it.
 
 Top-level `max_queue_size` (default 8) and `queue_timeout` (default 30 seconds)
 bound admission; full/expired waits return HTTP 429. Known inactive model IDs
@@ -384,19 +373,28 @@ Set `api_key` to protect inference and `/v1/runtime` control; null preserves
 unauthenticated local use. Keep the gateway on loopback unless deliberately
 exposing and securing it.
 
-Environment variables litmoe reads (all optional, all `LITMOE_*` — it never
-reads or sets `ANTHROPIC_*` / `OPENAI_*`): `LITMOE_CONFIG` (models.yaml path),
-`LITMOE_MODELS_DIR`, `LITMOE_PREFIX` (engine install prefix),
-`LITMOE_WARP_DIR` (override the WARP source root), `LITMOE_RUN_DIR` (PID
-files), `LITMOE_READY_TIMEOUT`, and `LITMOE_LLAMACPP_TAG` (pin a release).
+Environment variables litmoe reads (all optional; the main ones):
+`LITMOE_CONFIG` (models.yaml path), `LITMOE_MODELS_DIR`, `LITMOE_PREFIX`
+(engine install prefix), `LITMOE_WARP_DIR` (override the WARP source root),
+`LITMOE_RUN_DIR` (PID files), `LITMOE_READY_TIMEOUT`, `LITMOE_LLAMACPP_TAG`
+(pin a release), `LITMOE_GATEWAY` (CLI target), and `LITMOE_API_KEY` (CLI key).
+The installer also accepts `LITMOE_PIP_EXTRA_INDEX_URL`. The prompt-cache
+capability report reads `LLAMA_ARG_CACHE_PROMPT` from the process or model
+`env`. Harness endpoint variables are configured by the launchers described below.
 
-## Step 6: Connect Claude Code / Hermes / Open WebUI
+## Step 6: Connect Claude Code / Hermes / OMP / Open WebUI
 
-See [HARNESSES.md](HARNESSES.md). Short version: use `scripts/claude-local`
-and `scripts/hermes-local`; never `export ANTHROPIC_BASE_URL` in your shell.
+See [HARNESSES.md](HARNESSES.md). Short version: use `scripts/claude-local`,
+`scripts/hermes-local`, and `scripts/omp-local`; never `export
+ANTHROPIC_BASE_URL` in your shell.
 
 ## Docker
 
 `deploy/docker-compose.yml` builds a CPU llama.cpp image and runs the gateway
 on `127.0.0.1:8000` plus Open WebUI on `:8080`. Edit `deploy/models.yaml`
 (paths are `/models/...`, a read-only mount of `~/.litmoe/models`).
+
+The gateway port is published loopback-only (`127.0.0.1:8000:8000`), but Open
+WebUI is published as `8080:8080` on all host interfaces with
+`WEBUI_AUTH=false`. Restrict that binding and enable authentication before
+exposing the stack beyond localhost.

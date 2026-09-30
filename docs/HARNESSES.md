@@ -1,25 +1,21 @@
-# Using litmoe with agent harnesses — without breaking their defaults
+# Connecting agent harnesses
 
-The rule litmoe follows: **pointing a harness at a local model must never
-change what that harness does when you run it normally.** Claude Code should
-keep using your Anthropic account, Hermes should keep using its configured
-provider, and plain OMP should keep its normal profiles. Switching back requires
-no cleanup.
+The launchers route individual Claude Code, Hermes, and OMP sessions to the
+local gateway without changing their default provider configuration. Claude
+Code and OMP use separate state directories; Hermes uses per-invocation
+provider flags.
 
-This document lists, per harness, what it reads to decide where requests go,
-what litmoe touches (nothing global), and how to verify.
-
-## What litmoe itself never does
+## Configuration isolation and binding
 
 - Never rewrites `~/.claude/`, `~/.hermes/config.yaml`, `~/.hermes/.env`,
   normal OMP profiles, or shell rc files. The OMP launcher owns only its
   marked `~/.litmoe/omp/` directories.
 - Never exports environment variables into your shell. `litmoe serve` sets
   variables only for the engine subprocesses it spawns.
-- Never binds a port a harness uses by default: the gateway is `127.0.0.1:8090`
-  (or whatever `port:` you set); engines take 8081+, skipping the gateway port
-  and any port another process already listens on. Anthropic's real API is
-  HTTPS on api.anthropic.com — no overlap.
+- Generated configurations use `host: 127.0.0.1` and `port: 8090`.
+  Set `host` explicitly: omitting it defaults to `0.0.0.0`, with no
+  authentication unless `api_key` is set. Owned engines use loopback ports
+  starting at 8081, skipping the gateway port and existing listeners.
 - `litmoe stop` only signals engines litmoe started (tracked in
   `~/.litmoe/run/*.pid`). An Ollama/LM Studio/manual `llama-server` is left
   alone unless you pass `--all`.
@@ -42,6 +38,12 @@ The HTTP listener starts **before** model loading finishes. During startup,
 discovery is empty, and inference returns HTTP 503 until the engine is ready.
 Use `litmoe status` to distinguish loading or failure from an unreachable
 gateway; an open HTTP port does not itself mean inference is ready.
+
+For WARP, initial startup sends a best-effort four-token warmup request after
+the runtime reports `ready`. It bypasses gateway admission and may overlap
+client requests. Neither discovery nor readiness proves warmup completion.
+Switches and cancellation reloads skip this step; later prompts may still
+need cold expert reads.
 
 One inference lease lasts through the whole stream. The default queue permits
 eight waiting admissions for up to 30 seconds; overflow or expiry returns 429.
@@ -97,21 +99,15 @@ claude                                         # normal Claude Code, untouched
    for that process);
 6. `exec`s `claude --model <id> "$@"` — all of the above dies with that process.
 
-Verified on 2026-09-16 against a running gateway: inside the wrapper,
-`claude auth status --text` reported `Auth token: ANTHROPIC_AUTH_TOKEN` and
-`Anthropic base URL: http://127.0.0.1:<gateway port>`; a `-p` prompt ran
-end-to-end (`modelUsage: gemma-4-26b-a4b`, result `PONG`); immediately
-afterwards plain `claude auth status` still showed the Enterprise login and the
-shell had no `ANTHROPIC_*` / `CLAUDE_*` variables. Claude Code prints a
-one-line `[claude-code:unrecognized_model]` notice on stderr for non-Anthropic
-model ids; it is harmless.
+To verify isolation on your installation, compare `claude auth status --text`
+with `./scripts/claude-local auth status --text`, then run a local print-mode
+request. Check that the local session uses the gateway endpoint and that plain
+`claude` still uses your normal account or configured provider.
 
 ### What NOT to do
 
-- Do not `export ANTHROPIC_BASE_URL=...` in your shell or `.bashrc`/`.zshrc`
-  — every `claude` (and every other Anthropic SDK client) in that shell
-  silently goes local, and `claude auth status` will say `Auth token:` instead
-  of your login. (Earlier litmoe docs suggested exactly this. Removed.)
+- Do not `export ANTHROPIC_BASE_URL=...` in your shell or `.bashrc`/`.zshrc`;
+  it redirects Claude Code sessions and other clients that read the variable.
 - Do not put `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` `env`. That is
   global for every session. If you want a *project* that always uses the local
   model, put it in that project's `.claude/settings.local.json` (gitignored)
@@ -153,11 +149,16 @@ hermes                                    # normal Hermes, config untouched
 ```
 
 It runs `hermes chat --provider custom -m <model>` with
-`CUSTOM_BASE_URL=http://127.0.0.1:8090/v1`,
-`OPENAI_BASE_URL=http://127.0.0.1:8090/v1`, and `OPENAI_API_KEY=litmoe` set
-only in that process. The wrapper never writes your `config.yaml`.
-Current Hermes uses `CUSTOM_BASE_URL` for the custom provider; setting only
-`OPENAI_BASE_URL` can leave requests pointed at a saved endpoint instead.
+`CUSTOM_BASE_URL` and `OPENAI_BASE_URL` set to the gateway's `/v1` endpoint,
+and `OPENAI_API_KEY` set from `--key` or `LITMOE_API_KEY` (default `litmoe`).
+These settings apply only to the child process; the wrapper does not write
+`config.yaml`. It sets both endpoint variables because the custom provider
+uses `CUSTOM_BASE_URL`.
+
+For an authenticated gateway, pass both `--model <active-id>` and a matching
+key. The Hermes wrapper's automatic discovery currently sends no authorization
+header; an explicit model skips that discovery request. `--model` does not
+switch the resident model.
 
 Even a short message includes the harness's system prompt and tool definitions.
 Use the gateway's approximate prompt-token log and the engine log to distinguish
@@ -176,9 +177,6 @@ hermes -p litmoe                          # talks to the local model
 hermes                                    # default profile, unchanged
 ```
 
-`hermes profile alias litmoe` installs a `litmoe` command that always runs
-that profile.
-
 ### Or a model alias in your normal config
 
 Add to `~/.hermes/config.yaml` (this does not change the default model):
@@ -189,20 +187,19 @@ model_aliases:
     model: gemma-4-26b-a4b
     provider: custom
     base_url: "http://127.0.0.1:8090/v1"
-    api_key: litmoe          # required: without it Hermes would send your DEFAULT provider's key to this host
+    api_key: litmoe          # dummy only when the gateway has api_key: null
 ```
 
-Then `/model local` inside a session, `/model` again to go back. The
-`api_key` line matters even though the gateway ignores it (`api_key: null`
-in models.yaml): Hermes refuses to reuse the default provider's credential for
-an alias endpoint, so an alias without its own key fails instead of leaking.
+Select the alias with `/model local`. Use `/model` to select your normal
+provider again. Give the alias its own credential: use a dummy value for an
+unauthenticated gateway or the gateway's configured key when authentication
+is enabled. Do not use a cloud-provider credential for the local endpoint.
 
 ### What NOT to do
 
-`hermes config set model.provider custom` / `model.base_url ...` (the previous
-README's instructions) rewrite the default profile's config, so **every** later
-Hermes session uses the local model until you run the reverse commands. Use one
-of the three options above instead.
+`hermes config set model.provider custom` and `hermes config set model.base_url
+...` change the default profile for later sessions. Use the session wrapper,
+a separate profile, or a model alias when you want to keep that default.
 
 ## OMP (oh-my-pi)
 
@@ -246,14 +243,11 @@ shell, including tools you did not intend to touch.
 
 Claude Code uses the Anthropic Messages stream; Hermes's custom provider uses
 OpenAI chat completions. Verify both paths, not only non-streaming responses.
-The gateway consumes the already-open `httpx.Response` directly and closes the
-response and client on completion, read failure, or consumer closure. An
-`httpx.Response` is not an asynchronous context manager: using `async with` on
-it aborts the Anthropic stream immediately after `message_start`.
+The gateway closes the upstream response and client on stream completion,
+read failure, or consumer closure.
 
-Protocol smoke checks with small synthetic model weights establish transport
-correctness only. They do not establish responsiveness with real model weights,
-long harness prompts, or the user's hardware.
+Protocol checks with scripted responses or synthetic weights establish
+transport behavior only, not real-model speed or quality.
 
 The interactive cutover was exercised on Linux with Claude Code 2.1.283,
 Hermes 0.21.5, and OMP 18.4.3 against a real HTTP gateway with scripted upstream
@@ -287,7 +281,7 @@ fingerprint weights or binaries. Also record the Mac chip, macOS, memory
 pressure, swap, disk I/O, and native prefill/decode/cache statistics before
 choosing WARP versus an equivalent llama.cpp/Metal or MLX candidate.
 
-## Checklist before you say "it's broken"
+## Troubleshooting
 
 ```bash
 claude auth status --text        # should show your real login, no "Anthropic base URL" line
