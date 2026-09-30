@@ -60,15 +60,23 @@ if ! curl -sf --max-time 3 "$GATEWAY/health" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Default model = first model the gateway lists (aliases come after their model).
-if [[ -z "$MODEL" ]]; then
-  MODEL="$(curl -sf --max-time 5 "$GATEWAY/v1/models" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin)["data"]; m=[x["id"] for x in d if not x.get("alias_of")]; print(m[0] if m else "")' 2>/dev/null || true)"
-  if [[ -z "$MODEL" ]]; then
-    echo "claude-local: gateway has no models loaded (check models.yaml and litmoe status)" >&2
-    exit 1
-  fi
-fi
+# Use the resident model's actual capacity, not Claude's unknown-model 200K default.
+DETAILS="$(curl -sf --max-time 5 -H "Authorization: Bearer $KEY" "$GATEWAY/v1/models" \
+  | python3 -c '
+import json, sys
+models = json.load(sys.stdin)["data"]
+requested = sys.argv[1]
+entry = next((m for m in models if m["id"] == requested), None) if requested else next((m for m in models if not m.get("alias_of")), None)
+if entry is None:
+    raise SystemExit("claude-local: model is not ready; explicitly run litmoe switch MODEL")
+context = entry.get("context_window")
+if type(context) is not int or context <= 0:
+    raise SystemExit("claude-local: gateway did not report effective context")
+print(entry["id"])
+print(context)
+' "$MODEL")"
+MODEL="${DETAILS%%$'\n'*}"
+CONTEXT="${DETAILS#*$'\n'}"
 
 mkdir -p "$CONFIG_DIR"
 
@@ -87,5 +95,6 @@ exec env \
   ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL" \
   CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
   CLAUDE_CONFIG_DIR="$CONFIG_DIR" \
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CONTEXT" \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   claude --model "$MODEL" "$@"

@@ -24,7 +24,7 @@
   <rect x="80" y="120" width="1240" height="80" rx="12" fill="#0d2818" stroke="#2ea043" stroke-width="2"/>
   <text x="700" y="155" text-anchor="middle" class="section-title">Clients</text>
   <text x="700" y="180" text-anchor="middle" class="box-text">
-    Hermes Agent · Claude Code · Open WebUI · aider · Continue.dev · curl · Python · any OpenAI/Anthropic SDK
+    Hermes Agent · Claude Code · OMP · Open WebUI · aider · curl · Python · any OpenAI/Anthropic SDK
   </text>
 
   <!-- Vertical arrow down to gateway -->
@@ -35,13 +35,13 @@
   <!-- GATEWAY layer -->
   <rect x="80" y="250" width="1240" height="180" rx="12" fill="#1c1917" stroke="#d29922" stroke-width="2"/>
   <text x="110" y="285" class="section-title">litmoe Gateway</text>
-  <text x="110" y="305" class="box-text-mono">litmoe/server.py · FastAPI + uvicorn · ~780 lines</text>
+  <text x="110" y="305" class="box-text-mono">server.py + runtime.py · FastAPI + uvicorn · one resident engine</text>
 
   <!-- Routes inside gateway -->
   <rect x="110" y="325" width="220" height="80" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="220" y="350" text-anchor="middle" class="box-title">/v1/models</text>
-  <text x="220" y="370" text-anchor="middle" class="box-text-mono">list configured models</text>
-  <text x="220" y="388" text-anchor="middle" class="box-text-mono">+ engine field</text>
+  <text x="220" y="370" text-anchor="middle" class="box-text-mono">ready model + aliases</text>
+  <text x="220" y="388" text-anchor="middle" class="box-text-mono">effective context</text>
 
   <rect x="350" y="325" width="220" height="80" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="460" y="350" text-anchor="middle" class="box-title">/health</text>
@@ -64,9 +64,9 @@
   <text x="1180" y="388" text-anchor="middle" class="box-text-mono">pass-through</text>
 
   <!-- Note box inside gateway -->
-  <text x="900" y="420" text-anchor="middle" class="box-text">request body forwarded to engine.base_url/v1/...  ·  latency added: ~1-5 ms</text>
+  <text x="900" y="420" text-anchor="middle" class="box-text">one inference lease · bounded queue · explicit model switching</text>
 
-  <!-- Direct gateway routes to all three engines -->
+  <!-- Alternative backends: only one is resident -->
   <line x1="700" y1="430" x2="700" y2="455" class="arrow"/>
   <line x1="260" y1="455" x2="1140" y2="455" class="arrow"/>
   <line x1="260" y1="455" x2="260" y2="492" class="arrow"/>
@@ -177,7 +177,7 @@
     <text x="750" y="1096">litmoe init                # config + catalog default</text>
     <text x="750" y="1117">litmoe install --engine warp  # pinned runtime only</text>
     <text x="750" y="1138">litmoe install --model ID  # all-engine catalog</text>
-    <text x="750" y="1159">litmoe serve               # gateway + configured engines</text>
+    <text x="750" y="1159">litmoe serve ID            # one resident engine</text>
     <text x="750" y="1180">litmoe status              # poll /health</text>
     <text x="750" y="1201">litmoe stop                # stop litmoe-started engines</text>
     <text x="750" y="1222">litmoe models              # includes two WARP recipes</text>

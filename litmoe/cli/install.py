@@ -1572,20 +1572,6 @@ def install_cmd(
     if info.get("notes"):
         click.echo(f"  NOTE: {info['notes']}")
 
-    from litmoe.config import load_config
-    from litmoe.server import check_fits_together
-    try:
-        validation = check_fits_together(load_config(config_path).models)
-    except Exception:  # unreadable/partial config: the serve-time check will catch it
-        validation = None
     click.echo()
-    crowded = validation is not None and validation.level == "no" and len(validation.per_model) > 1
-    if crowded:
-        click.echo(
-            f"  NOTE: models.yaml now lists {len(validation.per_model)} models needing "
-            f"~{validation.total_gb:.0f} GB together; this machine has "
-            f"~{validation.ram_limit_gb:.0f} GB usable. `litmoe serve` loads all of them at once,"
-        )
-        click.echo(f"        so serve one at a time:  litmoe serve {model_name}")
-        click.echo()
-    click.echo("Done. Next:  litmoe serve" + (f" {model_name}" if crowded else ""))
+    click.echo(f"Done. Next:  litmoe serve {model_name}")
+    click.echo(f"Gateway already running? Restart it to read the updated config, then: litmoe switch {model_name}")

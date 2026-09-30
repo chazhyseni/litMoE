@@ -3,15 +3,17 @@
 The rule litmoe follows: **pointing a harness at a local model must never
 change what that harness does when you run it normally.** Claude Code should
 keep using your Anthropic account, Hermes should keep using its configured
-provider, and switching back must require zero cleanup.
+provider, and plain OMP should keep its normal profiles. Switching back requires
+no cleanup.
 
 This document lists, per harness, what it reads to decide where requests go,
 what litmoe touches (nothing global), and how to verify.
 
 ## What litmoe itself never does
 
-- Never writes to `~/.claude/`, `~/.hermes/config.yaml`, `~/.hermes/.env`,
-  shell rc files, or any harness config.
+- Never rewrites `~/.claude/`, `~/.hermes/config.yaml`, `~/.hermes/.env`,
+  normal OMP profiles, or shell rc files. The OMP launcher owns only its
+  marked `~/.litmoe/omp/` directories.
 - Never exports environment variables into your shell. `litmoe serve` sets
   variables only for the engine subprocesses it spawns.
 - Never binds a port a harness uses by default: the gateway is `127.0.0.1:8090`
@@ -21,6 +23,33 @@ what litmoe touches (nothing global), and how to verify.
 - `litmoe stop` only signals engines litmoe started (tracked in
   `~/.litmoe/run/*.pid`). An Ollama/LM Studio/manual `llama-server` is left
   alone unless you pass `--all`.
+
+## One resident model
+
+`litmoe serve MODEL` loads one configured model; omitted MODEL means the first
+entry. `litmoe switch OTHER` drains the current request, stops the owned native
+process, then starts OTHER. Client `--model` flags do not trigger switching.
+Known inactive IDs return 409 instead of substituting another model.
+After switching, relaunch the wrapper so its model and context match discovery.
+
+`litmoe status` and `/v1/runtime` expose selected/active IDs, readiness, queue,
+effective context, and cache/cancellation capabilities. `/v1/models` lists only
+the ready model and its aliases. The runtime endpoints use the same `api_key`
+authentication as inference; keep unauthenticated gateways on loopback.
+
+One inference lease lasts through the whole stream. The default queue permits
+eight waiting admissions for up to 30 seconds; overflow or expiry returns 429.
+Disconnecting a queued client removes its wait without dispatching inference.
+For active inference, cancellation **terminates the owned native process**:
+the current adapters lack a proven request-abort acknowledgement. The next
+request reloads the same selected model. This costs startup time and loses
+prefix state, but does not leave abandoned decoding running in the background.
+
+WARP reports no reusable prompt cache: the pinned server resets state for each
+HTTP request. Its expert-weight cache is not a conversation-prefix cache.
+llama.cpp may retain a prefix in its single backend slot; this is backend
+capability, not a claim that a particular request hit cache. Switches and
+cancellation clear it. No hidden prompt pruning or gateway cloud fallback.
 
 ## Claude Code
 
@@ -32,6 +61,7 @@ what litmoe touches (nothing global), and how to verify.
 | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | Credential; when either is set your claude.ai / Enterprise login is **not** used for that process | env, `apiKeyHelper` in settings |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` | Which model id the `sonnet`/`opus`/`haiku` aliases and subagents resolve to | env, settings `model` |
 | `CLAUDE_CONFIG_DIR` | Where sessions, settings, and cached credentials live (default `~/.claude`) | env |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | Effective context discovered from the resident gateway model, rather than the unknown-model default | wrapper process env |
 
 Environment variables override `settings.json`; both are read per process.
 That is what makes clean isolation possible: set them **only** for the one
@@ -48,7 +78,8 @@ claude                                         # normal Claude Code, untouched
 
 `claude-local` (copy it onto your PATH if you like):
 
-1. checks the gateway is up and picks the first model it serves (or `--model`);
+1. checks the gateway, selects its ready model (or validates `--model`), and
+   passes the discovered context as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`;
 2. **unsets** any `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / Bedrock /
    Vertex variables inherited from your shell, so nothing leaks either way;
 3. sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (any string when the
@@ -87,9 +118,9 @@ model ids; it is harmless.
 Claude Code sends Anthropic model names — the one you pick plus
 `claude-haiku-4-5` for background tasks even when `--model` is set. `litmoe
 init` and `litmoe install` attach the common Claude names as `aliases:` on the
-first model so those requests resolve instead of 404ing. This only affects
-requests that already reached litmoe; it has no effect on real Anthropic
-traffic. `claude-local` also sets the `ANTHROPIC_DEFAULT_*_MODEL` variables so
+first model. An alias is usable only while its model is resident; inactive
+aliases return 409. This has no effect on real Anthropic traffic.
+`claude-local` also sets the `ANTHROPIC_DEFAULT_*_MODEL` variables so
 Claude Code itself sends the local id wherever it can.
 
 ### Undo / revert
@@ -167,6 +198,35 @@ README's instructions) rewrite the default profile's config, so **every** later
 Hermes session uses the local model until you run the reverse commands. Use one
 of the three options above instead.
 
+## OMP (oh-my-pi)
+
+```bash
+litmoe serve glm-5.3-flash-warp
+./scripts/omp-local
+./scripts/omp-local -p "explain this repo"
+omp                                  # normal OMP state, unchanged
+```
+
+Wrapper options `--gateway`, `--model`, and `--key` must precede OMP arguments.
+They also accept `LITMOE_GATEWAY`, `LITMOE_MODEL`, and `LITMOE_API_KEY`.
+The launcher checks authenticated runtime/discovery before starting OMP; an
+inactive model, missing context, or unready engine fails without launching.
+
+Each endpoint/model/context combination gets a marked directory under
+`~/.litmoe/omp/`. Its `models.yml` defines the local OpenAI-completions provider;
+`config.yml` pins all model roles to that provider and disables model fallback,
+advisor calls, and context promotion. `PI_CODING_AGENT_DIR` and the explicit
+config overlay isolate this invocation from ordinary OMP profiles. The API key
+is an environment reference, not a credential written into those files.
+Profile/provider/model/config override flags are rejected instead of silently
+escaping isolation.
+
+The model advertises its actual context and text input only. Tool calling was
+exercised with OMP's bash tool; vision and long-context model quality are not
+established by that check. For OMP's independent prefill/generation/cache-pair
+experiments, consult the installed version's `omp bench --help`; the launcher
+itself is for agent sessions, not a benchmark subcommand wrapper.
+
 ## Open WebUI / other OpenAI-SDK clients
 
 Add `http://127.0.0.1:8090/v1` as an **additional** connection rather than
@@ -188,6 +248,38 @@ it aborts the Anthropic stream immediately after `message_start`.
 Protocol smoke checks with small synthetic model weights establish transport
 correctness only. They do not establish responsiveness with real model weights,
 long harness prompts, or the user's hardware.
+
+The interactive cutover was exercised on Linux with Claude Code 2.1.283,
+Hermes 0.21.5, and OMP 18.4.3 against a real HTTP gateway with scripted upstream
+responses. All three completed print-mode calls; OMP executed a bash tool and
+sent its result back. Separate real pinned-WARP synthetic-weight runs completed
+OpenAI/Anthropic streams, cancellation/reload, explicit switching, paired
+benchmark requests, and native-process cleanup after CLI SIGTERM.
+These checks do **not** measure real-model speed or quality on Apple Silicon.
+
+## Measure on the gateway host
+
+Run with other clients idle; direct requests intentionally bypass gateway
+admission. Start with a short transport check, then repeat with a representative
+non-private harness-sized prompt:
+
+```bash
+litmoe bench --prompt "hi" --runs 3 --max-tokens 128 --json
+litmoe bench --prompt-file /path/to/representative-prompt.txt --runs 3 --json
+```
+
+The report separates headers, first generated delta (including reasoning/tool
+output), first visible text, and completion. Role-only events do not count as
+tokens. Missing usage stays null; errors and incomplete streams fail the run.
+Runtime identity/generation detect restarts, even when the model ID is unchanged.
+Prompt hashes/sizes are recorded, not private prompt or response text.
+
+Alternating direct/gateway order is not a matched cold/warm comparison, and
+tokens divided by total response time is not decode-only speed. Record exact
+model artifact/quantization and backend build separately; the report does not
+fingerprint weights or binaries. Also record the Mac chip, macOS, memory
+pressure, swap, disk I/O, and native prefill/decode/cache statistics before
+choosing WARP versus an equivalent llama.cpp/Metal or MLX candidate.
 
 ## Checklist before you say "it's broken"
 

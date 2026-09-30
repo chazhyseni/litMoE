@@ -179,15 +179,14 @@ storage-paged containers. The llama.cpp laptop-tier choices are MoEs with
 3–5 B active parameters or ≤ 31 B dense — the ones that are actually fast on
 CPU/Metal.
 
-`litmoe serve` loads **every** entry in `models.yaml` at once. Catalogued
-llama.cpp and ktransformers entries with RAM estimates must fit together:
-`litmoe init` only writes a set that does, and `litmoe install --model` warns
-when adding one breaks that. At start, `serve` checks two limits: the GPU
-budget (75 % of RAM on macOS) and usable RAM (90 % minus 3 GB). Over the first
-but under the second it starts with a warning — llama.cpp keeps the overflow
-on the CPU, so it is slower. Over RAM it refuses and names a catalog model or
-quant that does fit. WARP catalog and manual entries are not assessed with
-that weights-plus-KV formula: WARP streams weights. At each startup,
+`litmoe serve` starts the **first** configured model, or the single model named
+on the command line. Other entries remain available through `litmoe switch ID`;
+their RAM estimates are not summed. `litmoe init` writes alternatives that fit
+individually. At startup, the selected model is checked against the GPU budget
+(75% of RAM on macOS) and usable RAM (90% minus 3 GB). Over GPU budget but
+under RAM it starts with a warning; over RAM it refuses unless `--force` is
+explicitly selected. WARP uses its own resident-memory planner rather than
+the weights-plus-KV estimate. At each startup,
 `warp_auto_context: true` uses the installed WARP memory planner to fit the
 native window (1,048,576 tokens for both catalog entries). Recommended resident
 memory, plus vision memory when enabled, must fit 75% of WARP's usable RAM
@@ -203,12 +202,10 @@ that limit. A positive install-time `--n-ctx N` selects fixed mode automatically
 Unknown manual model IDs need `config.max_position_embeddings` in their manifest
 or a fixed context. No re-download or conversion is required; restart the gateway.
 
-The WARP budget is per engine and based on capacity, **not current free RAM**.
-Serve one WARP model at a time, or assign budgets that leave room for other
-models and applications. A manually oversized `--budget` is passed upstream
-unchanged, not clamped by context fitting. Serve a subset with
-`litmoe serve <id> [<id2>…]` (or `--model`), or use `--force` to start
-regardless.
+The WARP budget is based on capacity, **not current free RAM**. One litmoe
+engine is resident, but other applications and independently launched engines
+still consume memory. An oversized explicit `--budget` passes upstream
+unchanged. `litmoe serve ID` selects one initial model; multiple IDs are rejected.
 
 ### 48 GB laptop — default tier
 
@@ -355,7 +352,7 @@ Field reference (see `litmoe/config.py`):
 | `n_ctx` | WARP | resolved positive `--ctx N`; automatically fitted and persisted in auto mode; fixed positive window otherwise |
 | `warp_auto_context` | WARP | `true`: re-fit native context each startup; `false`: preserve a positive `n_ctx`; omitted: migrate legacy 0/65536 to auto |
 | `n_gpu_layers` | llama.cpp | `-ngl` |
-| `extra_args` | all | passed through to the engine; WARP supports `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`, but rejects conflicting `--ctx` |
+| `extra_args` | all | engine flags; WARP rejects conflicting `--ctx`; llama.cpp rejects context/slot overrides (`-c`, `--ctx-size`, `-np`, `--parallel`, `--kv-unified-per-slot`) |
 | `env` | all | extra environment for the engine process; also used by WARP's isolated memory planner |
 | `kt_method` | ktransformers | CPU expert backend: `FP8`, `FP8_PERCHANNEL`, `BF16`, `RAWINT4`, `MXFP4`, `MXFP8` (AVX-512); `AMXINT4`, `AMXINT8` (Intel AMX); `LLAMAFILE` (AVX2, GGUF experts via `gguf_path`) |
 | `kt_num_gpu_experts` | ktransformers | experts pinned on GPU |
@@ -365,17 +362,27 @@ Field reference (see `litmoe/config.py`):
 ## Step 5: Run
 
 ```bash
-litmoe serve                            # gateway + all engines; refuses a set that will not fit in RAM
-litmoe serve gemma-4-26b-a4b            # only this entry (several ids allowed); --force skips the fit check
-litmoe status                           # gateway health + per-engine state
+litmoe serve                            # first configured model only
+litmoe serve gemma-4-26b-a4b             # one initial selection; --force skips its fit refusal
+litmoe switch qwen3.6-35b-a3b            # configured alternative; drain and unload before loading
+litmoe status                           # resident state, queue, effective context, capabilities
+litmoe bench --runs 3 --json             # gateway vs direct engine; run here with clients idle
 litmoe stop                             # stop engines litmoe started (PID files)
 curl http://127.0.0.1:8090/v1/models
 ```
 
-Engines get ports counting up from 8081, skipping the gateway port and any
-port another process already holds (so a stray llama-server on 8081 does not
-kill yours). Engine logs append to `logs/<model-id>.log` with a session header
-per start.
+The resident engine takes a free loopback port starting at 8081, skipping the
+gateway port and occupied ports. Logs append to `logs/<model-id>.log`.
+Switching waits for the active request and prevents new admission during the
+transition. A failed switch leaves an explicit failed state, never the old
+model masquerading as the requested one. Retry with `litmoe switch ID`.
+
+Top-level `max_queue_size` (default 8) and `queue_timeout` (default 30 seconds)
+bound admission; full/expired waits return HTTP 429. Known inactive model IDs
+return 409, unknown IDs 404, and switching/failed engines 503.
+Set `api_key` to protect inference and `/v1/runtime` control; null preserves
+unauthenticated local use. Keep the gateway on loopback unless deliberately
+exposing and securing it.
 
 Environment variables litmoe reads (all optional, all `LITMOE_*` — it never
 reads or sets `ANTHROPIC_*` / `OPENAI_*`): `LITMOE_CONFIG` (models.yaml path),

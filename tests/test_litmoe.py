@@ -1,6 +1,7 @@
 """Unit tests for litmoe (no network, no engines)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -560,8 +561,10 @@ def test_upstream_error_on_stream_is_a_real_http_error(monkeypatch):
         model = ModelEntry(id="m", engine="llamacpp", model_path="/tmp/x.gguf", aliases=["claude-sonnet-4-5"])
         base_url = "http://127.0.0.1:8081"
         process = None
+        def is_running(self): return True
     gw = S.Gateway(GatewayConfig(models=[_Eng.model]))
-    gw.engines = {"m": _Eng(), "claude-sonnet-4-5": _Eng()}
+    gw.runtime.engine = _Eng()
+    gw.runtime.state = "ready"
     c = TestClient(gw.app)
 
     r = c.post("/v1/chat/completions", json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]})
@@ -639,33 +642,30 @@ def test_anthropic_stream_real_httpx_response_lifecycle(ending):
     asyncio.run(run())
 
 
-def test_dead_engine_is_a_503_not_a_broken_200_stream():
-    """Observed: `litmoe stop` under a live gateway killed the engines; the next
-    streaming request got HTTP 200 and then 'Stream error'. A dead engine must
-    fail before the response is committed, with the reason and the log path."""
-    from fastapi import HTTPException
+@pytest.mark.parametrize("code", [-15, 1])
+def test_dead_engine_is_a_503_not_a_broken_200_stream(code):
+    from types import SimpleNamespace
+    import httpx
 
-    class _Proc:
-        def __init__(self, code): self._code = code
-        def poll(self): return self._code
+    model = ModelEntry(id="dead", engine="warp", model_path="/unused.waste")
+    gateway = S.Gateway(GatewayConfig(models=[model]))
+    gateway.runtime.engine = SimpleNamespace(
+        model=model, base_url="http://127.0.0.1:1",
+        process=SimpleNamespace(poll=lambda: code), is_running=lambda: False,
+    )
+    gateway.runtime.state = "ready"
 
-    class _Eng:
-        def __init__(self, mid, code):
-            self.model = ModelEntry(id=mid, engine="llamacpp", model_path="/tmp/x.gguf")
-            self.base_url = "http://127.0.0.1:8081"
-            self.process = _Proc(code)
-            self._log_path = Path("logs") / f"{mid}.log"
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                                     base_url="http://gateway") as client:
+            response = await client.post("/v1/chat/completions", json={
+                "model": "dead", "messages": [], "stream": True,
+            })
+        assert response.status_code == 503
+        assert response.headers["content-type"].startswith("application/json")
+        assert gateway.runtime.status()["active_model"] is None
 
-    gw = S.Gateway(GatewayConfig(models=[]))
-    gw.engines = {"alive": _Eng("alive", None), "killed": _Eng("killed", -15), "crashed": _Eng("crashed", 1)}
-
-    assert gw._resolve("alive")[0].id == "alive"
-    with pytest.raises(HTTPException) as e:
-        gw._resolve("killed")
-    assert e.value.status_code == 503 and "was stopped" in e.value.detail and "logs/killed.log" in e.value.detail
-    with pytest.raises(HTTPException) as e:
-        gw._resolve("crashed")
-    assert e.value.status_code == 503 and "exited with code 1" in e.value.detail
+    asyncio.run(scenario())
 
 
 def test_openai_to_anthropic_response():
@@ -1103,81 +1103,13 @@ def test_init_picks_fast_defaults_per_ram(tmp_path, monkeypatch):
             assert (M.KNOWN_MODELS[m.id].get("active_b") or 0) <= (12 if gb <= 96 else 1e9), (gb, m.id)
 
 
-def test_fit_together_is_a_joint_budget_not_per_model():
-    """Each of these fits a 103 GB Mac (77 GB budget) alone; loaded at once they OOM Metal."""
-    picks = ["gemma-4-26b-a4b", "gpt-oss-120b", "qwen3.5-122b-a10b"]
-    assert all(M.ram_needed_gb(m) <= 77 for m in picks)
-    kept, dropped = M.fit_together(picks, 77.0)
-    assert kept == ["gemma-4-26b-a4b"]
-    assert dropped == ["gpt-oss-120b", "qwen3.5-122b-a10b"]
-    # Order is preserved and a big budget keeps everything.
-    assert M.fit_together(picks, 768.0) == (picks, [])
-    # Headroom is counted once, not per model.
-    assert M.ram_needed_together_gb([10.0, 10.0]) == 20.0 - M._OS_HEADROOM_GB
-
-
-def test_init_writes_only_models_that_fit_together(tmp_path, monkeypatch):
-    """Regression: init wrote 140 GB of models for a 103 GB Mac; serve then OOMed on Metal."""
+def test_serve_rejects_multiple_initial_models_before_starting(monkeypatch):
     from click.testing import CliRunner
-    import litmoe.cli.main as CM
+    from litmoe.cli.main import cli
 
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(CM, "get_total_memory_bytes", lambda: int(103e9))
-    monkeypatch.setattr(CM, "is_macos", lambda: True)
-    r = CliRunner().invoke(CM.cli, ["init"])
-    assert r.exit_code == 0, r.output
-    ids = [m.id for m in load_config(tmp_path / "models.yaml").models]
-    kept, _ = M.fit_together(ids, 103 * 0.75)
-    assert kept == ids, (ids, r.output)          # everything written loads together
-    assert ids == ["gemma-4-26b-a4b"]
-    assert "serve --model" in r.output            # and the user is told how to run the others
-
-
-def test_serve_gate_two_thresholds(tmp_path, monkeypatch):
-    """Over the GPU budget but within RAM -> start with a warning (partial CPU offload).
-    Over RAM -> refuse with a useful hint, unless --force. Positional ids == --model."""
-    from click.testing import CliRunner
-    import litmoe.cli.main as CM
-
-    cfg = tmp_path / "models.yaml"
-    cfg.write_text(
-        "port: 8090\nmodels:\n"
-        "  - {id: gemma-4-26b-a4b, engine: llamacpp, model_path: 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n"
-        "  - {id: qwen3.5-122b-a10b, engine: llamacpp, model_path: 'unsloth/Qwen3.5-122B-A10B-GGUF:UD-IQ4_XS', n_ctx: 262144}\n"
-        "  - {id: qwen3.8-flash-next, engine: llamacpp, model_path: 'unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL', n_ctx: 32768}\n")
-    # 103 GB Mac: GPU budget ~77 GB, RAM limit ~90 GB.
-    monkeypatch.setattr(S, "get_total_memory_bytes", lambda: int(103.1e9))
-    monkeypatch.setattr(S, "is_macos", lambda: True)
-    monkeypatch.setattr(CM, "is_macos", lambda: True)
-    started = []
-    monkeypatch.setattr(S, "run", lambda cfg, **kw: started.append([m.id for m in cfg.models]))
-    run = lambda *args: CliRunner().invoke(CM.cli, ["serve", "-c", str(cfg), *args])
-
-    # All three: far over RAM -> refused, and the hint names one that fits, not the same set.
-    r = run()
-    assert r.exit_code == 1 and not started, r.output
-    assert "Serve one that fits:   litmoe serve gemma-4-26b-a4b" in r.output
-
-    # Fits the GPU budget -> silent start. Positional form.
-    r = run("gemma-4-26b-a4b")
-    assert r.exit_code == 0 and started == [["gemma-4-26b-a4b"]], r.output
-    assert "needs" not in r.output
-
-    # ~78 GB: over the 77 GB Metal budget, under the 90 GB RAM limit -> starts, warns about CPU offload.
-    r = run("--model", "qwen3.5-122b-a10b")
-    assert r.exit_code == 0 and started[-1] == ["qwen3.5-122b-a10b"], r.output
-    assert "part of it will run on the CPU" in r.output
-
-    # ~129 GB single model: over RAM -> refused; the hint is a smaller quant, never '--model <itself>'.
-    r = run("qwen3.8-flash-next")
-    assert r.exit_code == 1 and started[-1] != ["qwen3.8-flash-next"], r.output
-    assert "--quant" in r.output and "serve qwen3.8-flash-next" not in r.output
-
-    r = run("qwen3.8-flash-next", "--force")
-    assert r.exit_code == 0 and started[-1] == ["qwen3.8-flash-next"], r.output
-
-    r = run("nope")
-    assert r.exit_code == 1 and "not in" in r.output
+    monkeypatch.setattr(S, "run", lambda *args, **kwargs: pytest.fail("multiple engines were requested"))
+    result = CliRunner().invoke(cli, ["serve", "one", "two"])
+    assert result.exit_code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2831,7 +2763,7 @@ def test_server_context_preparation_migrates_warp_defaults(
         ),
     )
 
-    S.Gateway(config, config_path=str(config_path)).load_engines()
+    S.Gateway(config, config_path=str(config_path))._start_engine(model)
 
     if auto is True or (auto is None and requested_ctx in (0, 65536)):
         assert model.n_ctx > 87644
@@ -3102,12 +3034,12 @@ def test_warp_auto_context_refits_after_restart(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(WarpEngine, "start", lambda self, log_dir=None: self.build_command())
     first = S.Gateway(load_config(path), config_path=str(path))
-    first.load_engines()
+    first._start_engine(first.config.models[0])
     assert first.config.models[0].n_ctx == 1048576
     second_config = load_config(path)
     second_config.models[0].env["TEST_WARP_RAM_GIB"] = "16"
     second = S.Gateway(second_config, config_path=str(path))
-    second.load_engines()
+    second._start_engine(second.config.models[0])
     assert second.config.models[0].n_ctx == 114688
     assert load_config(path).models[0].warp_auto_context is True
 
@@ -3145,7 +3077,7 @@ def test_warp_rejects_conflicting_context_flags(tmp_path, monkeypatch, extra):
         engine.build_command()
 
 
-def test_warp_planning_failure_preserves_config_and_starts_other_models(tmp_path, monkeypatch):
+def test_warp_planning_failure_preserves_config(tmp_path, monkeypatch):
     from litmoe.engines.warp import WarpEngine
 
     root = _fake_warp_root(tmp_path)
@@ -3161,7 +3093,424 @@ def test_warp_planning_failure_preserves_config_and_starts_other_models(tmp_path
     before = path.read_bytes()
     monkeypatch.setattr(WarpEngine, "start", lambda self, log_dir=None: self.build_command())
     gateway = S.Gateway(load_config(path), config_path=str(path))
-    gateway.load_engines()
-    assert "glm-5.3-flash-warp" not in gateway.engines
-    assert "explicit" in gateway.engines
+    with pytest.raises(RuntimeError, match="context planning failed"):
+        gateway._start_engine(gateway.config.models[0])
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}, {"x-api-key": "wrong"}])
+def test_runtime_control_rejects_invalid_credentials(monkeypatch, headers):
+    import asyncio
+    import httpx
+
+    def unexpected_start(*args, **kwargs):
+        pytest.fail("unauthorized runtime control attempted to construct an engine")
+
+    monkeypatch.setattr(S, "make_engine", unexpected_start)
+    gateway = S.Gateway(GatewayConfig(
+        api_key="runtime-test-key",
+        models=[ModelEntry(id="one", engine="warp", model_path="/unused.waste")],
+    ))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gateway.app), base_url="http://gateway",
+        ) as client:
+            status = await client.get("/v1/runtime", headers=headers)
+            switch = await client.post(
+                "/v1/runtime/model", headers=headers, json={"model": "one"},
+            )
+            assert status.status_code == 401
+            assert switch.status_code == 401
+
+    asyncio.run(scenario())
+
+
+def test_runtime_unknown_selection_does_not_start_an_engine(monkeypatch):
+    import asyncio
+    import httpx
+
+    monkeypatch.setattr(
+        S, "make_engine",
+        lambda *args, **kwargs: pytest.fail("an unknown model triggered engine construction"),
+    )
+    gateway = S.Gateway(GatewayConfig(
+        api_key="runtime-test-key",
+        models=[ModelEntry(id="one", engine="warp", model_path="/unused.waste")],
+    ))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gateway.app), base_url="http://gateway",
+            headers={"Authorization": "Bearer runtime-test-key"},
+        ) as client:
+            before = (await client.get("/v1/runtime")).json()
+            response = await client.post("/v1/runtime/model", json={"model": "unknown"})
+            assert response.status_code == 404
+            after = (await client.get("/v1/runtime")).json()
+            assert after["selected_model"] == before["selected_model"]
+            assert after["active_model"] == before["active_model"]
+            assert after["state"] == before["state"]
+            assert "runtime-test-key" not in json.dumps(after)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body", [[], None, {}, {"model": []}, {"model": 1}])
+def test_runtime_selection_validates_model_before_starting(monkeypatch, body):
+    import asyncio
+    import httpx
+
+    monkeypatch.setattr(
+        S, "make_engine",
+        lambda *args, **kwargs: pytest.fail("invalid selection triggered engine construction"),
+    )
+    gateway = S.Gateway(GatewayConfig(
+        models=[ModelEntry(id="one", engine="warp", model_path="/unused.waste")],
+    ))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gateway.app), base_url="http://gateway",
+        ) as client:
+            response = await client.post(
+                "/v1/runtime/model", content=json.dumps(body),
+                headers={"content-type": "application/json"},
+            )
+            assert response.status_code in (400, 422)
+
+    asyncio.run(scenario())
+
+
+def _interactive_gateway(monkeypatch, **options):
+    from types import SimpleNamespace
+
+    events, live, failures = [], set(), set()
+
+    class Engine:
+        def __init__(self, model):
+            self.model, self.base_url, self._log_path = model, None, None
+            self.process = SimpleNamespace(poll=lambda: None if self.is_running() else 1)
+
+        def set_port(self, port):
+            self.port = port
+
+        def default_port(self):
+            return self.port
+
+        def start(self, log_dir=None):
+            assert not live, "two engines became resident"
+            live.add(self.model.id)
+            self.base_url = "http://127.0.0.1:1"
+            events.append(("start", self.model.id))
+
+        def stop(self):
+            live.discard(self.model.id)
+            events.append(("stop", self.model.id))
+
+        def is_running(self):
+            return self.model.id in live
+
+        async def wait_ready(self, timeout):
+            return self.model.id not in failures
+
+    monkeypatch.setattr(S, "make_engine", Engine)
+    gateway = S.Gateway(GatewayConfig(models=[
+        ModelEntry(id="one", engine="warp", model_path="/unused.waste", aliases=["alias-one"]),
+        ModelEntry(id="two", engine="warp", model_path="/unused.waste"),
+    ], **options))
+    return gateway, events, live, failures
+
+
+class _ConnectedRequest:
+    gone = False
+
+    async def is_disconnected(self):
+        return self.gone
+
+
+async def _eventually(predicate):
+    import asyncio
+    async with asyncio.timeout(2):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+
+def test_single_resident_switch_drains_request_and_preserves_catalog(monkeypatch):
+    import asyncio
+    import httpx
+
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        await gateway.load_engines()
+        lease = await gateway.runtime.acquire("alias-one", _ConnectedRequest())
+        switch = asyncio.create_task(gateway.runtime.switch("two"))
+        await _eventually(lambda: gateway.runtime.state == "draining")
+        assert live == {"one"}
+        assert events == [("start", "one")]
+        await lease.close()
+        assert (await switch)["active_model"] == "two"
+        assert events == [("start", "one"), ("stop", "one"), ("start", "two")]
+        assert [m.id for m in gateway.config.models] == ["one", "two"]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                                     base_url="http://gateway") as client:
+            assert [m["id"] for m in (await client.get("/v1/models")).json()["data"]] == ["two"]
+            result = await client.post("/v1/chat/completions", json={"model": "one", "messages": []})
+            assert result.status_code == 409
+        await gateway.shutdown()
+        assert not live
+
+    asyncio.run(scenario())
+
+
+def test_failed_switch_never_substitutes_a_different_model(monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+
+    async def scenario():
+        gateway, events, live, failures = _interactive_gateway(monkeypatch)
+        await gateway.load_engines()
+        failures.add("two")
+        with pytest.raises(HTTPException) as error:
+            await gateway.runtime.switch("two")
+        assert error.value.status_code == 503
+        assert not live
+        assert gateway.runtime.status()["active_model"] is None
+        assert gateway.runtime.status()["selected_model"] == "two"
+        assert gateway.runtime.status()["state"] == "failed"
+        assert events == [("start", "one"), ("stop", "one"), ("start", "two"), ("stop", "two")]
+        await gateway.runtime.switch("one")
+        assert live == {"one"}
+        await gateway.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ending", ["disconnect", "timeout"])
+def test_bounded_queue_removes_waiters_without_dispatch(monkeypatch, ending):
+    import asyncio
+    from fastapi import HTTPException
+
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(
+            monkeypatch, max_queue_size=1, queue_timeout=0.1,
+        )
+        await gateway.load_engines()
+        lease = await gateway.runtime.acquire("one", _ConnectedRequest())
+        queued_request = _ConnectedRequest()
+        waiter = asyncio.create_task(gateway.runtime.acquire("one", queued_request))
+        await _eventually(lambda: gateway.runtime.queue_depth == 1)
+        with pytest.raises(HTTPException) as full:
+            await gateway.runtime.acquire("one", _ConnectedRequest())
+        assert full.value.status_code == 429
+        queued_request.gone = ending == "disconnect"
+        with pytest.raises(HTTPException) as removed:
+            await waiter
+        assert removed.value.status_code == (499 if ending == "disconnect" else 429)
+        assert gateway.runtime.queue_depth == 0
+        assert events == [("start", "one")]
+        assert live == {"one"}
+        await lease.close()
+        later = await gateway.runtime.acquire("one", _ConnectedRequest())
+        await later.close()
+        await gateway.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_stream_disconnect_stops_owned_engine_and_reloads_on_next_request(monkeypatch):
+    import asyncio
+    from starlette.requests import ClientDisconnect
+    from litmoe.runtime import LeasedStream
+
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        await gateway.load_engines()
+        lease = await gateway.runtime.acquire("one", _ConnectedRequest())
+
+        async def chunks():
+            yield b"data: first\n\n"
+            pytest.fail("disconnected consumer requested more generation")
+
+        class Resource:
+            async def aclose(self):
+                pass
+
+        response = LeasedStream(chunks(), lease, Resource(), Resource())
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("consumer closed socket")
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        with pytest.raises(ClientDisconnect):
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+        assert not live
+        assert gateway.runtime.state == "stopped"
+        assert not gateway.runtime.lock.locked()
+        later = await gateway.runtime.acquire("one", _ConnectedRequest())
+        assert live == {"one"}
+        assert events == [("start", "one"), ("stop", "one"), ("start", "one")]
+        await later.close()
+        await gateway.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_benchmark_distinguishes_role_reasoning_text_and_final_usage():
+    from litmoe.benchmark import StreamMetrics
+
+    metrics = StreamMetrics()
+    metrics.event(json.dumps({"choices": [{"delta": {"role": "assistant"}}]}), 0.1)
+    assert metrics.first_generated_s is None
+    metrics.event(json.dumps({"choices": [{"delta": {"reasoning_content": "reason"}}]}), 0.3)
+    metrics.event(json.dumps({"choices": [{"delta": {"content": "answer"}}]}), 0.8)
+    metrics.event(json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}), 1.0)
+    metrics.event(json.dumps({"choices": [], "usage": {"completion_tokens": 7}}), 1.1)
+    metrics.event("[DONE]", 1.2)
+    assert metrics.first_generated_s == 0.3
+    assert metrics.first_text_s == 0.8
+    assert metrics.usage["completion_tokens"] == 7
+    assert metrics.done and metrics.finish_reason == "stop"
+
+
+@pytest.mark.parametrize("body", [
+    'data: {"error":{"message":"private-response-marker"}}\n\n',
+    'data: not-json\n\n',
+    'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+])
+def test_benchmark_rejects_error_and_incomplete_streams_without_leaking_text(body):
+    import asyncio
+    import httpx
+    from litmoe.benchmark import measure
+
+    async def scenario():
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"},
+        ))
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await measure(client, "http://engine/v1/chat/completions", b"{}", {}, 1)
+        assert not result["success"]
+        assert result["error"] is not None
+        assert result["output_tokens"] is None
+        assert result["output_tokens_per_response_second"] is None
+        assert "private-response-marker" not in json.dumps(result)
+
+    asyncio.run(scenario())
+
+
+def test_simultaneous_admissions_cannot_overfill_the_queue(monkeypatch):
+    from fastapi import HTTPException
+
+    async def scenario():
+        gateway, _, _, _ = _interactive_gateway(monkeypatch, max_queue_size=1)
+        await gateway.load_engines()
+        requests = [asyncio.create_task(gateway.runtime.acquire("one", _ConnectedRequest()))
+                    for _ in range(10)]
+        await _eventually(lambda: requests[0].done())
+        lease = requests[0].result()
+        assert gateway.runtime.queue_depth == 1
+        assert all(task.done() and isinstance(task.exception(), HTTPException)
+                   and task.exception().status_code == 429 for task in requests[2:])
+        await lease.close()
+        second = await requests[1]
+        await second.close()
+        await gateway.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_native_start_recovers_process_ownership(monkeypatch):
+    import threading
+
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        entered, release = threading.Event(), threading.Event()
+        original = gateway.runtime.start_engine
+
+        def delayed_start(model):
+            entered.set()
+            assert release.wait(timeout=2)
+            return original(model)
+
+        gateway.runtime.start_engine = delayed_start
+        pending = asyncio.create_task(gateway.runtime.acquire("one", _ConnectedRequest()))
+        assert await asyncio.to_thread(entered.wait, 1)
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not live
+        assert events == [("start", "one"), ("stop", "one")]
+        assert not gateway.runtime.lock.locked()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_switches_never_overlap_resident_engines(monkeypatch):
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        await gateway.load_engines()
+        first, second = await asyncio.gather(
+            gateway.runtime.switch("two"), gateway.runtime.switch("one"),
+        )
+        assert first["active_model"] == "two"
+        assert second["active_model"] == "one"
+        assert live == {"one"}
+        assert events == [("start", "one"), ("stop", "one"), ("start", "two"),
+                          ("stop", "two"), ("start", "one")]
+        assert gateway.runtime.status()["generation"] == 3
+        await gateway.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("extra", [["-np", "4"], ["--parallel=2"], ["-c", "4096"], ["--ctx-size=4096"]])
+def test_gateway_rejects_flags_that_override_advertised_context_or_single_slot(extra, monkeypatch):
+    model = ModelEntry(id="one", engine="llamacpp", model_path="/unused.gguf", extra_args=extra)
+    gateway = S.Gateway(GatewayConfig(models=[model]))
+    monkeypatch.setattr(S, "make_engine", lambda *args: pytest.fail("conflicting engine settings started"))
+    with pytest.raises(ValueError):
+        gateway._start_engine(model)
+
+
+@pytest.mark.parametrize("action", ["cancel", "switch"])
+def test_failed_stop_retains_ownership_without_reopening_admission(monkeypatch, action):
+    from fastapi import HTTPException
+
+    async def scenario():
+        gateway, _, live, _ = _interactive_gateway(monkeypatch)
+        await gateway.load_engines()
+        engine = gateway.runtime.engine
+        original_stop = engine.stop
+
+        def failed_stop():
+            raise OSError("native stop failed")
+
+        monkeypatch.setattr(engine, "stop", failed_stop)
+        if action == "cancel":
+            lease = await gateway.runtime.acquire("one", _ConnectedRequest())
+            with pytest.raises(OSError):
+                await lease.close(abandoned=True)
+        else:
+            with pytest.raises(HTTPException):
+                await gateway.runtime.switch("two")
+        assert gateway.runtime.status()["state"] == "failed"
+        assert gateway.runtime.engine is engine
+        assert live == {"one"}
+        with pytest.raises(HTTPException) as rejected:
+            await gateway.runtime.acquire("one", _ConnectedRequest())
+        assert rejected.value.status_code == 503
+        for model in ("one", "two"):
+            with pytest.raises(HTTPException) as rejected:
+                await gateway.runtime.switch(model)
+            assert rejected.value.status_code == 503
+            assert live == {"one"}
+        monkeypatch.setattr(engine, "stop", original_stop)
+        await gateway.runtime.switch("two")
+        assert live == {"two"}
+        await gateway.shutdown()
+
+    asyncio.run(scenario())

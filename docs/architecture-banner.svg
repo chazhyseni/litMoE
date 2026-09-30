@@ -15,15 +15,15 @@
   <!-- Clients -->
   <rect x="20" y="100" width="1160" height="50" rx="8" fill="#0d2818" stroke="#2ea043"/>
   <text x="40" y="125" class="section">Clients</text>
-  <text x="40" y="142" class="body">Hermes · Claude Code · Open WebUI · aider · curl · Python OpenAI/Anthropic SDK</text>
+  <text x="40" y="142" class="body">Hermes · Claude Code · OMP · Open WebUI · aider · curl · Python OpenAI/Anthropic SDK</text>
 
   <!-- Gateway -->
   <rect x="20" y="165" width="330" height="125" rx="8" fill="#1c1917" stroke="#d29922"/>
   <text x="40" y="190" class="section">litmoe Gateway</text>
   <text x="40" y="212" class="mono">FastAPI · OpenAI + Anthropic APIs</text>
-  <text x="40" y="232" class="mono">routes by model from models.yaml</text>
-  <text x="40" y="252" class="body">supervises loopback engine processes</text>
-  <text x="40" y="272" class="body">HTTP routing only · ~1–5 ms overhead</text>
+  <text x="40" y="232" class="mono">one ready model + aliases</text>
+  <text x="40" y="252" class="body">explicit switch · bounded inference queue</text>
+  <text x="40" y="272" class="body">ONE resident backend from the choices →</text>
 
   <!-- Engine 1: ktransformers -->
   <rect x="370" y="165" width="250" height="125" rx="8" fill="#1a0d1d" stroke="#a371f7"/>

@@ -10,12 +10,13 @@ import json
 import logging
 import os
 import re
-import signal
+from contextlib import asynccontextmanager
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+import anyio
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -26,6 +27,7 @@ from litmoe.engines.base import DEFAULT_ENGINE_PORT
 from litmoe.models import (_MODEL_OVERHEAD, _OS_HEADROOM_GB, fit_context, lookup as catalog_lookup,
                            memory_budgets_gb, quant_size_gb)
 from litmoe.platform_utils import get_total_memory_bytes, is_macos
+from litmoe.runtime import Runtime, LeasedStream, while_connected
 
 logger = logging.getLogger(__name__)
 
@@ -212,39 +214,84 @@ def allocate_engine_ports(n: int, gateway_port: int, start: int = DEFAULT_ENGINE
 
 
 class Gateway:
-    """Routes OpenAI requests to the right engine based on model name."""
+    """One resident engine shared by OpenAI and Anthropic clients."""
 
-    def __init__(self, config: GatewayConfig, config_path: str | None = None):
+    def __init__(self, config: GatewayConfig, config_path: str | None = None,
+                 initial_model: str | None = None, log_dir: str | None = None,
+                 force: bool = False):
         self.config = config
         self.config_path = config_path
-        self.engines: dict[str, Engine] = {}
-        self.app = FastAPI(title="litmoe gateway")
+        self.log_dir = Path(log_dir) if log_dir else None
+        self.force = force
+        timeout = float(os.environ.get("LITMOE_READY_TIMEOUT", "0") or 0)
+        if not timeout:
+            timeout = 3600 if any(is_hf_repo_spec(m.model_path or "") for m in config.models) else 600
+        self.runtime = Runtime(config, self._start_engine, initial_model, timeout)
+
+        @asynccontextmanager
+        async def lifespan(app):
+            try:
+                if self.runtime.selected:
+                    try:
+                        await self.load_engines()
+                    except HTTPException:
+                        logger.exception("Initial model failed; use litmoe status/switch to recover")
+                yield
+            finally:
+                await self.shutdown()
+
+        self.app = FastAPI(title="litmoe gateway", lifespan=lifespan)
         self._setup_routes()
+
+    @property
+    def engines(self) -> dict[str, Engine]:
+        engine = self.runtime.engine
+        return {name: engine for name in [engine.model.id, *engine.model.aliases]} if engine else {}
 
     def _setup_routes(self) -> None:
         @self.app.get("/v1/models")
         async def list_models():
             data = []
+            status = self.runtime.status()
             for m in self.config.models:
+                if m.id != status["active_model"]:
+                    continue
                 data.append({"id": m.id, "object": "model", "owned_by": "litmoe",
-                             "engine": m.engine})
+                             "engine": m.engine, "context_window": m.n_ctx})
                 for alias in m.aliases:
                     data.append({"id": alias, "object": "model", "owned_by": "litmoe",
-                                 "engine": m.engine, "alias_of": m.id})
+                                 "engine": m.engine, "alias_of": m.id, "context_window": m.n_ctx})
             return {"object": "list", "data": data}
 
         @self.app.get("/v1/models/{model_id}")
         async def get_model(model_id: str):
-            for m in self.config.models:
-                if m.id == model_id or model_id in m.aliases:
-                    return {"id": m.id, "object": "model",
-                            "owned_by": "litmoe", "engine": m.engine}
-            raise HTTPException(404, f"Model \'{model_id}\' not found")
+            for item in (await list_models())["data"]:
+                if item["id"] == model_id:
+                    return item
+            raise HTTPException(404, f"Ready model '{model_id}' not found")
+
+        @self.app.get("/v1/runtime")
+        async def runtime_status(request: Request):
+            self._check_api_key(request)
+            return self.runtime.status()
+
+        @self.app.post("/v1/runtime/model")
+        async def switch_model(request: Request):
+            self._check_api_key(request)
+            try:
+                body = await request.json()
+            except ValueError:
+                raise HTTPException(400, "invalid JSON body")
+            if not isinstance(body, dict) or not isinstance(body.get("model"), str) or not body["model"]:
+                raise HTTPException(400, "model must be a non-empty string")
+            return await self.runtime.switch(body["model"])
 
         @self.app.get("/health")
         async def health():
+            status = self.runtime.status()
             return {
-                "status": "ok",
+                "status": "ok" if status["state"] == "ready" else status["state"],
+                "runtime": status,
                 "engines": {
                     model.id: {
                         "running": eng.process is not None and eng.process.poll() is None,
@@ -320,115 +367,107 @@ class Gateway:
         return engine.model, engine
 
     async def _proxy(self, request: Request, endpoint: str, anthropic: bool = False):
-        """Forward request to the right engine."""
         self._check_api_key(request)
-
-        body = await request.body()
         try:
-            payload = json.loads(body) if body else {}
-        except json.JSONDecodeError:
+            payload = await request.json()
+        except ValueError:
             raise HTTPException(400, "invalid JSON body")
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), str) or not payload["model"]:
+            raise HTTPException(400, "model must be a non-empty string")
+        lease = await self.runtime.acquire(payload["model"], request)
+        handed_off = completed = False
+        try:
+            response = await while_connected(
+                self._forward(payload, endpoint, anthropic, lease), request,
+            )
+            handed_off = isinstance(response, LeasedStream)
+            completed = True
+            return response
+        finally:
+            if not handed_off:
+                await lease.close(abandoned=not completed)
 
-        model_id = payload.get("model")
-        if not model_id:
-            raise HTTPException(400, "missing 'model' field")
+    async def _forward(self, payload: dict, endpoint: str, anthropic: bool, lease):
+        model_id = payload["model"]
         model, engine = self._resolve(model_id)
-
         if anthropic:
             payload = _anthropic_to_openai(payload)
-            target_url = f"{engine.base_url}/v1/chat/completions"
-        else:
-            target_url = f"{engine.base_url}/v1/{endpoint}"
-
-        # Aliases are a gateway concept: engines that validate the model field
-        # (sglang) must see the id they were started with.
+            endpoint = "chat/completions"
+        target_url = f"{engine.base_url}/v1/{endpoint}"
         payload["model"] = model.id
         send_body = json.dumps(payload).encode()
         stream = bool(payload.get("stream", False))
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
-
-        # A 50K-token system prompt looks exactly like a hang from the client
-        # side; say what is being forwarded. ~4 chars/token, same estimate as
-        # /v1/messages/count_tokens.
-        approx_tokens = len(send_body) // 4
         logger.info("%s: %s request, ~%s prompt tokens%s", model.id, endpoint,
-                    f"{approx_tokens:,}", " (stream)" if stream else "")
-        if approx_tokens >= 20_000:
-            logger.info("%s: large prompt — on CPU/Metal the first pass over a new prefix can take "
-                        "minutes; later turns reuse it from the prompt cache", model.id)
-
-        # Strip Authorization header — the gateway handles auth, not the engine.
-        # llama-server rejects Bearer tokens that don't match its own key.
-        fwd_headers = {"content-type": "application/json"}
-
+                    f"{len(send_body) // 4:,}", " (stream)" if stream else "")
+        # Authentication terminates at the gateway, not the owned backend.
+        headers = {"content-type": "application/json"}
         if stream:
-            # Connect first. An upstream 4xx/5xx (e.g. "request exceeds the
-            # available context size") must reach the client as that status
-            # with its message — not as JSON bytes inside a 200 event-stream,
-            # which clients report as "empty/malformed SSE" and retry forever.
             try:
-                client, r = await _connect_stream(target_url, send_body, timeout, fwd_headers)
-            except httpx.RequestError as e:
-                raise HTTPException(502, f"engine for {model.id} unreachable: {e}")
-            if r.status_code >= 400:
-                raw = await r.aread()
-                await r.aclose()
-                await client.aclose()
-                message = _upstream_error_message(raw)
-                logger.warning("%s: engine returned HTTP %d: %s", model.id, r.status_code, message)
-                if anthropic:
-                    return JSONResponse(status_code=r.status_code, content={
-                        "type": "error", "error": {"type": "api_error", "message": message}})
+                client, response = await _connect_stream(target_url, send_body, timeout, headers)
+            except httpx.RequestError as exc:
+                raise HTTPException(502, f"engine for {model.id} unreachable: {exc}")
+            if response.status_code >= 400:
                 try:
-                    content = json.loads(raw)
-                except ValueError:
-                    content = {"error": {"message": message, "type": "upstream_error"}}
-                return JSONResponse(status_code=r.status_code, content=content)
-            if anthropic:
-                return StreamingResponse(_stream_anthropic_response(client, r, model_id),
-                                         media_type="text/event-stream")
-            return StreamingResponse(_stream_response(client, r), media_type="text/event-stream")
-
+                    raw = await response.aread()
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        await response.aclose()
+                        await client.aclose()
+                message = _upstream_error_message(raw)
+                if anthropic:
+                    content = {"type": "error", "error": {"type": "api_error", "message": message}}
+                else:
+                    try:
+                        content = json.loads(raw)
+                    except ValueError:
+                        content = {"error": {"message": message, "type": "upstream_error"}}
+                return JSONResponse(status_code=response.status_code, content=content)
+            iterator = (_stream_anthropic_response(client, response, model_id) if anthropic
+                        else _stream_response(client, response))
+            return LeasedStream(iterator, lease, client, response)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(target_url, content=send_body, headers=fwd_headers)
-        except httpx.RequestError as e:
-            raise HTTPException(502, f"engine for {model.id} unreachable: {e}")
+                response = await client.post(target_url, content=send_body, headers=headers)
+        except httpx.RequestError as exc:
+            raise HTTPException(502, f"engine for {model.id} unreachable: {exc}")
         try:
-            data = r.json()
+            data = response.json()
         except ValueError:
-            raise HTTPException(502, f"engine for {model.id} returned non-JSON "
-                                     f"(HTTP {r.status_code}): {r.text[:300]}")
-        if anthropic and r.status_code == 200:
+            raise HTTPException(502, f"engine for {model.id} returned non-JSON (HTTP {response.status_code})")
+        if anthropic and response.status_code == 200:
             return JSONResponse(content=_openai_to_anthropic(data, model_id))
         if anthropic:
             message = data.get("error", {}).get("message") if isinstance(data, dict) else None
-            return JSONResponse(status_code=r.status_code, content={
-                "type": "error",
-                "error": {"type": "api_error", "message": message or json.dumps(data)[:500]},
+            return JSONResponse(status_code=response.status_code, content={
+                "type": "error", "error": {"type": "api_error", "message": message or json.dumps(data)[:500]},
             })
-        return JSONResponse(content=data, status_code=r.status_code)
+        return JSONResponse(content=data, status_code=response.status_code)
 
-    def load_engines(self, log_dir: str | None = None) -> None:
-        """Start all configured engines. A model that fails to start is skipped, not fatal."""
-        ld = Path(log_dir) if log_dir else None
-        ports = allocate_engine_ports(len(self.config.models), self.config.port)
-        for model, port in zip(self.config.models, ports):
-            old_context = (model.n_ctx, model.warp_auto_context)
-            logger.info("Loading %s via %s on port %d...", model.id, model.engine, port)
-            try:
-                self._fix_context(model)
-                engine = make_engine(model)
-                engine.set_port(port)
-                engine.start(log_dir=ld)
-                if model.engine == "warp" and old_context != (model.n_ctx, model.warp_auto_context):
-                    self._persist_ctx(model)
-            except Exception as e:  # FileNotFoundError, ValueError, OSError ...
-                logger.error("Model %s could not be started: %s", model.id, e)
-                continue
-            self.engines[model.id] = engine
-            for alias in model.aliases:
-                self.engines[alias] = engine
+    async def load_engines(self) -> None:
+        if self.runtime.selected:
+            await self.runtime.switch(self.runtime.selected.id)
+
+    def _start_engine(self, model: ModelEntry) -> Engine:
+        if model.engine == "llamacpp":
+            from litmoe.engines.llamacpp import _has_flag
+            if _has_flag(model.extra_args, {"-c", "--ctx-size", "-np", "--parallel", "--kv-unified-per-slot"}):
+                raise ValueError("Set llama.cpp context with n_ctx; interactive serving owns the single slot, not extra_args")
+        verdict = check_fits_together([model])
+        if verdict and verdict.level == "no" and not self.force:
+            raise ValueError(f"{model.id} exceeds the RAM budget; choose a smaller quant")
+        old_context = (model.n_ctx, model.warp_auto_context)
+        self._fix_context(model)
+        engine = make_engine(model)
+        engine.set_port(allocate_engine_ports(1, self.config.port)[0])
+        try:
+            engine.start(log_dir=self.log_dir)
+        except BaseException:
+            engine.stop()
+            raise
+        if model.engine == "warp" and old_context != (model.n_ctx, model.warp_auto_context):
+            self._persist_ctx(model)
+        return engine
 
     def _fix_context(self, model: ModelEntry) -> None:
         """Resolve context defaults and persist corrections to models.yaml.
@@ -489,19 +528,9 @@ class Gateway:
         return [(m, self.engines[m.id]) for m in self.config.models
                 if m.id in self.engines]
 
-    async def wait_all_ready(self, timeout: float = 600.0) -> bool:
-        """Wait for all engines to be ready."""
-        tasks = [eng.wait_ready(timeout=timeout) for _, eng in self._unique_engines()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return all(r is True for r in results)
 
-    def shutdown(self) -> None:
-        """Stop all engines (idempotent)."""
-        for _, engine in self._unique_engines():
-            try:
-                engine.stop()
-            except Exception as e:  # never let one engine block the others
-                logger.warning("stopping %s: %s", engine.model.id, e)
+    async def shutdown(self) -> None:
+        await self.runtime.shutdown()
 
 
 async def _connect_stream(url: str, body: bytes, timeout: httpx.Timeout,
@@ -515,8 +544,9 @@ async def _connect_stream(url: str, body: bytes, timeout: httpx.Timeout,
     try:
         req = client.build_request("POST", url, content=body, headers=headers)
         r = await client.send(req, stream=True)
-    except httpx.RequestError:
-        await client.aclose()
+    except BaseException:
+        with anyio.CancelScope(shield=True):
+            await client.aclose()
         raise
     return client, r
 
@@ -875,49 +905,10 @@ def _configure_logging() -> None:
     lg.propagate = False
 
 
-def run(config: GatewayConfig, log_dir: str | None = None, config_path: str | None = None) -> None:
-    """Entry point: start gateway."""
+def run(config: GatewayConfig, log_dir: str | None = None, config_path: str | None = None,
+        initial_model: str | None = None, force: bool = False) -> None:
+    """Run lifecycle and HTTP handling on the same event loop."""
     _configure_logging()
-    gateway = Gateway(config, config_path=config_path)
-    gateway.load_engines(log_dir=log_dir)
-    if not gateway.engines:
-        logger.error("No engine could be started — check the errors above and `litmoe doctor`.")
-
-    # Models served straight from HuggingFace (-hf) download on first start;
-    # allow more time for that than for a local file.
-    ready_timeout = float(os.environ.get("LITMOE_READY_TIMEOUT", "0") or 0)
-    if not ready_timeout:
-        downloads = any(is_hf_repo_spec(m.model_path or "") or (m.model_path or "").startswith("http")
-                        for m in config.models)
-        ready_timeout = 3600.0 if downloads else 600.0
-
-    async def startup():
-        ok = await gateway.wait_all_ready(timeout=ready_timeout)
-        if not ok:
-            logger.warning("Not all engines became ready — gateway will start anyway")
-        else:
-            logger.info("All engines ready.")
-
-    # Engines run in their own sessions (start_new_session=True), so a SIGTERM
-    # sent to the gateway does not reach them. uvicorn captures SIGINT/SIGTERM
-    # to exit gracefully, then *restores the previous handlers and re-raises
-    # the signal* after run() returns. With Python's default SIGTERM
-    # disposition that kills the process before any `finally:` block runs and
-    # orphans the engines (measured: rc=-15, no cleanup output). Install a
-    # handler beforehand so the re-raised signal lands here instead.
-    def _stop_engines(signum, _frame):
-        logger.info("Signal %d: stopping engines", signum)
-        gateway.shutdown()
-        raise SystemExit(128 + signum)
-
-    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
-        if sig is not None:
-            signal.signal(sig, _stop_engines)
-
-    try:
-        asyncio.run(startup())
-        uvicorn.run(gateway.app, host=config.host, port=config.port, log_level="info")
-    except KeyboardInterrupt:
-        pass
-    finally:
-        gateway.shutdown()
+    gateway = Gateway(config, config_path=config_path, initial_model=initial_model,
+                      log_dir=log_dir, force=force)
+    uvicorn.run(gateway.app, host=config.host, port=config.port, log_level="info")

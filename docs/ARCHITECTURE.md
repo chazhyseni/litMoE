@@ -1,13 +1,13 @@
 # Architecture
 
-The litmoe gateway is intentionally minimal: a FastAPI pass-through plus
-process supervision. Every component earns its place.
+The gateway combines OpenAI/Anthropic protocol handling with a single-resident
+runtime. The three backend boxes below are alternatives, not concurrent loads.
 
 ```
    ┌────────────────────────────────────────────────────────────────────────────────┐
    │   CLIENTS                                                                      │
    │   Claude Code (scripts/claude-local) · Hermes Agent (scripts/hermes-local)     │
-   │   Open WebUI · aider · curl · any OpenAI / Anthropic SDK                       │
+   │   OMP (scripts/omp-local) · Open WebUI · aider · curl · SDK clients             │
    └─────────────────────────────────┬──────────────────────────────────────────────┘
                                      │ HTTP, 127.0.0.1:8090
                                      │ POST /v1/chat/completions   (OpenAI)
@@ -21,18 +21,18 @@ process supervision. Every component earns its place.
    │                                                                                │
    │   REQUEST ROUTER                                                               │
    │   - read `model` from the body; resolve aliases (claude-* → local id)          │
-   │   - unknown model → 404 with the list of ids that ARE served                   │
+   │   - unknown model → 404; known inactive model → 409; no implicit switching     │
    │   - /v1/messages: Anthropic Messages → OpenAI chat (tools, images, thinking,   │
    │     streaming SSE re-framed as Anthropic events)                               │
    │   - stream: raw byte pass-through; non-stream: JSON relay                      │
    │                                                                                │
    │   ENGINE SUPERVISOR                                                            │
-   │   - one subprocess per model, own session/pgid, PID file in ~/.litmoe/run      │
-   │   - ports 8081+ skipping the gateway port and anything already bound           │
-   │   - llama.cpp and WARP context fitted using their own memory models          │
-   │   - SIGTERM/SIGINT/SIGHUP to the gateway stops every engine (no orphans)       │
+   │   - one resident subprocess, own session/pgid, PID file in ~/.litmoe/run        │
+   │   - one inference lease, bounded queue, explicit drain/stop/start switching    │
+   │   - llama.cpp and WARP context fitted using their own memory models            │
+   │   - ASGI lifespan drains and stops the owned engine on graceful shutdown      │
    └───────────────┬──────────────────────┬───────────────────────┬────────────────┘
-                   │ :8081                │ :8082                 │ :8083
+                   │ alternative          │ alternative           │ alternative
                    ▼                      ▼                       ▼
    ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
    │ LLAMA.CPP ENGINE       │  │ KTRANSFORMERS ENGINE   │  │ WARP ENGINE            │
@@ -124,18 +124,27 @@ containers remain valid alternatives.
   re-evaluate the plan. Unmarked legacy 0/65536 values migrate to auto; other
   positive values remain fixed. `warp_auto_context: false` preserves an
   intentional positive limit, including 65536. Conflicting `extra_args --ctx`
-  flags are rejected. A planning failure skips that model, not later models.
-  WARP container size is not resident RAM. Budgets are per engine, not
-  reservations against other engines or applications.
-  It starts each engine in its own process group, writes
-  `~/.litmoe/run/<id>.pid`, waits for readiness, then serves.
+  flags are rejected. A planning failure leaves that selection unavailable,
+  never silently choosing another model. WARP budgets are capacity estimates,
+  not measurements of other applications' current memory pressure.
+- Initial load, explicit switch, cancellation, and shutdown share one asyncio
+  runtime on uvicorn's event loop. The active lease covers upstream connection
+  establishment and the complete downstream stream. Switches drain first;
+  stop failures retain ownership and prevent another engine from starting.
+- Active-request cancellation stops the native process before releasing its
+  lease; a later request reloads the same model. This intentionally loses
+  cache state rather than assuming a closed HTTP connection stopped inference.
 - Engine stdout/stderr append to `logs/<id>.log` with a per-start header.
-- Ctrl-C / SIGTERM / SIGHUP to the gateway stops all engines. (uvicorn
-  re-raises the signal after its own graceful exit; litmoe installs a handler
-  so that re-raise runs engine shutdown instead of killing the process.)
+  ASGI lifespan cleanup handles uvicorn's graceful Ctrl-C/SIGTERM shutdown.
 - `litmoe stop` signals only the process groups in the PID files; `--all`
   additionally matches by name. Nothing else on the machine is touched.
 - `litmoe status` polls `/health`.
+- `/v1/runtime` reports the configured choices, selected/active model,
+  lifecycle state, generation, queue, effective context, and capabilities.
+  POST `/v1/runtime/model` performs an explicit selection using the same
+  optional API-key policy as inference. Discovery lists ready models only.
+- llama.cpp uses one slot; context/slot overrides in `extra_args` are rejected.
+  WARP has no cross-request prompt-cache capability at the pinned revision.
 
 ## Ports and isolation
 
@@ -158,7 +167,9 @@ under `~/.litmoe/` and `models.yaml`; engine installers also write to
 litmoe/
 ├── models.py          catalog (downloads + pinned WARP recipes, sizes, ctx, KV)
 ├── config.py          models.yaml schema + validation
-├── server.py          gateway, Anthropic↔OpenAI translation, engine supervision
+├── server.py          gateway and Anthropic↔OpenAI translation
+├── runtime.py         single-resident ownership, admission, cancellation, switching
+├── benchmark.py       paired HTTP/SSE timing without private payload logging
 ├── platform_utils.py  RAM, physical cores, macOS quirks
 ├── engines/
 │   ├── base.py        Engine ABC: start/stop/health, PID files, log headers
@@ -166,9 +177,11 @@ litmoe/
 │   ├── ktransformers.py  sglang-kt adapter (kt-method, GPU experts, cpuinfer)
 │   └── warp.py        upstream WARP server adapter for local .waste containers
 └── cli/
-    ├── main.py        doctor · init · models · serve · status · stop
+    ├── main.py        doctor · init · models · serve · switch · status · stop
+    ├── benchmark.py   bench CLI
     └── install.py     engine installs + catalog downloads / upstream WARP orchestration and validation
 scripts/claude-local   Claude Code against the gateway, per-process env only
 scripts/hermes-local   Hermes Agent against the gateway, per-process env only
+scripts/omp-local      OMP with an owned isolated model/config directory
 tests/test_litmoe.py   catalog, config, ctx math, port allocation, Anthropic translation, stop safety
 ```

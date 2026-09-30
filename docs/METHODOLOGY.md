@@ -176,9 +176,24 @@ interactive inference on this VM.
 - **Server, CPU only, 768 GB+:** llama.cpp with Kimi-K3 / Qwen3.8-2.4T at
   IQ1 — batch use, not chat, unless the CPU has many memory channels.
 
-Pick the engine per model in `models.yaml`. All three engines expose local
-OpenAI HTTP services. The dispatcher adds latency in the
-single-digit-millisecond range and never touches the forward pass.
+Pick the engine per model in `models.yaml`; only one is resident. All three
+engines expose local OpenAI HTTP services. litmoe does not execute the forward
+pass, but gateway overhead must be measured, not assumed. `litmoe bench`
+alternates direct-engine and gateway requests with identical payloads and
+records time to headers, generated delta, visible text, and completion.
+
+On the target 96 GB Apple Silicon Mac, compare the same model artifact,
+quantization, context, prompt, generation limit, and backend build. Record
+memory pressure, swap growth, disk I/O, and native prefill/decode/cache counters.
+Repeated prompts alone do not prove cache hits; alternating order alone does
+not establish matched cold/warm state. Output tokens divided by total response
+time is end-to-end throughput, not decode-only speed.
+
+Retain WARP for its supported `.waste` containers until target-machine evidence
+justifies replacing it. A llama.cpp/Metal or MLX comparison needs compatible
+model architecture and weights, equivalent prompting/tool behavior, and actual
+Mac measurements. Linux synthetic-weight protocol checks cannot select the
+fastest Apple Silicon backend.
 
 ## What litmoe does NOT do
 

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Run OMP against the ready litmoe model without changing normal OMP settings.
+# Usage: omp-local [--gateway URL] [--model ID] [--key KEY] [OMP launch arguments]
+# Example: omp-local -p "explain this repository"
+# Models and roles live in ~/.litmoe/omp/<endpoint-model-context hash>/.
+set -euo pipefail
+GATEWAY="${LITMOE_GATEWAY:-http://127.0.0.1:8090}"
+MODEL="${LITMOE_MODEL:-}"
+KEY="${LITMOE_API_KEY:-litmoe}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gateway) GATEWAY="${2:?--gateway needs a URL}"; shift 2 ;;
+    --model) MODEL="${2:?--model needs an ID}"; shift 2 ;;
+    --key) KEY="${2:?--key needs a value}"; shift 2 ;;
+    -h|--help) printf '%s\n' 'Usage: omp-local [--gateway URL] [--model ID] [--key KEY] [OMP launch arguments]' 'Uses one ready local model and isolated OMP configuration.'; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+command -v omp >/dev/null || { echo 'omp-local: omp is not installed' >&2; exit 127; }
+# These change the routing/isolation contract. Use normal omp for those modes.
+for arg in "$@"; do
+  case "$arg" in
+    --profile|--profile=*|--alias|--alias=*|--provider|--provider=*|--model|--model=*|--config|--config=*)
+      echo "omp-local: $arg overrides local isolation; use the launcher's --model before OMP arguments" >&2; exit 2 ;;
+  esac
+done
+DETAILS="$(LITMOE_API_KEY="$KEY" python3 - "$GATEWAY" "$MODEL" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
+
+
+def fail(message):
+    raise SystemExit('omp-local: ' + message)
+
+
+base = sys.argv[1].rstrip('/')
+if base.endswith('/v1'):
+    base = base[:-3]
+url = urlsplit(base)
+if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.query or url.fragment:
+    fail('gateway must be an http(s) endpoint without credentials, query, or fragment')
+
+
+def fetch(path):
+    request = Request(base + path, headers={'Authorization': 'Bearer ' + os.environ['LITMOE_API_KEY']})
+    try:
+        with urlopen(request, timeout=10) as response:
+            return json.load(response)
+    except (HTTPError, URLError, ValueError, OSError) as exc:
+        fail(f'{path} failed: {exc}; check litmoe status and the gateway API key')
+
+
+runtime = fetch('/v1/runtime')
+models = fetch('/v1/models')
+if runtime.get('state') != 'ready':
+    fail(f"engine state is {runtime.get('state')}; run litmoe switch MODEL to load it")
+requested = sys.argv[2] or runtime['active_model']
+entry = next((item for item in models['data'] if item['id'] == requested), None)
+if entry is None:
+    fail(f'{requested} is not ready; explicitly run litmoe switch {requested} first')
+model = entry.get('alias_of', entry['id'])
+context = entry.get('context_window')
+if model != runtime['active_model'] or context != runtime.get('context_window'):
+    fail('model changed during discovery; relaunch after switching completes')
+if type(context) is not int or context <= 0:
+    fail('gateway did not report a valid effective context window')
+if any(c in model for c in '\r\n') or '\n' in str(Path.home()):
+    fail('model and home path must not contain line breaks')
+identity = hashlib.sha256(json.dumps([base, model, context]).encode()).hexdigest()[:20]
+directory = Path.home() / '.litmoe' / 'omp' / identity
+marker = directory / '.litmoe-owned'
+if directory.exists() and not marker.exists() and any(directory.iterdir()):
+    fail(f'refusing to overwrite an unowned directory: {directory}')
+directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+marker.touch(mode=0o600)
+selector = 'litmoe/' + model
+provider = {'providers': {'litmoe': {
+    'baseUrl': base + '/v1', 'api': 'openai-completions',
+    'apiKey': 'LITMOE_API_KEY', 'auth': 'apiKey', 'authHeader': True,
+    'models': [{'id': model, 'name': model + ' (litmoe)', 'input': ['text'],
+                'contextWindow': context, 'maxTokens': min(4096, context),
+                'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
+                'compat': {'supportsStore': False, 'supportsDeveloperRole': False,
+                           'supportsReasoningEffort': False, 'maxTokensField': 'max_tokens'}}],
+}}}
+roles = ('default', 'smol', 'slow', 'plan', 'commit', 'task', 'tiny', 'memory', 'advisor', 'judge', 'vision')
+settings = {
+    'modelRoles': {role: selector for role in roles},
+    'retry': {'modelFallback': False, 'fallbackChains': {role: [] for role in (*roles, 'litmoe/*')}},
+    'enabledModels': ['litmoe/*'], 'modelRoleStorage': 'global',
+    'advisor': {'enabled': False}, 'contextPromotion': {'enabled': False},
+}
+# JSON is YAML; stdlib-only generation avoids requiring PyYAML in system Python.
+for name, data in [('models.yml', provider), ('config.yml', settings)]:
+    with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as output:
+        json.dump(data, output, indent=2)
+        temporary = output.name
+    os.replace(temporary, directory / name)
+print(directory)
+print(selector)
+PY
+)"
+AGENT_DIR="${DETAILS%%$'\n'*}"
+SELECTOR="${DETAILS#*$'\n'}"
+exec env -u OMP_PROFILE -u PI_PROFILE \
+  PI_CODING_AGENT_DIR="$AGENT_DIR" LITMOE_API_KEY="$KEY" \
+  PI_SMOL_MODEL="$SELECTOR" PI_SLOW_MODEL="$SELECTOR" PI_PLAN_MODEL="$SELECTOR" \
+  PI_NO_TITLE=1 PI_AUTO_QA=0 OMP_SKIP_SETUP=1 \
+  omp --config "$AGENT_DIR/config.yml" --model "$SELECTOR" "$@"

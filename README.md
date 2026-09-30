@@ -2,12 +2,12 @@
 
 **lit + MoE** — a light gateway for Mixture-of-Experts models.
 
-OpenAI- and Anthropic-compatible gateway for [llama.cpp](https://github.com/ggml-org/llama.cpp), [ktransformers](https://github.com/kvcache-ai/ktransformers), and [WARP](https://github.com/sqliteai/warp). One `models.yaml`, one port, every model reachable by name — from a 4B-active MoE that chats interactively on a 48 GB laptop to trillion-parameter models on a server.
+OpenAI- and Anthropic-compatible gateway for [llama.cpp](https://github.com/ggml-org/llama.cpp), [ktransformers](https://github.com/kvcache-ai/ktransformers), and [WARP](https://github.com/sqliteai/warp). One `models.yaml`, one port, **one resident model at a time**. Switch explicitly between configured models without competing native processes consuming the same memory budget.
 
 litmoe is not an inference engine — the forward pass runs in llama.cpp, ktransformers, or WARP. What litmoe adds:
 
-- **One API for multiple engines.** Mix llama.cpp, ktransformers, and WARP in the same `models.yaml`. Clients see one flat model list at one endpoint.
-- **Anthropic Messages API.** `/v1/messages` (and `/v1/messages/count_tokens`) are translated to OpenAI chat completions, so Claude Code, Hermes Agent, and other Anthropic-format tools work unchanged. Model aliases (`claude-sonnet-4-5` → your local model) are built in, and `scripts/claude-local` / `scripts/hermes-local` run a harness against the gateway **without touching its normal configuration** — plain `claude` keeps using your Anthropic account.
+- **One API for multiple engines.** Keep different engines in `models.yaml`; `litmoe switch MODEL` drains the current request, unloads the old engine, and loads the selected model. Discovery lists only the ready resident model and its aliases.
+- **Claude Code, Hermes, and OMP.** OpenAI chat completions and translated Anthropic Messages streams support their local sessions. `scripts/claude-local`, `scripts/hermes-local`, and `scripts/omp-local` leave normal client configuration unchanged.
 - **A curated model catalog.** `litmoe models` shows what fits your machine; `litmoe install --model X` installs the listed model and writes its config entry. Downloads are RAM-tiered, while the two WARP entries are storage-sized recipes that run pinned upstream conversions into local `.waste` containers.
 - **Hardware-aware setup.** `litmoe doctor` reports physical cores, RAM, AVX-512/AMX, NVIDIA GPUs, and which engines are installed, then recommends an engine and models. llama.cpp context is fitted to the weights + KV budget (Metal's share of unified memory on macOS, RAM elsewhere). WARP fits its native context using its own resident-memory planner, not the container's disk size.
 - **Engine lifecycle.** Subprocess supervision with health checks, clean shutdown via process groups, per-model append-only logs, per-model CLI flag and environment passthrough. `litmoe stop` only touches engines litmoe started (PID files), never an Ollama/LM Studio/manual engine process.
@@ -213,7 +213,7 @@ models:
     engine: llamacpp
     model_path: /home/me/.litmoe/models/qwen3.6-35b-a3b/UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
     n_ctx: 262144
-    extra_args: ["-t", "12"]   # any llama-server flags; -t overrides the physical-core default
+    extra_args: ["-t", "12"]   # -t overrides the physical-core default; context/slots are gateway-owned
 
   # ktransformers via sglang-kt (Linux + NVIDIA GPU)
   - id: glm-5.3-flash
@@ -245,9 +245,9 @@ For WARP, `model_path` must be a local `.waste` container. With `warp_auto_conte
 
 The adapter always passes a positive `--ctx` and persists the selected `n_ctx` **with automatic mode still enabled**. Unmarked legacy `n_ctx: 0` and `65536` entries migrate to automatic sizing. An old intentional 65536 is indistinguishable from the shipped default: set `warp_auto_context: false` alongside a positive `n_ctx` to keep any fixed window. Other unmarked positive limits remain fixed. Changing context requires a gateway restart, not a download or conversion.
 
-WARP `extra_args` supports `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`; conflicting `--ctx` flags are rejected. The planning ceiling measures RAM **capacity**, not currently free RAM, and is per engine, not shared across models. Serve one WARP model at a time or assign explicit budgets that leave room for other engines and applications. A manually oversized `--budget` is still passed upstream unchanged; the planner does not clamp that runtime allocation. Unknown manual model IDs need `config.max_position_embeddings` in the container manifest or an explicit fixed context.
+WARP `extra_args` supports `--budget`, `--threads`, `--cpus`, `--cache`, `--vision`, and `--verify`; conflicting `--ctx` flags are rejected. The planning ceiling measures RAM **capacity**, not currently free RAM. litmoe owns one resident model; leave room for other applications and independently launched inference servers. An oversized explicit `--budget` still passes upstream unchanged. Unknown manual model IDs need `config.max_position_embeddings` in the container manifest or an explicit fixed context.
 
-llama-server gets `-t <physical cores>` unless `extra_args` sets `-t`. Context corrections are written back into `models.yaml` (comments in the file are not preserved by that rewrite).
+llama-server gets one slot and `-t <physical cores>` unless `extra_args` sets `-t`. Configure context through `n_ctx`, not `-c`/`--ctx-size`; slot/context overrides in `extra_args` are rejected. Context corrections are written back into `models.yaml` (comments are not preserved by that rewrite). Requests are serialized with up to `max_queue_size: 8` waiting admissions and `queue_timeout: 30` seconds; overflow/expiry returns HTTP 429.
 
 ---
 
@@ -258,9 +258,11 @@ litmoe doctor          # CPU/GPU/RAM, engines, recommended models
 litmoe models          # catalog by RAM tier with fits / does-not-fit for this machine
 litmoe init            # write models.yaml with fast defaults for this RAM
 litmoe install         # install engines and/or download a model (--model, --quant, --engine)
-litmoe serve           # start gateway + all configured engines (Ctrl-C stops them); refuses a set that will not fit in RAM
-litmoe serve X [Y…]    # serve only these entries; --force skips the fit check
-litmoe status          # gateway health and per-engine status
+litmoe serve           # gateway + first configured model; Ctrl-C stops the owned engine
+litmoe serve X         # select one initial model; --force skips its RAM-fit refusal
+litmoe switch Y        # drain, stop X, load configured Y; no automatic substitution
+litmoe status          # selected/active model, queue, context, capabilities, failures
+litmoe bench --json    # paired direct-engine/gateway streaming measurements; run on gateway host
 litmoe stop            # stop the engines litmoe started (PID files); --all also matches by name
 ```
 
@@ -271,19 +273,18 @@ litmoe stop            # stop the engines litmoe started (PID files); --all also
 ![architecture](docs/architecture-banner.svg)
 
 ```
-   Clients (Claude Code, Hermes, Open WebUI, aider, curl)
+   Clients (Claude Code, Hermes, OMP, Open WebUI, aider, curl)
         │  HTTP  /v1/chat/completions · /v1/messages · /v1/models
         ▼
-   litmoe gateway (litmoe/server.py, FastAPI)
-        │  read `model` → resolve alias → engine from models.yaml
+   litmoe gateway (server.py + runtime.py)
+        │  resolve active model/alias → bounded single-request admission
         │  Anthropic /v1/messages ⇄ OpenAI chat completions
         ▼
-   engine subprocess             engine subprocess                    engine subprocess
-   llama-server :8081            sglang-kt :8082                      WARP serve :8083
-   CPU/CUDA/Metal/Vulkan         GPU attention + CPU experts          local .waste container
-                                                                      mmap + local paging
+   ONE resident subprocess: llama-server OR sglang-kt OR WARP serve
+        └─ explicit switch: drain → stop old → start new → ready
+```
 
-Engine ports are assigned in `models.yaml` order starting at 8081, skipping the gateway's own port and any port another process already holds. The gateway never touches the forward pass.
+The resident engine gets a free loopback port starting at 8081, skipping the gateway port and existing listeners. litmoe never touches the forward pass, silently switches models, truncates prompts, or falls back to cloud inference.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/architecture.svg](docs/architecture.svg) · design rationale and measurements: [docs/METHODOLOGY.md](docs/METHODOLOGY.md)
 
@@ -308,6 +309,14 @@ claude                                              # normal Claude Code, still 
 hermes                                              # unchanged
 ```
 For a persistent setup, create a separate profile (`hermes profile create litmoe --clone`, then `hermes -p litmoe model` → Custom endpoint `http://127.0.0.1:8090/v1`), or add a `model_aliases:` entry with its own `api_key` and switch with `/model local` — see [docs/HARNESSES.md](docs/HARNESSES.md) for the exact block. Avoid `hermes config set model.*` — it rewrites the default profile.
+
+### OMP (oh-my-pi)
+```bash
+./scripts/omp-local                                 # isolated local profile and model roles
+./scripts/omp-local --model qwen3.6-35b-a3b -p "explain this repo"
+omp                                                 # normal OMP configuration, unchanged
+```
+The requested model must already be active. The launcher discovers its effective context, pins model roles locally, and disables model fallback. See [HARNESSES](docs/HARNESSES.md) for cache and cancellation limits.
 
 ### Open WebUI
 Add `http://127.0.0.1:8090/v1` as an **additional** OpenAI API connection (keep the existing ones).
