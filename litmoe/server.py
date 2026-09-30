@@ -458,6 +458,31 @@ class Gateway:
     async def load_engines(self) -> None:
         if self.runtime.selected:
             await self.runtime.switch(self.runtime.selected.id)
+            await self._warmup(self.runtime.selected)
+
+    async def _warmup(self, model: ModelEntry) -> None:
+        """One tiny generation after load so the first real request does not
+        pay the cold-expert paging cost (WARP reads ~28 GB from disk when its
+        expert cache is empty)."""
+        if model.engine != "warp":
+            return
+        engine = self.runtime.engine
+        if engine is None:
+            return
+        payload = {
+            "model": model.id,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 4,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                response = await client.post(
+                    f"{engine.base_url}/v1/chat/completions",
+                    json=payload,
+                )
+            logger.info("warmup %s: status %s", model.id, response.status_code)
+        except Exception as exc:  # warmup is best-effort; serving still works
+            logger.warning("warmup %s skipped: %s", model.id, exc)
 
     def _start_engine(self, model: ModelEntry) -> Engine:
         if model.engine == "llamacpp":
