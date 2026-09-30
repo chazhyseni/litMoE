@@ -485,6 +485,19 @@ def test_stop_all_matches_manual_warp_server(tmp_path, monkeypatch):
         "/tmp/warp/serve/__main__.py",
         "/tmp/tiny.waste",
     ])
+    run = subprocess.run
+
+    def discover_test_process(args, **kwargs):
+        assert args[:2] == ["pgrep", "-f"]
+        result = run(args, **kwargs)
+        # Exercise real command-line matching without exposing unrelated
+        # resident engines to the CLI's deliberately broad --all cleanup.
+        result.stdout = "\n".join(
+            pid for pid in result.stdout.split() if pid == str(server.pid)
+        )
+        return result
+
+    monkeypatch.setattr(subprocess, "run", discover_test_process)
     try:
         result = CliRunner().invoke(cli, ["stop", "--all"])
         assert result.exit_code == 0, result.output
@@ -3357,6 +3370,83 @@ def test_stream_disconnect_stops_owned_engine_and_reloads_on_next_request(monkey
         await gateway.shutdown()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("engine_kind,endpoint,keeps_resident", [
+    ("warp", "chat/completions", True),
+    ("llamacpp", "chat/completions", False),
+    ("warp", "completions", False),
+])
+def test_stream_abort_respects_backend_contract(monkeypatch, engine_kind, endpoint, keeps_resident):
+    import httpx
+    from starlette.requests import ClientDisconnect
+
+    async def scenario():
+        gateway, events, live, _ = _interactive_gateway(monkeypatch)
+        await gateway.runtime.switch("one")
+        gateway.runtime.engine.model.engine = engine_kind
+        lease = await gateway.runtime.acquire("one", _ConnectedRequest())
+        upstream_closed = asyncio.Event()
+
+        class Tokens(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'data: {"choices":[{"delta":{"reasoning_content":"Thinking"}}]}\n\n'
+                await asyncio.Event().wait()
+
+            async def aclose(self):
+                upstream_closed.set()
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=Tokens()),
+        ))
+
+        async def connect(*args):
+            response = await client.send(client.build_request("POST", "http://engine"), stream=True)
+            return client, response
+
+        monkeypatch.setattr(S, "_connect_stream", connect)
+        response = await gateway._forward({"model": "one", "stream": True}, endpoint, False, lease)
+        waiter = asyncio.create_task(gateway.runtime.acquire("one", _ConnectedRequest()))
+        await _eventually(lambda: gateway.runtime.queue_depth == 1)
+        assert not waiter.done()
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        with pytest.raises(ClientDisconnect):
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+        assert upstream_closed.is_set()
+        next_lease = await waiter
+        assert live == {"one"}
+        assert events == ([("start", "one")] if keeps_resident else
+                          [("start", "one"), ("stop", "one"), ("start", "one")])
+        await next_lease.close()
+        await gateway.shutdown()
+        assert not live
+
+    asyncio.run(scenario())
+
+
+def test_busy_gateway_port_does_not_start_model(monkeypatch):
+    import socket
+
+    async def unexpected_load(self):
+        pytest.fail("occupied gateway port started native model loading")
+
+    monkeypatch.setattr(S.Gateway, "load_engines", unexpected_load)
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        config = GatewayConfig(host="127.0.0.1", port=occupied.getsockname()[1], models=[
+            ModelEntry(id="one", engine="warp", model_path="/unused.waste"),
+        ])
+        with pytest.raises(SystemExit) as error:
+            S.run(config)
+        assert error.value.code != 0
 
 
 def test_benchmark_distinguishes_role_reasoning_text_and_final_usage():

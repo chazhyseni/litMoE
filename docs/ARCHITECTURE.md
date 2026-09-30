@@ -127,13 +127,20 @@ containers remain valid alternatives.
   flags are rejected. A planning failure leaves that selection unavailable,
   never silently choosing another model. WARP budgets are capacity estimates,
   not measurements of other applications' current memory pressure.
+- The gateway reserves its listening socket before model startup and passes
+  that same socket to uvicorn. A busy gateway port fails without spawning
+  another engine; there is no bind-and-close preflight race.
 - Initial load, explicit switch, cancellation, and shutdown share one asyncio
   runtime on uvicorn's event loop. The active lease covers upstream connection
   establishment and the complete downstream stream. Switches drain first;
   stop failures retain ownership and prevent another engine from starting.
-- Active-request cancellation stops the native process before releasing its
-  lease; a later request reloads the same model. This intentionally loses
-  cache state rather than assuming a closed HTTP connection stopped inference.
+- Cancelling an accepted WARP chat stream closes its upstream socket; the
+  pinned server stops generation from its token callback and retains the
+  resident engine/expert cache. Cancellation is not an immediate prefill
+  interrupt. Other paths (including blocking WARP calls and raw completions)
+  stop the native process before releasing their lease; a later request reloads.
+- WARP startup warmup shares the inference lock. It touches some experts,
+  not every expert a subsequent prompt will use, and does not guarantee latency.
 - Engine stdout/stderr append to `logs/<id>.log` with a per-start header.
   ASGI lifespan cleanup handles uvicorn's graceful Ctrl-C/SIGTERM shutdown.
 - `litmoe stop` signals only the process groups in the PID files; `--all`

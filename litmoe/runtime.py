@@ -51,8 +51,9 @@ async def while_connected(awaitable, request: Request):
 
 
 class Lease:
-    def __init__(self, runtime: Runtime, engine: Engine):
+    def __init__(self, runtime: Runtime, engine: Engine, restart_on_abandon: bool = True):
         self.runtime, self.engine = runtime, engine
+        self.restart_on_abandon = restart_on_abandon
         self.closed = False
 
     async def close(self, abandoned: bool = False) -> None:
@@ -61,7 +62,7 @@ class Lease:
         self.closed = True
         with anyio.CancelScope(shield=True):
             try:
-                if abandoned:
+                if abandoned and self.restart_on_abandon:
                     await self.runtime._stop()
             finally:
                 self.runtime.lock.release()
@@ -141,7 +142,10 @@ class Runtime:
             "configured_models": [{"id": m.id, "aliases": m.aliases} for m in self.config.models],
             "queue_depth": self.queue_depth,
             "context_window": engine.model.n_ctx if ready else None,
-            "capabilities": {"prompt_cache": cache, "cancellation": "restart"},
+            "capabilities": {
+                "prompt_cache": cache,
+                "cancellation": "stream-disconnect" if engine and engine.model.engine == "warp" else "restart",
+            },
         }
 
     async def _stop(self) -> None:

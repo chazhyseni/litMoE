@@ -409,8 +409,8 @@ class Gateway:
         send_body = json.dumps(payload).encode()
         stream = bool(payload.get("stream", False))
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
-        logger.info("%s: %s request, ~%s prompt tokens%s", model.id, endpoint,
-                    f"{len(send_body) // 4:,}", " (stream)" if stream else "")
+        logger.info("%s: %s request, %s payload bytes%s", model.id, endpoint,
+                    f"{len(send_body):,}", " (stream)" if stream else "")
         # Authentication terminates at the gateway, not the owned backend.
         headers = {"content-type": "application/json"}
         if stream:
@@ -434,6 +434,11 @@ class Gateway:
                     except ValueError:
                         content = {"error": {"message": message, "type": "upstream_error"}}
                 return JSONResponse(status_code=response.status_code, content=content)
+            # Only an accepted WARP chat stream cancels generation on socket
+            # close. Blocking calls and raw completions do not share that
+            # contract; retain restart-on-abandon for those paths.
+            if model.engine == "warp" and endpoint == "chat/completions":
+                lease.restart_on_abandon = False
             iterator = (_stream_anthropic_response(client, response, model_id) if anthropic
                         else _stream_response(client, response))
             return LeasedStream(iterator, lease, client, response)
@@ -458,12 +463,12 @@ class Gateway:
     async def load_engines(self) -> None:
         if self.runtime.selected:
             await self.runtime.switch(self.runtime.selected.id)
-            await self._warmup(self.runtime.selected)
+            async with self.runtime.lock:
+                if not self.runtime.closing and self.runtime.state == "ready":
+                    await self._warmup(self.runtime.selected)
 
     async def _warmup(self, model: ModelEntry) -> None:
-        """One tiny generation after load so the first real request does not
-        pay the cold-expert paging cost (WARP reads ~28 GB from disk when its
-        expert cache is empty)."""
+        """Touch some WARP experts before serving; this cannot warm every prompt."""
         if model.engine != "warp":
             return
         engine = self.runtime.engine
@@ -947,4 +952,8 @@ def run(config: GatewayConfig, log_dir: str | None = None, config_path: str | No
     _configure_logging()
     gateway = Gateway(config, config_path=config_path, initial_model=initial_model,
                       log_dir=log_dir, force=force)
-    uvicorn.run(gateway.app, host=config.host, port=config.port, log_level="info")
+    server_config = uvicorn.Config(gateway.app, host=config.host, port=config.port, log_level="info")
+    # Reserve the actual listener before lifespan schedules native model load.
+    # Keep this socket through serving: a bind-and-close probe would race.
+    with server_config.bind_socket() as listener:
+        uvicorn.Server(server_config).run(sockets=[listener])

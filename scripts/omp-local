@@ -110,8 +110,15 @@ PY
 )"
 AGENT_DIR="${DETAILS%%$'\n'*}"
 SELECTOR="${DETAILS#*$'\n'}"
+# Local inference should not inherit a machine-wide skill/plugin catalog.
+# Keep built-in coding tools and project context; discovery is opt-in.
+LAUNCH_ARGS=(--no-title)
+if [[ "${LITMOE_OMP_DISCOVERY:-0}" != "1" ]]; then
+  LAUNCH_ARGS+=(--no-extensions --no-skills --no-rules)
+fi
 exec env -u OMP_PROFILE -u PI_PROFILE \
   PI_CODING_AGENT_DIR="$AGENT_DIR" LITMOE_API_KEY="$KEY" \
   PI_SMOL_MODEL="$SELECTOR" PI_SLOW_MODEL="$SELECTOR" PI_PLAN_MODEL="$SELECTOR" \
   PI_NO_TITLE=1 PI_AUTO_QA=0 OMP_SKIP_SETUP=1 \
-  omp --config "$AGENT_DIR/config.yml" --model "$SELECTOR" "$@"
+  omp --config "$AGENT_DIR/config.yml" --model "$SELECTOR" \
+  "${LAUNCH_ARGS[@]}" "$@"

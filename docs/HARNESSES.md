@@ -44,12 +44,13 @@ Use `litmoe status` to distinguish loading or failure from an unreachable
 gateway; an open HTTP port does not itself mean inference is ready.
 
 One inference lease lasts through the whole stream. The default queue permits
-eight waiting admissions for up to 30 seconds; overflow or expiry returns 429.
+eight waiting admissions for up to 600 seconds; overflow or expiry returns 429.
 Disconnecting a queued client removes its wait without dispatching inference.
-For active inference, cancellation **terminates the owned native process**:
-the current adapters lack a proven request-abort acknowledgement. The next
-request reloads the same selected model. This costs startup time and loses
-prefix state, but does not leave abandoned decoding running in the background.
+For accepted WARP chat streams, cancellation closes the upstream connection:
+the native token callback stops generation without reloading the engine.
+This does not interrupt prefill immediately. Blocking WARP requests, raw
+completions, and other adapters still terminate the owned process on active
+cancellation; the next request reloads the selected model.
 
 WARP reports no reusable prompt cache: the pinned server resets state for each
 HTTP request. Its expert-weight cache is not a conversation-prefix cache.
@@ -227,11 +228,27 @@ is an environment reference, not a credential written into those files.
 Profile/provider/model/config override flags are rejected instead of silently
 escaping isolation.
 
+Title generation and automatic extension/skill/rule discovery are disabled
+for this local invocation. Built-in coding tools and project context remain
+available, and the launcher does not disable thinking. This avoids injecting
+a machine-wide catalog into every local request; it does not remove OMP's
+own system prompt or tool schemas. Set `LITMOE_OMP_DISCOVERY=1` to opt back
+into automatic discovery. Explicit OMP extension paths (`-e`) remain usable.
+
 The model advertises its actual context and text input only. Tool calling was
 exercised with OMP's bash tool; vision and long-context model quality are not
 established by that check. For OMP's independent prefill/generation/cache-pair
 experiments, consult the installed version's `omp bench --help`; the launcher
 itself is for agent sessions, not a benchmark subcommand wrapper.
+
+**Latency limitation:** routing/tool-protocol checks are not an interactive
+performance guarantee. A real GLM-5.3-Flash run on the pinned NEON WARP backend
+with discovery disabled still sent 25,860 request-body bytes and exceeded a
+600-second OMP deadline. A native stack sample afterward was in
+`waste_model_prefill`. The queue/cancellation fixes do not accelerate that
+prefill, and closing the stream does not interrupt it immediately. Do not
+interpret request bytes as token counts or a large context capacity as fast
+prompt processing.
 
 ## Open WebUI / other OpenAI-SDK clients
 

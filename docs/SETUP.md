@@ -373,13 +373,18 @@ curl http://127.0.0.1:8090/v1/models
 
 The resident engine takes a free loopback port starting at 8081, skipping the
 gateway port and occupied ports. Logs append to `logs/<model-id>.log`.
+The gateway binds its own port before loading the model. Starting another
+gateway on that port fails immediately without starting a duplicate engine.
 Switching waits for the active request and prevents new admission during the
 transition. A failed switch leaves an explicit failed state, never the old
 model masquerading as the requested one. Retry with `litmoe switch ID`.
 
-Top-level `max_queue_size` (default 8) and `queue_timeout` (default 30 seconds)
-bound admission; full/expired waits return HTTP 429. Known inactive model IDs
-return 409, unknown IDs 404, and switching/failed engines 503.
+Top-level `max_queue_size` (default 8) and `queue_timeout` (default 600 seconds)
+bound admission; full/expired waits return HTTP 429. The longer default allows
+harness side requests to wait behind slow reasoning turns; it does not make
+inference parallel. An explicitly configured shorter timeout still applies.
+Known inactive model IDs return 409, unknown IDs 404, and switching/failed
+engines 503.
 Set `api_key` to protect inference and `/v1/runtime` control; null preserves
 unauthenticated local use. Keep the gateway on loopback unless deliberately
 exposing and securing it.

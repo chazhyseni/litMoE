@@ -97,7 +97,7 @@ class GatewayConfig(BaseModel):
     api_key: str | None = None
     models: list[ModelEntry] = Field(default_factory=list)
     max_queue_size: int = Field(default=8, ge=0, le=1024)
-    queue_timeout: float = Field(default=30.0, gt=0, le=3600, allow_inf_nan=False)
+    queue_timeout: float = Field(default=600.0, gt=0, le=3600, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "GatewayConfig":
