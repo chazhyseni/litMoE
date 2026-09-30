@@ -161,7 +161,7 @@ Current Hermes uses `CUSTOM_BASE_URL` for the custom provider; setting only
 `OPENAI_BASE_URL` can leave requests pointed at a saved endpoint instead.
 
 Even a short message includes the harness's system prompt and tool definitions.
-Use the gateway's approximate prompt-token log and the engine log to distinguish
+Use the gateway's request-byte log and the engine log to distinguish
 prefill from a failed request. A retry banner or `APIConnectionError` is not proof
 of slow prefill: check the gateway traceback and the endpoint Hermes resolved.
 Do not assume the next turn will be faster. The pinned WARP server resets its
@@ -242,13 +242,17 @@ experiments, consult the installed version's `omp bench --help`; the launcher
 itself is for agent sessions, not a benchmark subcommand wrapper.
 
 **Latency limitation:** routing/tool-protocol checks are not an interactive
-performance guarantee. A real GLM-5.3-Flash run on the pinned NEON WARP backend
-with discovery disabled still sent 25,860 request-body bytes and exceeded a
-600-second OMP deadline. A native stack sample afterward was in
-`waste_model_prefill`. The queue/cancellation fixes do not accelerate that
-prefill, and closing the stream does not interrupt it immediately. Do not
-interpret request bytes as token counts or a large context capacity as fast
-prompt processing.
+performance guarantee. The bundled exact-arithmetic native patch reduced a
+216-token GLM-5.3-Flash microbenchmark from 97.00 to 91.44 seconds on a 96 GiB
+M2 Max. The patched full-OMP request still sent 25,860 request-body bytes and
+failed with an in-band stream error after 600.69 seconds, even with OMP's
+`--max-time 3500`. The gateway's upstream read-inactivity timeout is 600 seconds;
+OMP's CLI deadline does not override it. A native stack sample after the failure
+was still inside `waste_model_prefill`. Thinking and built-in tools were retained.
+This modest native gain therefore does not establish interactive full-harness
+latency. Queue/cancellation fixes do not accelerate prefill, and closing the
+stream does not interrupt it immediately. Do not interpret request bytes as
+token counts or a large context capacity as fast prompt processing.
 
 ## Open WebUI / other OpenAI-SDK clients
 

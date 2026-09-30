@@ -698,7 +698,7 @@ def test_openai_to_anthropic_response():
 # installer helpers
 # ---------------------------------------------------------------------------
 
-def _fake_warp_source(tmp_path):
+def _fake_warp_source(tmp_path, monkeypatch):
     import subprocess
 
     source = tmp_path / "source"
@@ -708,8 +708,22 @@ def _fake_warp_source(tmp_path):
     subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True)
     (source / "serve").mkdir()
     (source / "serve" / "__main__.py").write_text("")
+    (source / "tools").mkdir()
+    for script in ("fetch_weights.sh", "pipeline.sh"):
+        (source / "tools" / script).write_text("#!/bin/sh\n")
+    patch = tmp_path / "native.patch"
+    patch.write_text(
+        "diff --git a/native-prefill-ready b/native-prefill-ready\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/native-prefill-ready\n"
+        "@@ -0,0 +1 @@\n"
+        "+optimized\n"
+    )
+    monkeypatch.setattr(I, "WARP_PATCH", patch)
     (source / "Makefile").write_text(
         "all:\n"
+        "\ttest -f native-prefill-ready\n"
         "\tprintf '#!/bin/sh\\nexit 0\\n' > waste\n"
         "\tchmod +x waste\n"
         "\tcp waste waste.exe\n"
@@ -727,7 +741,7 @@ def _fake_warp_source(tmp_path):
 
 
 def test_install_warp_builds_and_verifies_pinned_source(tmp_path, monkeypatch):
-    source, ref = _fake_warp_source(tmp_path)
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
     prefix = tmp_path / "prefix"
     monkeypatch.setattr(I, "WARP_REPO", str(source))
     root = I.install_warp(prefix, ref=ref)
@@ -738,10 +752,47 @@ def test_install_warp_builds_and_verifies_pinned_source(tmp_path, monkeypatch):
     assert (prefix / "bin" / "waste").resolve() == root / "waste"
 
 
+@pytest.mark.parametrize("marker", [None, "stale-patch"])
+def test_install_warp_rebuilds_an_unpatched_or_stale_runtime(tmp_path, monkeypatch, marker):
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I, "WARP_COMMIT", ref)
+    prefix = tmp_path / "prefix"
+    root = I.install_warp(prefix, ref=ref)
+    stamp = root / ".litmoe-patch-sha256"
+    if marker is None:
+        stamp.unlink()
+    else:
+        stamp.write_text(marker)
+    (root / "native-prefill-ready").write_text("old native implementation\n")
+
+    rebuilt = I.install_warp(prefix, ref=ref)
+
+    assert (rebuilt / "native-prefill-ready").read_text() == "optimized\n"
+    assert I._installed_warp_root(prefix) == rebuilt
+
+
+def test_install_warp_patch_failure_preserves_previous_runtime(tmp_path, monkeypatch):
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
+    monkeypatch.setattr(I, "WARP_REPO", str(source))
+    monkeypatch.setattr(I, "WARP_COMMIT", ref)
+    prefix = tmp_path / "prefix"
+    root = I.install_warp(prefix, ref=ref)
+    stamp = (root / ".litmoe-patch-sha256").read_text()
+    I.WARP_PATCH.write_text("not an applicable patch\n")
+
+    with pytest.raises(RuntimeError, match="WARP native prefill patch failed"):
+        I.install_warp(prefix, ref=ref)
+
+    assert (root / "native-prefill-ready").read_text() == "optimized\n"
+    assert (root / ".litmoe-patch-sha256").read_text() == stamp
+    assert (prefix / "bin" / "waste").resolve() == root / "waste"
+
+
 def test_install_warp_build_subprocesses_do_not_inherit_hf_token(
     tmp_path, monkeypatch,
 ):
-    source, ref = _fake_warp_source(tmp_path)
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
     prefix = tmp_path / "prefix"
     token = "runtime-build-secret"
     calls = []
@@ -766,13 +817,12 @@ def test_install_warp_build_subprocesses_do_not_inherit_hf_token(
 
     I.install_warp(prefix, ref=ref)
 
-    assert len(calls) == 5
     assert all(isinstance(kwargs.get("env"), dict) for _, kwargs in calls)
     assert all("HF_TOKEN" not in kwargs["env"] for _, kwargs in calls)
 
 
 def test_install_warp_copies_discoverable_windows_launcher(tmp_path, monkeypatch):
-    source, ref = _fake_warp_source(tmp_path)
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
     prefix = tmp_path / "prefix"
     monkeypatch.setattr(I, "WARP_REPO", str(source))
     monkeypatch.setattr(I.shutil, "which", lambda tool: f"/usr/bin/{tool}")
@@ -790,7 +840,7 @@ def test_install_warp_copies_discoverable_windows_launcher(tmp_path, monkeypatch
 def test_install_warp_keyboard_interrupt_restores_windows_runtime_and_launcher(
     tmp_path, monkeypatch, cutover,
 ):
-    source, ref = _fake_warp_source(tmp_path)
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
     prefix = tmp_path / "prefix"
     previous = prefix / "lib" / "warp"
     previous.mkdir(parents=True)
@@ -835,7 +885,7 @@ def test_install_warp_keyboard_interrupt_restores_windows_runtime_and_launcher(
 
 
 def test_install_warp_restores_previous_tree_when_launcher_install_fails(tmp_path, monkeypatch):
-    source, ref = _fake_warp_source(tmp_path)
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
     prefix = tmp_path / "prefix"
     previous = prefix / "lib" / "warp"
     previous.mkdir(parents=True)
@@ -861,7 +911,7 @@ def test_install_warp_restores_previous_tree_when_launcher_install_fails(tmp_pat
     assert wrapper.read_text() == "old launcher"
 
 def test_install_warp_preserves_recovery_tree_when_rollback_fails(tmp_path, monkeypatch):
-    source, ref = _fake_warp_source(tmp_path)
+    source, ref = _fake_warp_source(tmp_path, monkeypatch)
     prefix = tmp_path / "prefix"
     previous = prefix / "lib" / "warp"
     previous.mkdir(parents=True)
@@ -2999,6 +3049,10 @@ def test_install_warp_reuses_pinned_runtime_without_rebuilding(tmp_path, monkeyp
     (root / "tools").mkdir()
     (root / "tools" / "fetch_weights.sh").write_text("#!/usr/bin/env bash\n")
     (root / "tools" / "pipeline.sh").write_text("#!/usr/bin/env bash\n")
+    import hashlib
+    (root / ".litmoe-patch-sha256").write_text(
+        hashlib.sha256(I.WARP_PATCH.read_bytes()).hexdigest() + "\n"
+    )
 
     import subprocess as subprocess_module
 

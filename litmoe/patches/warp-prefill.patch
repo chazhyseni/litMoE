@@ -1,0 +1,251 @@
+diff --git a/Makefile b/Makefile
+index 0b97ea8..e3dacf2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -261,13 +261,15 @@ waste$(EXE): cli/main.o libwaste.a
+ TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
+              test_qwenparts test_state test_vision test_vision_glm \
+              test_vision_ds41 test_image test_memory test_cpus test_lock sweep \
+-             kernel_kl test_qsa_pick test_qsa_attn
++             kernel_kl test_qsa_pick test_qsa_attn test_mvq
+ TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
+ 
+ test: $(TESTBINS)
+ 
+ test_kda$(EXE): tests/test_kda.o libwaste.a
+ 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
++test_mvq$(EXE): tests/test_mvq.o libwaste.a
++	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+ # Every link rule passes LDLIBS, including the one target that does not
+ # currently need it. `test_image` omitted it and linked fine on macOS for
+ # a week: clang folded the one sqrt() in image.c, glibc did not, and the
+diff --git a/src/model.c b/src/model.c
+index 8839498..21f1e49 100644
+--- a/src/model.c
++++ b/src/model.c
+@@ -417,6 +417,74 @@ static inline int32_t idot(const int8_t *a, const int8_t *b, int n)
+ #endif
+ }
+ 
++#if defined(__ARM_NEON) || defined(__aarch64__)
++/* Keep each row's FMA order, but expose two independent dependency chains.
++ * Pairing rows also reuses the activation loads; no activation quantization
++ * or extra weight representation is needed. */
++static inline float32x4_t mvq4_acc32(float32x4_t sum, uint8x16_t by,
++                                   const float *x)
++{
++    const int8x16_t lo = vsubq_s8(
++        vreinterpretq_s8_u8(vandq_u8(by, vdupq_n_u8(15))), vdupq_n_s8(8));
++    const int8x16_t hi = vsubq_s8(
++        vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), vdupq_n_s8(8));
++    const int8x16x2_t z = vzipq_s8(lo, hi);
++    for (int h = 0; h < 2; h++) {
++        const int16x8_t l16 = vmovl_s8(vget_low_s8(z.val[h]));
++        const int16x8_t h16 = vmovl_s8(vget_high_s8(z.val[h]));
++        sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_low_s16(l16))),
++                       vld1q_f32(x + 16 * h));
++        sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_high_s16(l16))),
++                       vld1q_f32(x + 16 * h + 4));
++        sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_low_s16(h16))),
++                       vld1q_f32(x + 16 * h + 8));
++        sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_high_s16(h16))),
++                       vld1q_f32(x + 16 * h + 12));
++    }
++    return sum;
++}
++
++static void mvq4_rows_pair(int b, int e, const mvq_arg *a)
++{
++    const int g = a->group, ng = a->ng;
++    const float *x = (const float *)a->xs;
++    int o = b;
++    for (; o + 1 < e; o += 2) {
++        const uint8_t *r0 = (const uint8_t *)a->W + (size_t)o * a->rowbytes;
++        const uint8_t *r1 = r0 + a->rowbytes;
++        const uint16_t *w0 = a->ws + (size_t)o * ng, *w1 = w0 + ng;
++        float y0 = 0, y1 = 0;
++        for (int k = 0; k < ng; k++) {
++            float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
++            for (int j = 0; j < g; j += 32) {
++                const size_t off = ((size_t)k * g + j) / 2;
++                const float *xx = x + (size_t)k * g + j;
++                s0 = mvq4_acc32(s0, vld1q_u8(r0 + off), xx);
++                s1 = mvq4_acc32(s1, vld1q_u8(r1 + off), xx);
++            }
++            y0 += f16_to_f32(w0[k]) * vaddvq_f32(s0);
++            y1 += f16_to_f32(w1[k]) * vaddvq_f32(s1);
++        }
++        a->y[o] = y0;
++        a->y[o + 1] = y1;
++    }
++    if (o < e) {
++        const uint8_t *row = (const uint8_t *)a->W + (size_t)o * a->rowbytes;
++        const uint16_t *ws = a->ws + (size_t)o * ng;
++        float y = 0;
++        for (int k = 0; k < ng; k++) {
++            float32x4_t sum = vdupq_n_f32(0);
++            for (int j = 0; j < g; j += 32)
++                sum = mvq4_acc32(sum,
++                    vld1q_u8(row + ((size_t)k * g + j) / 2),
++                    x + (size_t)k * g + j);
++            y += f16_to_f32(ws[k]) * vaddvq_f32(sum);
++        }
++        a->y[o] = y;
++    }
++}
++#endif
++
+ /* int8 weights, f32 activations: dequantize the row inline. Keeps the
+  * 4x memory saving of int8 storage while producing exactly the numbers the
+  * f32 path does — no activation quantization error. */
+@@ -425,6 +493,12 @@ void waste_mvq_rows_f32(int b, int e, void *p)
+     mvq_arg *a = (mvq_arg *)p;
+     const int ng = a->ng, g = a->group;
+     const float *x = (const float *)a->xs;      /* raw activations */
++#if defined(__ARM_NEON) || defined(__aarch64__)
++    if (a->bits == 4 && g > 0 && (g & 31) == 0 && a->in % g == 0) {
++        mvq4_rows_pair(b, e, a);
++        return;
++    }
++#endif
+     int8_t *unp = NULL;
+     if (a->bits != 8) {
+         unp = (int8_t *)malloc((size_t)g);
+@@ -7303,6 +7377,9 @@ static int clamp_token(const waste_model *m, int token)
+     return 0;
+ }
+ 
++static const float *model_step_impl(waste_model *m, int token, int pos,
++                                    int *routed, int emit_logits);
++
+ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
+                                  int pos0)
+ {
+@@ -7328,7 +7405,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
+     if (c->hc_mult || c->index_topk) {
+         const float *out = NULL;
+         for (int t = 0; t < n; t++) {
+-            out = waste_model_step(m, tokens[t], pos0 + t, NULL);
++            /* Only the final token's distribution is consumed by prefill. */
++            out = model_step_impl(m, tokens[t], pos0 + t, NULL, t == n - 1);
+             if (!out) return NULL;
+         }
+         return out;
+@@ -8559,7 +8637,8 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
+     return m->read_error ? NULL : m->logits;
+ }
+ 
+-const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
++static const float *model_step_impl(waste_model *m, int token, int pos,
++                                    int *routed, int emit_logits)
+ {
+     if (m->cfg.arch_qwen) return qwen_step(m, token, pos, routed);
+     dump_pos0 = pos;
+@@ -8698,6 +8777,11 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
+                       fclose(df); }
+         }
+     }
++    if (!emit_logits) {
++        free(resid);
++        free(norm);
++        return m->read_error ? NULL : m->logits;
++    }
+     /* One last AttnRes: the output layer attends over every block
+      * representation before the final norm (tech report §2.2, "the final
+      * output layer then aggregates all N block representations"). */
+@@ -8726,3 +8810,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
+     free(norm);
+     return m->read_error ? NULL : m->logits;
+ }
++
++const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
++{
++    return model_step_impl(m, token, pos, routed, 1);
++}
+diff --git a/tests/run.sh b/tests/run.sh
+index 820af9d..6ce133d 100755
+--- a/tests/run.sh
++++ b/tests/run.sh
+@@ -253,6 +253,13 @@ fi
+ # ---------------------------------------------------------------- unit ----
+ head_ "kernels vs the reference implementations"
+ 
++./test_mvq
++case $? in
++    0)  ok "exact Q4 projection ranges, odd rows, groups and tails" ;;
++    77) sk "paired-row Q4 projection" "ARM-only kernel" ;;
++    *)  no "exact Q4 projection ranges, odd rows, groups and tails" ;;
++esac
++
+ # Not a kernel, but it decides the default budget on every containerized
+ # host and runs in milliseconds against synthetic files, so it runs early
+ # and unconditionally. All of it runs everywhere: the reader takes its
+diff --git a/tests/test_mvq.c b/tests/test_mvq.c
+new file mode 100644
+index 0000000..9e7d7a7
+--- /dev/null
++++ b/tests/test_mvq.c
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++/* Exact Q4 range arithmetic, including odd rows and generic-path groups. */
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "../src/simd.h"
++
++void waste_mvq_rows_f32(int b, int e, void *p);
++
++int main(void)
++{
++#if defined(__ARM_NEON) || defined(__aarch64__)
++    enum { ROWS = 17, MAX_IN = 256, MAX_GROUPS = 8 };
++    const int groups[] = {32, 48, 64, 128};
++    const int inputs[] = {32, 64, 96, 128, 256};
++    int8_t weights[ROWS * MAX_IN];
++    uint16_t scales[ROWS * MAX_GROUPS];
++    float x[MAX_IN], y[ROWS], expected[ROWS];
++    for (int i = 0; i < MAX_IN; i++) x[i] = (float)((i * 13) % 31 - 15) / 11.0f;
++    for (int gi = 0; gi < 4; gi++) for (int ni = 0; ni < 5; ni++) {
++        const int g = groups[gi], in = inputs[ni], ng = (in + g - 1) / g;
++        const size_t rowbytes = (size_t)ng * g / 2;
++        for (int r = 0; r < ROWS; r++) {
++            for (size_t j = 0; j < rowbytes; j++)
++                weights[r * rowbytes + j] = (int8_t)((r * 19 + j * 37) & 255);
++            float total = 0;
++            for (int k = 0; k < ng; k++) {
++                const int exponent = (r + k) % 3;
++                scales[r * ng + k] = (uint16_t)(0x3800 + 0x400 * exponent);
++                const float scale = exponent == 0 ? 0.5f : exponent == 1 ? 1.0f : 2.0f;
++                float lanes[4] = {0, 0, 0, 0};
++                const int limit = in - k * g < g ? in - k * g : g;
++                for (int j = 0; j < limit; j++) {
++                    const uint8_t packed = (uint8_t)weights[r * rowbytes + (k * g + j) / 2];
++                    const int q = ((j & 1) ? packed >> 4 : packed & 15) - 8;
++                    lanes[j & 3] = fmaf((float)q, x[k * g + j], lanes[j & 3]);
++                }
++                total += scale * ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]));
++            }
++            expected[r] = total;
++        }
++        for (int b = 0; b < ROWS; b++) for (int e = b; e <= ROWS; e++) {
++            for (int r = 0; r < ROWS; r++) y[r] = 12345.0f;
++            mvq_arg a = {y, weights, scales, NULL, x, in, ng, g, 4, rowbytes};
++            waste_mvq_rows_f32(b, e, &a);
++            for (int r = 0; r < ROWS; r++) {
++                const float want = r >= b && r < e ? expected[r] : 12345.0f;
++                if (memcmp(&y[r], &want, sizeof want)) {
++                    fprintf(stderr, "Q4 mismatch: group=%d in=%d range=%d:%d row=%d got=%.9g want=%.9g\n",
++                            g, in, b, e, r, y[r], want);
++                    return 1;
++                }
++            }
++        }
++    }
++    puts("Q4 exact range arithmetic passed");
++#else
++    puts("Q4 paired-row kernel is ARM-only; generic kernels use the model oracle checks");
++    return 77;
++#endif
++    return 0;
++}

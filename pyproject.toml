@@ -37,5 +37,8 @@ litmoe = "litmoe.cli.main:main"
 where = ["."]
 include = ["litmoe*"]
 
+[tool.setuptools.package-data]
+litmoe = ["patches/*.patch"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

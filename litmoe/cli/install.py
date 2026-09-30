@@ -9,6 +9,7 @@ The model catalog lives in litmoe.models (single source of truth).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import platform
 import re
@@ -55,6 +56,7 @@ from litmoe.platform_utils import (
 LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
 WARP_REPO = "https://github.com/sqliteai/warp.git"
 WARP_COMMIT = "09fcff352ca55223b08ee222d15054b90546c6a9"
+WARP_PATCH = Path(__file__).resolve().parents[1] / "patches" / "warp-prefill.patch"
 LONG_QUIET_SECONDS = 60
 
 # Curated "stable" pointer maintained by llama.cpp CI: the latest release
@@ -403,6 +405,12 @@ def _installed_warp_root(prefix: Path) -> Path | None:
     if not all(path.is_file() for path in required):
         return None
     try:
+        patch_id = (root / ".litmoe-patch-sha256").read_text().strip()
+    except OSError:
+        return None
+    if patch_id != hashlib.sha256(WARP_PATCH.read_bytes()).hexdigest():
+        return None
+    try:
         pinned = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=root,
@@ -418,7 +426,7 @@ def _installed_warp_root(prefix: Path) -> Path | None:
 
 
 def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
-    """Build and install an exact WARP source revision, or reuse the pinned one."""
+    """Build the pinned WARP revision with the bundled native prefill patch."""
     existing = _installed_warp_root(prefix)
     if existing is not None:
         click.echo(f"  WARP already installed: {existing}")
@@ -461,6 +469,12 @@ def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
             label=f"git checkout {ref}",
             timeout=300,
         )
+        _run_warp_command(
+            ["git", "apply", str(WARP_PATCH)],
+            cwd=checkout,
+            label="WARP native prefill patch",
+            timeout=30,
+        )
 
         click.echo("  Building WARP...")
         _run_warp_command(
@@ -489,6 +503,9 @@ def install_warp(prefix: Path, ref: str = WARP_COMMIT) -> Path:
                 "WARP build incomplete; missing required artifact(s): "
                 + ", ".join(missing)
             )
+        (checkout / ".litmoe-patch-sha256").write_text(
+            hashlib.sha256(WARP_PATCH.read_bytes()).hexdigest() + "\n"
+        )
 
         bin_dir = prefix / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)

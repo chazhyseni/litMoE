@@ -100,8 +100,9 @@ litmoe install --model deepseek-v4.1-flash-warp \
 The command requires `git`, `make`, `bash`, `curl`, and `uv`. litmoe checks
 dependencies and free disk space, prints the pinned revision, sizes, and
 paths, and asks for confirmation before writing. It then installs WARP
-runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9`, downloads the
-pinned source weights, converts them, validates the resulting WARP v0
+runtime commit `09fcff352ca55223b08ee222d15054b90546c6a9` with litmoe's
+bundled exact-arithmetic prefill optimization, downloads the pinned source
+weights, converts them, validates the resulting WARP v0
 manifest and artifacts, and registers the absolute container path with
 `engine: warp`, `n_ctx: 0`, and `warp_auto_context: true`. A positive `--n-ctx`
 selects a fixed window instead. When `HF_TOKEN` is set, litmoe uses a
@@ -143,9 +144,11 @@ litmoe serve glm-5.3-flash-warp
 ```
 
 **Runtime-only/manual alternative:** `litmoe install --engine warp` installs
-only the same pinned runtime. Add an existing local `.waste` container to
-`models.yaml` yourself; manually created or acquired containers remain
-supported.
+only the same pinned, patched runtime. Re-run it to upgrade an older unpatched
+installation without reconverting weights. Add an existing local `.waste`
+container to `models.yaml` yourself; manually created or acquired containers
+remain supported. See [native optimization measurements](docs/ARCHITECTURE.md#native-prefill-optimization)
+for correctness checks and the limits of the measured speedup.
 
 Upstream WARP reports the following measurements. They are not litmoe
 benchmarks or performance guarantees:

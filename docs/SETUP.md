@@ -84,7 +84,8 @@ and output work, prints the revision, sizes, and paths, and asks for
 confirmation (`--yes` skips the prompt). It then:
 
 1. installs WARP runtime commit
-   `09fcff352ca55223b08ee222d15054b90546c6a9`;
+   `09fcff352ca55223b08ee222d15054b90546c6a9` with litmoe's bundled native
+   prefill patch;
 2. downloads the pinned source weights and runs the conversion pipeline,
    printing a heartbeat every minute with elapsed time and the newest
    progress line; the full logs are the staging `download.log` and the
@@ -145,9 +146,14 @@ For a runtime-only or manual-container setup, keep using:
 litmoe install --engine warp
 ```
 
-That command installs the pinned runtime under `$LITMOE_PREFIX/lib/warp`
+That command installs the pinned, patched runtime under `$LITMOE_PREFIX/lib/warp`
 (default `~/.local/lib/warp`) and runs upstream `make check`; it does not select
-a model. Add your existing local `.waste` path to `models.yaml`. The installed
+a model. Re-run it to rebuild an older unpatched runtime without reconverting
+weights. Reuse requires a matching upstream commit and patch SHA-256 marker.
+Patch/build/check failures preserve the previous installation. See the
+[native optimization measurements](ARCHITECTURE.md#native-prefill-optimization)
+for the measured improvement and remaining latency limits.
+Add your existing local `.waste` path to `models.yaml`. The installed
 shared library is `libwaste.so` on Linux, `libwaste.dylib` on macOS, or
 `libwaste.dll` on Windows.
 

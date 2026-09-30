@@ -84,16 +84,18 @@ API.
 ## WARP catalog installation
 
 `litmoe install --model glm-5.3-flash-warp` and
-`litmoe install --model deepseek-v4.1-flash-warp` are orchestration paths, not
-new inference or quantization implementations. The CLI resolves deterministic
+`litmoe install --model deepseek-v4.1-flash-warp` are orchestration paths.
+The runtime build applies the native patch described below; model conversion
+and quantization remain upstream implementations. The CLI resolves deterministic
 absolute source, output, and run/report paths; rejects source or output paths
 containing a backslash, single quote, newline, or carriage return; and requires
 the three paths not to overlap or nest, including through resolved symlink
 aliases. It checks `git`, `make`, `bash`, `curl`, `uv`, and free storage,
 prints the pinned revision and size plan, and confirms before writing. It
 installs pinned WARP runtime commit
-`09fcff352ca55223b08ee222d15054b90546c6a9`, then runs WARP's upstream
-download and conversion pipeline. Each stage runs in its own session and is
+`09fcff352ca55223b08ee222d15054b90546c6a9` with the bundled prefill patch,
+then runs WARP's upstream download and conversion pipeline. Each stage runs in
+its own session and is
 owned by the CLI: on interrupt or hangup the entire stage process group is
 terminated, so no orphaned download or conversion survives its parent. A
 second install of the same model is refused while one is running. Internal
@@ -111,6 +113,46 @@ source, output, and run/report data are retained so the same command can
 resume; nothing already downloaded is refetched. The runtime-only
 `litmoe install --engine warp` and manually configured local `.waste`
 containers remain valid alternatives.
+
+### Native prefill optimization
+
+`litmoe/patches/warp-prefill.patch` is applied to the pinned source before
+building and running upstream checks. Installation reuse requires both the
+upstream commit and the patch's SHA-256 marker; an older unpatched installation
+is rebuilt. A patch/build/check failure leaves the previous installation in
+place. The patch ships in source distributions and wheels.
+
+The patch pairs two ARM NEON Q4 projection rows, preserving each row's FMA
+order without quantizing activations or expanding weights. The GLM/DSA
+token-at-a-time prefill path also skips final normalization/output projection
+for intermediate tokens whose logits are never consumed. The final token and
+ordinary decode still compute the complete distribution. No model weights,
+context limits, thinking settings, or harness tools are changed.
+
+On a 96 GiB M2 Max, a 216-token repeated-text microbenchmark with a 36,000 MiB
+expert cache took **97.00 s unpatched versus 91.44 s patched** (5.7% less time).
+The final 154,880 logits were byte-identical and eight greedy continuation
+tokens matched. This is a modest native gain, not a full-session latency
+guarantee. The ARM regression covers nonzero row ranges, odd row counts,
+group sizes and partial groups; upstream checks also compare prefill and
+token-at-a-time output across architectures.
+
+Reproduce the microbenchmark using upstream `test_forward` from separate
+patched/unpatched builds of that commit, with the same compiler and flags:
+
+```bash
+# Tokenize this text with `waste tokenize MODEL TEXT --json`, then repeat its
+# 54 returned token IDs four times as one comma-separated argument.
+# TEXT: You are a coding assistant. Read the relevant source before editing,
+# preserve existing behavior, and verify your changes with tests. Explain the
+# purpose of a queue in a web server and describe how cancellation interacts
+# with a shared inference engine. Include the important ordering guarantees
+# and failure cases.
+WASTE_CACHE_MB=36000 WASTE_PROFILE=1 WASTE_CHUNK=1 \
+  ./test_forward MODEL IDS logits.bin 8
+```
+
+Do not run timing comparisons alongside compilation or another model process.
 
 
 ## Engine lifecycle
